@@ -1,0 +1,11 @@
+# Compiled binaries
+/intercom
+
+# Test binaries / coverage
+*.test
+*.out
+
+# Editor / OS detritus
+.DS_Store
+.idea/
+.vscode/

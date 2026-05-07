@@ -390,8 +390,12 @@ Code.
 If the read goroutine sees EOF (broker died, was restarted, etc.):
 
 - Mark the connection as disconnected. Don't auto-respawn the broker in the background.
-- In-flight tool calls awaiting a `send_ack` / `list_peers_reply` resolve with an `isError: true`
-  content describing the broker disconnect.
+- The shim's pending-replies map is cleared (every entry's reply channel is closed); in-flight
+  tool calls awaiting a `send_ack` / `list_peers_reply` see the closed channel and resolve with
+  an `isError: true` content describing the broker disconnect.
+- Request `id`s issued before the disconnect are not reused after reconnect. New `id`s come from
+  fresh `crypto/rand`, so even if a stale broker reply somehow arrives at a new connection, the
+  `id` won't match anything in the new pending map and is dropped with a log line.
 - The next `send_message` or `list_peers` tool call triggers the same dial-and-spawn sequence as
   startup (step 3 above). If it succeeds, the shim re-registers and the call proceeds.
 - We deliberately don't poll in the background: idle reconnection costs nothing for the user, and
@@ -422,6 +426,7 @@ If the read goroutine sees EOF (broker died, was restarted, etc.):
 | Shim is mid-receiving a `deliver` and gets `SIGTERM` | Shim exits; the in-flight delivery is dropped. The sender's `send_ack` was already `ok=true` (broker write succeeded), so from the sender's perspective the message was delivered. Acceptable for v1; a redelivery story would require persistence. |
 | Self-send (`send_message(to=name, ...)`) | Broker rejects with `no_self_send`; tool returns `isError: true`. |
 | Broker idle-exit fires while a shim is mid-call | The pending call resolves with the broker-disconnect error; next tool call auto-respawns the broker. |
+| Recipient is offline when sender calls `send_message` | Broker returns `no_such_peer`; sender's tool result is `isError: true`. **Delivery is best-effort within the broker's lifetime — there is no queueing, no persistence, no retry.** A peer that is offline at send time will not receive the message later, even if it connects shortly after. |
 
 ## Implementation plan
 

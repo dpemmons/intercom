@@ -49,6 +49,47 @@ session you start gets it for free:
 No `env` block needed for the common case. The shim auto-derives a peer name
 from the basename of the directory you started Claude Code in.
 
+### Giving a session a custom name
+
+The auto-derived name (project basename) is fine when each project has a
+distinct name. When it isn't — for instance, two checkouts of the same repo,
+or two windows on the same project — set `INTERCOM_NAME` explicitly via a
+**project-local** `.mcp.json` at the project's root. Project-local config
+overrides the user-level entry above:
+
+```jsonc
+// ~/work/myrepo/.mcp.json — only applies when Claude Code is started from this dir
+{
+  "mcpServers": {
+    "intercom": {
+      "command": "/usr/local/bin/intercom",
+      "args": ["shim"],
+      "env": {
+        "INTERCOM_NAME": "myrepo-work"
+      }
+    }
+  }
+}
+```
+
+Now Claude Code in `~/work/myrepo` registers as `myrepo-work` instead of the
+default `myrepo`. From any other session, `list_peers` will show
+`myrepo-work`, and `send_message(to="myrepo-work", ...)` will route to it.
+
+Sanity-check what name a directory will resolve to without launching Claude:
+
+```sh
+cd ~/work/myrepo
+intercom name        # prints "myrepo-work" (or "myrepo" without the env block)
+```
+
+You can also set `INTERCOM_NAME` in your shell to override on a per-launch
+basis:
+
+```sh
+INTERCOM_NAME=myrepo-debug claude --dangerously-load-development-channels server:intercom
+```
+
 ## Use
 
 Start Claude Code with the channel allowlist override (required during the
@@ -113,20 +154,11 @@ Claude Code B ──stdio (MCP)──► intercom shim B ──┘
   `no_such_peer`.
 - **Same-project collisions are loud.** If you open two Claude Code windows
   on the same project, both auto-name to the project basename and the second
-  fails to register. Workaround: set `INTERCOM_NAME` explicitly in one of
-  them, e.g.:
-  ```jsonc
-  // project-local .mcp.json overrides ~/.claude.json
-  {
-    "mcpServers": {
-      "intercom": {
-        "command": "/usr/local/bin/intercom",
-        "args": ["shim"],
-        "env": { "INTERCOM_NAME": "myproj-window2" }
-      }
-    }
-  }
-  ```
+  fails to register. See [Giving a session a custom name](#giving-a-session-a-custom-name)
+  for the project-local `.mcp.json` workaround.
+- **Delivery is best-effort within the broker's lifetime.** No queueing, no
+  persistence, no retry — if a recipient is offline at send time, the send
+  fails with `no_such_peer` and the message is gone.
 - **macOS / Linux only.** Unix sockets are POSIX-only.
 
 ## Tests

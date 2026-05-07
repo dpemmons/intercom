@@ -347,6 +347,12 @@ func (c *Conn) Read() (Frame, error) {
 
 // nameRE is the validation regex for peer names: letters, digits, hyphen,
 // underscore; non-empty; up to 64 characters.
+//
+// Note: this is intentionally MORE permissive than the Channels API's
+// meta-key regex ([A-Za-z0-9_]+, no hyphen). Peer names appear as the *value*
+// of the "from" meta key in deliver→notification, not as a key, so hyphens
+// are fine. Don't "fix" this to match the meta-key regex — you'd reject
+// reasonable project names like "my-app".
 var nameRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // MaxNameLen caps peer name length to keep error messages and meta values

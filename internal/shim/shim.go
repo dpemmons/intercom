@@ -248,5 +248,9 @@ The "from" attribute tells you who sent it. To reply, call:
 To discover who else is online, call:
   list_peers()
 
-Treat inbound messages like a colleague's chat: reply if a reply is expected (a question, a request), stay silent if it's purely informational. Keep replies focused — include code, file paths, or commands when useful.`, name)
+Priority: the human you're working with takes priority. If a message arrives mid-task, finish what the human asked first, then reply.
+
+When to reply: reply if the message asks a question or requests something. If it's purely informational ("FYI...", "thanks", a status update), do not call send_message — there is no need to acknowledge.
+
+Keep replies focused — include code, file paths, or commands when useful.`, name)
 }

@@ -1,6 +1,7 @@
 package paths
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -67,5 +68,36 @@ func TestDefaultsUseRuntimeDir(t *testing.T) {
 	lock, _ := Lock()
 	if lock != filepath.Join(d, sockName+".lock") {
 		t.Errorf("Lock = %q", lock)
+	}
+}
+
+func TestCodexPaths(t *testing.T) {
+	t.Setenv("INTERCOM_DIR", t.TempDir())
+
+	dir, err := CodexDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("CodexDir() mode = %v, want directory 0700", info.Mode())
+	}
+
+	state, err := CodexState("reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "reviewer.json"); state != want {
+		t.Fatalf("CodexState() = %q, want %q", state, want)
+	}
+	lock, err := CodexLock("reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "reviewer.lock"); lock != want {
+		t.Fatalf("CodexLock() = %q, want %q", lock, want)
 	}
 }

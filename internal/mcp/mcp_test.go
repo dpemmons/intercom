@@ -467,3 +467,43 @@ func TestPingReturnsEmpty(t *testing.T) {
 		t.Fatalf("resp = %+v", resp)
 	}
 }
+
+func TestRequestIDSpellingIsPreserved(t *testing.T) {
+	for _, id := range []string{`"request-1"`, `9007199254740993`, `-1.25e+9`} {
+		t.Run(id, func(t *testing.T) {
+			d := newDriver(t, Options{})
+			d.send(t, `{"jsonrpc":"2.0","id":`+id+`,"method":"ping"}`)
+
+			var resp struct {
+				ID json.RawMessage `json:"id"`
+			}
+			d.recv(t, &resp)
+			if string(resp.ID) != id {
+				t.Fatalf("response id = %s, want exact %s", resp.ID, id)
+			}
+		})
+	}
+}
+
+func TestInvalidRequestIDTypesReturnInvalidRequest(t *testing.T) {
+	for _, id := range []string{`true`, `false`, `{}`, `[]`} {
+		t.Run(id, func(t *testing.T) {
+			d := newDriver(t, Options{})
+			d.send(t, `{"jsonrpc":"2.0","id":`+id+`,"method":"ping"}`)
+
+			var resp struct {
+				ID    json.RawMessage `json:"id"`
+				Error *struct {
+					Code int `json:"code"`
+				} `json:"error"`
+			}
+			d.recv(t, &resp)
+			if string(resp.ID) != "null" {
+				t.Fatalf("response id = %s, want null", resp.ID)
+			}
+			if resp.Error == nil || resp.Error.Code != codeInvalidRequest {
+				t.Fatalf("error = %+v, want invalid request", resp.Error)
+			}
+		})
+	}
+}

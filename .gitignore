@@ -1,5 +1,9 @@
 # Compiled binaries
 /intercom
+/bin/
+
+# Nix build output
+/result
 
 # Test binaries / coverage
 *.test

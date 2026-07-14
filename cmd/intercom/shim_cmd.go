@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,8 +18,8 @@ import (
 func newShimCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "shim",
-		Short: "Run the per-session MCP server (invoked by Claude Code)",
-		Long:  "Speaks MCP over stdio, registers send_message and list_peers tools, and forwards messages between this Claude Code session and other connected sessions via the local broker.",
+		Short: "Runs the Claude Code MCP and Channels adapter",
+		Long:  "intercom shim serves MCP over standard input and output, registers the send_message and list_peers tools, and forwards broker deliveries as Claude Code channel notifications.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
@@ -28,13 +29,19 @@ func newShimCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			brokerBin, err := resolveBrokerBinary()
+			if err != nil {
+				return fmt.Errorf("shim: %w", err)
+			}
 
 			// Logging goes to stderr so Claude Code captures it in its
 			// per-session debug log.
 			logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 			err = shim.Run(ctx, shim.Config{
+				Version:    version,
 				SocketPath: sock,
+				BrokerBin:  brokerBin,
 				Logger:     logger,
 				Stdin:      cmd.InOrStdin(),
 				Stdout:     cmd.OutOrStdout(),

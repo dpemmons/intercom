@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/dpemmons/intercom/internal/brokerclient"
+	"github.com/dpemmons/intercom/internal/intercomtools"
 	"github.com/dpemmons/intercom/internal/mcp"
 	"github.com/dpemmons/intercom/internal/wire"
 )
@@ -18,6 +20,8 @@ import (
 type Config struct {
 	// Name is the peer name. If empty, ResolveName is used.
 	Name string
+	// Version is reported to both the MCP client and broker. Required.
+	Version string
 	// SocketPath is the broker's Unix socket. Required.
 	SocketPath string
 	// BrokerBin is the path to the binary used to auto-spawn the broker.
@@ -51,6 +55,9 @@ func Run(parentCtx context.Context, cfg Config) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
+	if cfg.Version == "" {
+		return fmt.Errorf("shim: version is required")
+	}
 	if cfg.Name == "" {
 		n, err := ResolveName()
 		if err != nil {
@@ -63,7 +70,7 @@ func Run(parentCtx context.Context, cfg Config) error {
 	}
 
 	srv := mcp.NewServer(
-		mcp.Implementation{Name: "intercom", Version: Version},
+		mcp.Implementation{Name: "intercom", Version: cfg.Version},
 		mcp.Options{
 			Instructions: instructions(cfg.Name),
 			Experimental: map[string]any{"claude/channel": map[string]any{}},
@@ -72,8 +79,9 @@ func Run(parentCtx context.Context, cfg Config) error {
 
 	// The client owns the broker connection. Its OnDeliver callback turns
 	// inbound deliver frames into notifications/claude/channel events.
-	client := NewClient(ClientOptions{
+	client := brokerclient.NewClient(brokerclient.ClientOptions{
 		Name:       cfg.Name,
+		Version:    cfg.Version,
 		SocketPath: cfg.SocketPath,
 		BrokerBin:  cfg.BrokerBin,
 		Logger:     cfg.Logger,
@@ -96,70 +104,48 @@ func Run(parentCtx context.Context, cfg Config) error {
 	defer client.Close()
 
 	srv.RegisterTool(mcp.Tool{
-		Name:        "send_message",
-		Description: "Send a message to another local Claude Code session via the intercom broker. Use list_peers to see who is online.",
-		InputSchema: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"to":      {"type": "string", "description": "The peer name of the destination session."},
-				"message": {"type": "string", "description": "The message body."}
-			},
-			"required": ["to", "message"]
-		}`),
+		Name:        intercomtools.SendMessageName,
+		Description: intercomtools.SendMessageDescription,
+		InputSchema: intercomtools.SendMessageInputSchema,
 		Handler: func(callCtx context.Context, args json.RawMessage) (mcp.ToolResult, error) {
-			var in struct {
-				To      string `json:"to"`
-				Message string `json:"message"`
-			}
-			if err := json.Unmarshal(args, &in); err != nil {
-				return mcp.ToolResult{}, fmt.Errorf("decode args: %w", err)
-			}
-			if in.To == "" {
-				return mcp.ToolResult{Text: `"to" is required`, IsError: true}, nil
-			}
-			if in.Message == "" {
-				return mcp.ToolResult{Text: `"message" is required`, IsError: true}, nil
-			}
-			if len(in.Message) > maxOutboundMessageBytes {
-				return mcp.ToolResult{
-					Text:    fmt.Sprintf("message exceeds %d-byte limit", maxOutboundMessageBytes),
-					IsError: true,
-				}, nil
+			in, err := intercomtools.DecodeSendMessage(args)
+			if err != nil {
+				return mcp.ToolResult{Text: err.Error(), IsError: true}, nil
 			}
 
 			ack, err := client.Send(callCtx, in.To, in.Message)
 			if err != nil {
 				return mcp.ToolResult{
-					Text:    fmt.Sprintf("send failed: %v", err),
+					Text:    intercomtools.SendFailed(err),
 					IsError: true,
 				}, nil
 			}
 			if !ack.OK {
 				return mcp.ToolResult{
-					Text:    fmt.Sprintf("send rejected (%s): %s", ack.Code, ack.Message),
+					Text:    intercomtools.SendRejected(ack.Code, ack.Message),
 					IsError: true,
 				}, nil
 			}
-			return mcp.ToolResult{Text: fmt.Sprintf("Message sent to %q.", in.To)}, nil
+			return mcp.ToolResult{Text: intercomtools.SendAccepted(in.To)}, nil
 		},
 	})
 
 	srv.RegisterTool(mcp.Tool{
-		Name:        "list_peers",
-		Description: "List the names of other Claude Code sessions currently connected to the intercom broker.",
-		InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
-		Handler: func(callCtx context.Context, _ json.RawMessage) (mcp.ToolResult, error) {
+		Name:        intercomtools.ListPeersName,
+		Description: intercomtools.ListPeersDescription,
+		InputSchema: intercomtools.ListPeersInputSchema,
+		Handler: func(callCtx context.Context, args json.RawMessage) (mcp.ToolResult, error) {
+			if err := intercomtools.DecodeListPeers(args); err != nil {
+				return mcp.ToolResult{Text: err.Error(), IsError: true}, nil
+			}
 			peers, err := client.ListPeers(callCtx)
 			if err != nil {
 				return mcp.ToolResult{
-					Text:    fmt.Sprintf("list_peers failed: %v", err),
+					Text:    intercomtools.ListPeersFailed(err),
 					IsError: true,
 				}, nil
 			}
-			if len(peers) == 0 {
-				return mcp.ToolResult{Text: "No other peers are connected."}, nil
-			}
-			return mcp.ToolResult{Text: "Connected peers: " + strings.Join(peers, ", ")}, nil
+			return mcp.ToolResult{Text: intercomtools.FormatPeers(peers)}, nil
 		},
 	})
 
@@ -180,8 +166,6 @@ func Run(parentCtx context.Context, cfg Config) error {
 
 	return srv.Run(ctx, cfg.Stdin, cfg.Stdout)
 }
-
-const maxOutboundMessageBytes = 200 * 1024 // a touch under MaxFrameSize to leave room for envelope
 
 // channelParams is the params object for notifications/claude/channel.
 type channelParams struct {
@@ -230,7 +214,7 @@ func (e *InvalidNameError) Error() string {
 	if src == "" {
 		src = "name"
 	}
-	return fmt.Sprintf("intercom: invalid peer name %q from %s; allowed characters are letters, digits, '-', '_', up to %d chars",
+	return fmt.Sprintf("invalid peer name %q from %s; allowed characters are ASCII letters, digits, '-', '_', up to %d bytes",
 		e.Name, src, wire.MaxNameLen)
 }
 

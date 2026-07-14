@@ -1,0 +1,482 @@
+# Intercom Handbook
+
+## NAME
+
+`intercom-handbook` — installation and operating procedures for Intercom peers.
+
+## CONTENTS
+
+1. [Install Intercom](#1-install-intercom)
+2. [Configure a Claude Code peer](#2-configure-a-claude-code-peer)
+3. [Add a managed Codex peer](#3-add-a-managed-codex-peer)
+4. [List peers and exchange messages](#4-list-peers-and-exchange-messages)
+5. [Resume or replace a managed Codex thread](#5-resume-or-replace-a-managed-codex-thread)
+6. [Stop a managed Codex peer](#6-stop-a-managed-codex-peer)
+7. [Run isolated broker groups](#7-run-isolated-broker-groups)
+8. [Diagnose failures](#8-diagnose-failures)
+
+## 1. Install Intercom
+
+### Purpose
+
+This procedure installs the `intercom` command and the `intercom-codex-project` launcher.
+
+### Prerequisites
+
+One of the following build environments is required:
+
+- Nix with flakes enabled.
+- Go 1.25.5 and Bash.
+
+Linux and macOS are supported. Windows is not supported.
+
+### Concepts
+
+The Nix package installs both programs. A Go build produces only `intercom`; the launcher is a Bash program and must be installed separately.
+
+### Procedure
+
+The Nix procedure runs from the repository root:
+
+```sh
+nix profile add path:.
+hash -r
+```
+
+The checkout-local Go procedure runs from the repository root:
+
+```sh
+mkdir -p bin
+go build -o bin/intercom ./cmd/intercom
+install -m 0755 scripts/intercom-codex-project bin/intercom-codex-project
+export PATH="$PWD/bin:$PATH"
+```
+
+The exported `PATH` must remain in the shell that starts either program. A checkout-local launcher invocation without that export requires an explicit adapter selection:
+
+```sh
+INTERCOM_BIN=./bin/intercom ./bin/intercom-codex-project --name reviewer --cwd .
+```
+
+Invoking only `./bin/intercom-codex-project` can select another `intercom` from `PATH`.
+
+### Verification
+
+The following transcript verifies command discovery and argument handling. It does not start a broker or an app-server.
+
+```console
+$ intercom help codex >/dev/null
+$ intercom-codex-project --help >/dev/null
+$ INTERCOM_NAME=handbook-check intercom name
+handbook-check
+```
+
+For a checkout-local build without the exported `PATH`, the first command is `./bin/intercom help codex`, and the launcher path is `./bin/intercom-codex-project`. The Codex help check distinguishes this build from an Intercom executable that contains only Claude commands.
+
+### Notes
+
+`nix profile add path:.` includes the working tree visible through the path flake. A bare `.` flake reference reads the Git-tracked view and can omit untracked source files in a development checkout.
+
+### See also
+
+[Command reference](REFERENCE.md), [development procedures](DEVELOPMENT.md)
+
+## 2. Configure a Claude Code peer
+
+### Purpose
+
+This procedure registers the Intercom MCP server and starts one Claude Code Channels peer.
+
+### Prerequisites
+
+- Claude Code 2.1.80 or later.
+- `intercom` available on `PATH`.
+- Claude Code authentication through claude.ai or an Anthropic Console API key.
+
+Organization-managed Team and Enterprise accounts require the Channels setting to be enabled. Anthropic Console organizations that deploy managed settings require `channelsEnabled: true`; Console organizations without managed settings have Channels enabled by default. Channels is unavailable through Amazon Bedrock, Google Vertex AI, and Microsoft Foundry.
+
+### Concepts
+
+Claude Code starts `intercom shim` as a stdio MCP server. The shim registers with the broker after the MCP initialization handshake. The shim derives its peer name from `INTERCOM_NAME` when that variable contains a nonblank value; otherwise it uses the working-directory basename.
+
+The bare MCP server name is `intercom`. Claude Code requires explicit development-channel authorization for a custom channel server.
+
+### Procedure
+
+The user-scoped MCP registration is created once:
+
+```sh
+claude mcp add --transport stdio --scope user intercom -- intercom shim
+```
+
+The registration is inspected before the first launch:
+
+```sh
+claude mcp get intercom
+```
+
+The peer starts from the project directory:
+
+```sh
+INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:intercom
+```
+
+The `INTERCOM_NAME` assignment may be omitted when the project-directory basename is the required peer name.
+
+### Verification
+
+Claude Code lists `intercom` as a connected MCP server under `/mcp`. Another terminal resolves the same selected name when run from the same directory and with the same environment:
+
+```console
+$ INTERCOM_NAME=implementer intercom name
+implementer
+```
+
+### Notes
+
+Two live peers cannot share a name. A Claude shim remains available as an MCP process after an eager broker registration failure and retries registration on a later tool call. The colliding peer does not appear in `list_peers` until the name becomes available.
+
+The Channels option is required on every Claude Code launch that uses the Intercom channel. MCP registration alone exposes the tools but does not authorize inbound channel notifications.
+
+### See also
+
+[Reference: `intercom shim`](REFERENCE.md#intercom-shim), [Claude Code Channels](https://code.claude.com/docs/en/channels), [Claude Code MCP](https://code.claude.com/docs/en/mcp)
+
+## 3. Add a managed Codex peer
+
+### Purpose
+
+This procedure adds a dedicated headless Codex peer to a broker that may already contain Claude peers.
+
+### Prerequisites
+
+- `codex-cli` 0.144.1 available as `codex`.
+- `intercom-codex-project` and `intercom` available on `PATH`.
+- Codex authentication available to the child `codex app-server` process.
+- A project directory writable under the selected Codex sandbox policy.
+
+### Concepts
+
+The launcher starts one child `codex app-server`, waits for its Unix socket, and starts one child `intercom codex` adapter. The adapter creates or resumes one non-ephemeral thread with the following policy:
+
+- working directory set to the selected project directory;
+- approval policy `never`;
+- workspace-write sandbox;
+- `send_message` and `list_peers` registered as dynamic tools;
+- one inbound Intercom message serialized into one Codex turn.
+
+All peers using the same `INTERCOM_SOCKET` belong to the same broker. The default socket therefore joins a new Codex peer to existing default-configured Claude peers without another connection step.
+
+### Procedure
+
+The managed peer starts in its own terminal:
+
+```sh
+intercom-codex-project --name reviewer --cwd .
+```
+
+The launcher remains in the foreground. `--name` may be omitted when `INTERCOM_NAME` or the selected directory basename supplies the required name.
+
+### Verification
+
+Another terminal lists the managed peer while it is running:
+
+```console
+$ intercom peers
+reviewer
+```
+
+The output contains all other peers in bytewise sorted order. Existing Claude peer names therefore appear in the same output when they remain connected.
+
+### Notes
+
+The launcher owns the app-server. A separately started app-server is supported only through the lower-level `intercom codex --app-server ENDPOINT` command.
+
+Intercom cannot adopt an arbitrary existing Codex CLI, TUI, desktop, or shared app-server session. A managed thread must be dedicated because Intercom supplies its dynamic tools, developer instructions, sandbox policy, and sole turn scheduler.
+
+The launcher does not daemonize or restart a failed child. A shell or service manager owns launcher lifetime and restart policy.
+
+Intercom does not discover the socket used by another peer. Existing peers and the new launcher must inherit the same explicit `INTERCOM_SOCKET`, or all must use the default. One broker socket should contain peers and a broker from the same Intercom build because the wire protocol performs no version negotiation.
+
+### See also
+
+[Reference: `intercom-codex-project`](REFERENCE.md#intercom-codex-project), [Reference: `intercom codex`](REFERENCE.md#intercom-codex), [Codex documentation](https://developers.openai.com/codex/)
+
+## 4. List peers and exchange messages
+
+### Purpose
+
+This procedure discovers live peer names and sends a message from one connected model to another.
+
+### Prerequisites
+
+At least two peers must be connected to the same broker.
+
+### Concepts
+
+The agent tools, not the shell command, send messages. `list_peers` excludes the calling peer. `send_message` accepts one destination and one message body.
+
+A successful tool result means that the broker wrote a delivery frame to the live destination adapter. No offline mailbox, delivery retry, model-observation receipt, or reply receipt exists.
+
+### Procedure
+
+The connected `implementer` model calls `list_peers`:
+
+```text
+list_peers()
+```
+
+When `reviewer` is the other connected peer, the tool result is:
+
+```text
+Connected peers: reviewer
+```
+
+The connected model sends one message:
+
+```text
+send_message(to="reviewer", message="Inspect the current diff and report correctness defects.")
+```
+
+The accepted result is:
+
+```text
+Message sent to "reviewer".
+```
+
+### Verification
+
+Claude receives the message as an Intercom channel event containing sender and UTC timestamp metadata. Codex receives an `Intercom message` user turn containing `From`, `Sent`, and `Message-ID` fields followed by the body.
+
+A replying model calls `send_message` with the original sender name. A normal Codex final answer is retained in Codex history and is not forwarded.
+
+### Notes
+
+The destination must be connected when the broker handles the send. Sending to the caller is rejected. A model can create a message loop by repeatedly replying; Intercom performs no loop detection.
+
+Message bodies are model instructions. System and developer instructions retain precedence at each receiving agent.
+
+### See also
+
+[Tool reference](REFERENCE.md#agent-tools), [broker protocol](BROKER_PROTOCOL.md)
+
+## 5. Resume or replace a managed Codex thread
+
+### Purpose
+
+This procedure restarts a managed Codex peer with either its saved thread or a new thread.
+
+### Prerequisites
+
+A prior `intercom-codex-project` invocation must have created the peer binding.
+
+### Concepts
+
+The binding is stored in `$INTERCOM_DIR/codex/NAME.json`; the default base is `$HOME/.claude-intercom`. Codex conversation data remains under the app-server-reported `CODEX_HOME`.
+
+Resume requires the same peer name, canonical working directory, `CODEX_HOME`, app-server identity, Codex version, state schema, and tool-contract version. The app-server must return the saved thread as idle, non-ephemeral, approval policy `never`, and workspace-write sandbox without additional writable roots.
+
+The binding becomes materialized after a terminal result for the first delivered turn is confirmed through `thread/read`. A restart before materialization attempts resume; when Codex reports that no rollout exists for the pending thread, Intercom replaces that unmaterialized binding with a new thread.
+
+### Procedure
+
+The existing service group must stop as described in Chapter 6 before another invocation can acquire the peer lock. The same invocation resumes the binding:
+
+```sh
+intercom-codex-project --name reviewer --cwd .
+```
+
+A deliberate replacement uses `--new`:
+
+```sh
+intercom-codex-project --name reviewer --cwd . --new
+```
+
+### Verification
+
+The launcher log emits `codex turn completed` after each terminal managed turn. The state record contains the active binding:
+
+```sh
+state_dir=${INTERCOM_DIR:-"$HOME/.claude-intercom"}
+sed -n '/"peer"/p; /"threadId"/p; /"materialized"/p' "$state_dir/codex/reviewer.json"
+```
+
+The same `threadId` denotes a resumed binding. A different `threadId` denotes `--new` or replacement of an unmaterialized missing rollout.
+
+### Notes
+
+`--new` replaces only the Intercom binding. It does not delete the previous Codex rollout or conversation history.
+
+The binding changes only after the replacement thread starts and passes managed-thread validation. A failed replacement leaves the prior binding unchanged.
+
+A failure after Codex creates the replacement can leave an unbound thread in Codex storage. Intercom does not delete Codex threads.
+
+A changed project symlink that resolves to the same canonical directory remains compatible. A different canonical directory requires `--new`.
+
+### See also
+
+[State files](REFERENCE.md#files), [Codex lifecycle](ARCHITECTURE.md#codex-adapter-lifecycle)
+
+## 6. Stop a managed Codex peer
+
+### Purpose
+
+This procedure terminates the adapter and app-server service group.
+
+### Prerequisites
+
+The launcher must be running in the foreground.
+
+### Concepts
+
+The launcher sends `SIGTERM` to the adapter first. The adapter becomes unavailable, stops broker reconnection, closes its broker connection, interrupts an active turn when necessary, and drains the turn and reverse-request handlers within one shutdown budget. The launcher then sends `SIGTERM` to app-server. A child that exceeds the configured per-child shutdown timeout receives `SIGKILL`.
+
+### Procedure
+
+The launcher terminal receives `Ctrl-C`, or a service manager sends `SIGTERM` to the launcher process.
+
+### Verification
+
+Another terminal no longer lists the stopped peer. For a broker whose remaining agent peer is `implementer`, the transcript is:
+
+```console
+$ intercom peers
+implementer
+```
+
+The broker can remain alive with zero peers until its idle timeout expires.
+
+### Notes
+
+The launcher maps `SIGHUP`, `SIGINT`, and `SIGTERM` to status 129, 130, and 143. Normal adapter status is propagated. A nonzero app-server status is propagated; an unexpected zero app-server status maps to 1.
+
+Stopping during a starting or active turn interrupts that delivery. Intercom does not retry it. Deliveries waiting in the in-memory queue are lost when the adapter exits. A turn whose result matters must reach terminal completion before the service group stops.
+
+### See also
+
+[Launcher exit status](REFERENCE.md#intercom-codex-project), [failure semantics](ARCHITECTURE.md#failure-semantics)
+
+## 7. Run isolated broker groups
+
+### Purpose
+
+This procedure separates peers into independent routing groups.
+
+### Prerequisites
+
+Each group requires a distinct Unix socket path. Parent directories must exist and be writable by the current user.
+
+### Concepts
+
+`INTERCOM_SOCKET` selects both the broker socket and its sibling `.lock` file. Every adapter and diagnostic command in one group must receive the same value. `INTERCOM_DIR` does not override an explicit `INTERCOM_SOCKET`.
+
+### Procedure
+
+One shell environment creates a private runtime directory under the working directory and selects its socket:
+
+```sh
+mkdir -p .intercom-runtime
+chmod 700 .intercom-runtime
+export INTERCOM_SOCKET="$PWD/.intercom-runtime/broker.sock"
+```
+
+Claude and Codex peers launched from that shell join the selected group. A second group uses another directory and socket value.
+
+### Verification
+
+The selected group is queried with the same environment:
+
+```sh
+intercom peers
+```
+
+An invocation with `INTERCOM_SOCKET` unset queries the default group instead.
+
+### Notes
+
+`INTERCOM_SOCKET` is inherited by the launcher adapter. It does not select the Codex app-server socket; the launcher creates and owns that socket separately.
+
+Broker isolation does not isolate managed Codex binding files or the default broker log. Codex peers with the same name and different sockets still contend for `$INTERCOM_DIR/codex/NAME.lock`. Distinct `INTERCOM_DIR` values provide separate Codex bindings and default logs when those resources must also be isolated.
+
+### See also
+
+[Environment](REFERENCE.md#environment), [files](REFERENCE.md#files)
+
+## 8. Diagnose failures
+
+### Purpose
+
+This procedure identifies peer-name, broker, Claude MCP, and Codex lifecycle failures.
+
+### Prerequisites
+
+The failing command's standard error and environment must be available.
+
+### Concepts
+
+Broker messages are written to the configured broker log unless `intercom broker --foreground` owns the broker. Adapter diagnostics are written to standard error. Claude Code captures shim standard error in its MCP diagnostics. The Codex launcher leaves both child diagnostics attached to its terminal.
+
+### Procedure
+
+The resolved name is checked without connecting:
+
+```sh
+intercom name
+```
+
+The broker path and peer list are checked under the same environment as the agent:
+
+```sh
+intercom peers
+```
+
+The default broker log is inspected with:
+
+```sh
+state_dir=${INTERCOM_DIR:-"$HOME/.claude-intercom"}
+tail -n 50 "$state_dir/broker.log"
+```
+
+Claude Code MCP state is inspected with `/mcp` and:
+
+```sh
+claude mcp get intercom
+```
+
+An explicitly owned isolated diagnostic broker writes logs to the terminal:
+
+```sh
+mkdir -p .intercom-diagnostic
+chmod 700 .intercom-diagnostic
+INTERCOM_SOCKET="$PWD/.intercom-diagnostic/broker.sock" \
+  intercom broker --foreground --idle-after 0
+```
+
+The foreground command starts a broker; it does not attach to a broker that already owns the selected lock. Foreground logging for an existing group therefore requires that group's current broker to stop before this command starts with the same environment.
+
+### Verification
+
+The following table maps diagnostics to binding conditions.
+
+| Diagnostic | Condition | Remedy |
+|---|---|---|
+| `invalid peer name` | The selected name is empty, longer than 64 bytes, or contains a character outside ASCII letters, digits, `_`, and `-`. | A valid `INTERCOM_NAME` or `--name` is required. |
+| `name_taken` | A live peer has registered the same name. | The duplicate must stop, or another name must be selected. |
+| `no_such_peer` | The destination is absent when the broker handles the send. | A retry is appropriate only after `list_peers` reports the reconnected peer. |
+| `no_self_send` | The destination equals the sender. | Another destination peer is required. |
+| `broker did not start within retry budget` | Broker spawning succeeded but the socket never accepted the client within the fixed dial sequence. | The broker log, socket directory, and `INTERCOM_BROKER_BIN` identify the startup failure. |
+| `unsupported app-server version` | The app-server user agent does not report `0.144.1`. | Codex CLI 0.144.1 is required. |
+| `peer is already managed` | Another `intercom codex` process holds the peer state lock. | The other service group must stop, or another peer name and state binding must be selected. |
+| `use --new to replace the binding` | Saved identity or tool state differs from the selected runtime. | The matching runtime must be restored, or `--new` must select a deliberate replacement. |
+| `managed thread is ... want idle` | The dedicated thread is active or in an error state during startup. | The service group must stop until Codex settles before restart. |
+| `active turn had no app-server activity` | An active managed turn emits no app-server activity for 15 minutes. | App-server diagnostics determine whether the service group requires restart. |
+
+### Notes
+
+`intercom peers` starts a broker when none is listening. Its successful empty-list marker proves broker availability, not agent availability.
+
+The fixed diagnostic peer name is `intercom-peers`. The name remains legal for an agent; a live peer using it causes `intercom peers` to fail with `name_taken`.
+
+### See also
+
+[Errors](REFERENCE.md#errors), [broker error codes](BROKER_PROTOCOL.md#error-codes)

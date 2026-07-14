@@ -62,6 +62,7 @@ func startShim(t *testing.T, ctx context.Context, name, sock string) *shimSessio
 		defer stdoutW.Close()
 		_ = shim.Run(ctx, shim.Config{
 			Name:       name,
+			Version:    "test-version",
 			SocketPath: sock,
 			BrokerBin:  "/nonexistent", // broker is already running
 			Stdin:      stdinR,
@@ -129,11 +130,19 @@ func (s *shimSession) recvUntil(pred func(line []byte) bool) []byte {
 func (s *shimSession) initialize(id int) {
 	s.send(`{"jsonrpc":"2.0","id":` + itoa(id) + `,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`)
 	var resp struct {
-		ID int `json:"id"`
+		ID     int `json:"id"`
+		Result struct {
+			ServerInfo struct {
+				Version string `json:"version"`
+			} `json:"serverInfo"`
+		} `json:"result"`
 	}
 	s.recv(&resp)
 	if resp.ID != id {
 		s.t.Errorf("initialize id mismatch: got %d", resp.ID)
+	}
+	if resp.Result.ServerInfo.Version != "test-version" {
+		s.t.Errorf("server version = %q, want test-version", resp.Result.ServerInfo.Version)
 	}
 	s.send(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 }

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -29,7 +31,7 @@ func TestRoundTrip(t *testing.T) {
 		{"send_ack err", SendAck{ID: "deadbeef", OK: false, Code: CodeNoSuchPeer, Message: "no such peer"}},
 		{"list_peers", ListPeers{ID: "cafebabe"}},
 		{"list_peers_reply", ListPeersReply{ID: "cafebabe", Peers: []string{"alice", "bob"}}},
-		{"deliver", Deliver{From: "bob", Message: "hi back", Timestamp: "2026-05-06T10:30:00Z"}},
+		{"deliver", Deliver{ID: "deadbeef", From: "bob", Message: "hi back", Timestamp: "2026-05-06T10:30:00Z"}},
 		{"error correlated", Error{ID: "deadbeef", Code: CodeBadFrame, Message: "nope"}},
 		{"error unsolicited", Error{Code: CodeOversize, Message: "too big"}},
 	}
@@ -59,7 +61,8 @@ func TestRoundTrip(t *testing.T) {
 }
 
 // TestEnvelopeShape verifies the on-the-wire JSON for representative frames so
-// downstream consumers (and DESIGN.md) stay in sync with the implementation.
+// downstream consumers and docs/BROKER_PROTOCOL.md stay in sync with the
+// implementation.
 func TestEnvelopeShape(t *testing.T) {
 	cases := []struct {
 		name string
@@ -75,6 +78,12 @@ func TestEnvelopeShape(t *testing.T) {
 		{"send_ack success omits code/message",
 			SendAck{ID: "abc", OK: true},
 			`{"kind":"send_ack","id":"abc","ok":true}`},
+		{"deliver carries correlation id",
+			Deliver{ID: "abc", From: "alice", Message: "hi", Timestamp: "2026-05-06T10:30:00Z"},
+			`{"kind":"deliver","id":"abc","from":"alice","message":"hi","timestamp":"2026-05-06T10:30:00Z"}`},
+		{"deliver omits empty correlation id",
+			Deliver{From: "alice", Message: "hi", Timestamp: "2026-05-06T10:30:00Z"},
+			`{"kind":"deliver","from":"alice","message":"hi","timestamp":"2026-05-06T10:30:00Z"}`},
 		{"unsolicited error omits id",
 			Error{Code: CodeOversize, Message: "too big"},
 			`{"kind":"error","code":"oversize","message":"too big"}`},
@@ -90,6 +99,56 @@ func TestEnvelopeShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeliverMixedVersionCompatibility(t *testing.T) {
+	t.Run("old delivery without id decodes in new reader", func(t *testing.T) {
+		body := []byte(`{"kind":"deliver","from":"alice","message":"hi","timestamp":"2026-05-06T10:30:00Z"}`)
+		var framed bytes.Buffer
+		if err := binary.Write(&framed, binary.BigEndian, uint32(len(body))); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if _, err := framed.Write(body); err != nil {
+			t.Fatalf("write body: %v", err)
+		}
+
+		got, err := NewConn(&framed).Read()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		d, ok := got.(Deliver)
+		if !ok {
+			t.Fatalf("got %T, want Deliver", got)
+		}
+		if d.ID != "" || d.From != "alice" || d.Message != "hi" || d.Timestamp != "2026-05-06T10:30:00Z" {
+			t.Fatalf("deliver = %+v", d)
+		}
+	})
+
+	t.Run("old-style decoder ignores new id", func(t *testing.T) {
+		body, err := (Deliver{
+			ID:        "deadbeef",
+			From:      "alice",
+			Message:   "hi",
+			Timestamp: "2026-05-06T10:30:00Z",
+		}).encode()
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+
+		var old struct {
+			Kind      Kind   `json:"kind"`
+			From      string `json:"from"`
+			Message   string `json:"message"`
+			Timestamp string `json:"timestamp"`
+		}
+		if err := json.Unmarshal(body, &old); err != nil {
+			t.Fatalf("old-style decode: %v", err)
+		}
+		if old.Kind != KindDeliver || old.From != "alice" || old.Message != "hi" || old.Timestamp != "2026-05-06T10:30:00Z" {
+			t.Fatalf("old-style deliver = %+v", old)
+		}
+	})
 }
 
 // TestReadErrors covers the failure paths of Conn.Read against synthetic input.
@@ -164,6 +223,55 @@ func TestReadErrors(t *testing.T) {
 	})
 }
 
+// FuzzConnRead exercises the untrusted broker framing boundary. Successful
+// decodes must remain encodable and readable as the same concrete frame kind;
+// malformed inputs may return an error but must never panic or allocate beyond
+// the protocol's announced frame limit.
+func FuzzConnRead(f *testing.F) {
+	seeds := []Frame{
+		Hello{Name: "alice", Version: "test"},
+		Welcome{},
+		Goodbye{Reason: "shutdown"},
+		Send{ID: "1", To: "bob", Message: "hello"},
+		SendAckOK("1"),
+		ListPeers{ID: "2"},
+		ListPeersReply{ID: "2", Peers: []string{"alice", "bob"}},
+		Deliver{ID: "1", From: "alice", Message: "hello", Timestamp: "2026-07-13T00:00:00Z"},
+		Error{ID: "1", Code: CodeBadFrame, Message: "bad"},
+	}
+	for _, seed := range seeds {
+		var framed bytes.Buffer
+		if err := NewConn(&framed).Write(seed); err != nil {
+			f.Fatalf("encode seed %s: %v", seed.Kind(), err)
+		}
+		f.Add(framed.Bytes())
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0, 0, 0, 1, '{'})
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > MaxFrameSize+4 {
+			t.Skip()
+		}
+		got, err := NewConn(&readWriteAdapter{r: bytes.NewReader(data)}).Read()
+		if err != nil {
+			return
+		}
+		var roundTrip bytes.Buffer
+		if err := NewConn(&roundTrip).Write(got); err != nil {
+			t.Fatalf("re-encode %s: %v", got.Kind(), err)
+		}
+		again, err := NewConn(&roundTrip).Read()
+		if err != nil {
+			t.Fatalf("read re-encoded %s: %v", got.Kind(), err)
+		}
+		if again.Kind() != got.Kind() {
+			t.Fatalf("round-trip kind = %q, want %q", again.Kind(), got.Kind())
+		}
+	})
+}
+
 // TestWriteOversize ensures we refuse to send giant frames at marshal time, so
 // neither side has to parse oversized garbage. The big string is sized so the
 // JSON envelope crosses MaxFrameSize.
@@ -176,7 +284,98 @@ func TestWriteOversize(t *testing.T) {
 	}
 }
 
-// TestConcurrentWrites verifies the per-Conn write mutex serializes frames
+func TestWriteWithTimeoutIncludesQueueWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		blocked := &firstWriteBlocker{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		c := NewConn(blocked)
+		firstDone := make(chan error, 1)
+		go func() {
+			firstDone <- c.Write(ListPeersReply{ID: "blocking"})
+		}()
+		<-blocked.started
+
+		const budget = time.Second
+		start := time.Now()
+		err := c.WriteWithTimeout(Goodbye{Reason: "shutdown"}, budget)
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("queued write error = %v, want deadline exceeded", err)
+		}
+		if elapsed := time.Since(start); elapsed != budget {
+			t.Fatalf("queued write elapsed = %v, want total budget %v", elapsed, budget)
+		}
+
+		close(blocked.release)
+		if err := <-firstDone; err != nil {
+			t.Fatalf("blocking write after release: %v", err)
+		}
+	})
+}
+
+type firstWriteBlocker struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *firstWriteBlocker) Write(p []byte) (int, error) {
+	w.once.Do(func() {
+		close(w.started)
+		<-w.release
+	})
+	return len(p), nil
+}
+
+func (*firstWriteBlocker) Read([]byte) (int, error) { return 0, io.EOF }
+
+func TestWriteAllCompletesShortWrites(t *testing.T) {
+	w := &chunkWriter{max: 2}
+	c := NewConn(w)
+	want := Hello{Name: "alice", Version: "test"}
+	if err := c.Write(want); err != nil {
+		t.Fatalf("write through short writer: %v", err)
+	}
+	if w.writes <= 2 {
+		t.Fatalf("underlying writes = %d, want retries for short writes", w.writes)
+	}
+	frame, err := NewConn(&w.Buffer).Read()
+	if err != nil {
+		t.Fatalf("read completed short writes: %v", err)
+	}
+	if got, ok := frame.(Hello); !ok || got != want {
+		t.Fatalf("round trip = %#v, want %#v", frame, want)
+	}
+}
+
+type chunkWriter struct {
+	bytes.Buffer
+	max    int
+	writes int
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
+
+func TestWriteAllRejectsNoProgress(t *testing.T) {
+	err := NewConn(zeroProgressWriter{}).Write(Welcome{})
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("no-progress write error = %v, want io.ErrShortWrite", err)
+	}
+}
+
+type zeroProgressWriter struct{}
+
+func (zeroProgressWriter) Write([]byte) (int, error) { return 0, nil }
+func (zeroProgressWriter) Read([]byte) (int, error)  { return 0, io.EOF }
+
+// TestConcurrentWrites verifies the per-Conn write gate serializes frames
 // even when many goroutines call Write concurrently. We expect to see N
 // well-formed frames back-to-back, no interleaving.
 func TestConcurrentWrites(t *testing.T) {
@@ -227,7 +426,7 @@ func (a *readWriteAdapter) Read(p []byte) (int, error) { return a.r.Read(p) }
 func (a *readWriteAdapter) Write([]byte) (int, error)  { return 0, errors.New("read-only adapter") }
 
 // safeBuf is a goroutine-safe wrapper around bytes.Buffer for concurrent-write
-// tests. bytes.Buffer is not safe for concurrent Write; the Conn's writeM is,
+// tests. bytes.Buffer is not safe for concurrent Write; the Conn's gate is,
 // but we still need the underlying Writer to handle concurrent direct calls
 // from the Conn implementation across goroutines after the lock is released.
 type safeBuf struct {
@@ -282,11 +481,11 @@ func TestValidName(t *testing.T) {
 	}
 }
 
-// TestWriteWithTimeoutAppliesUnderLock verifies that the deadline is set and
-// cleared inside the per-Conn write mutex, so two concurrent writers can't
+// TestWriteWithTimeoutAppliesDeadlineUnderGate verifies that the deadline is set and
+// cleared inside the per-Conn write gate, so two concurrent writers can't
 // clobber each other's deadlines. The deadlinerProbe tracks every
 // SetWriteDeadline call.
-func TestWriteWithTimeoutAppliesUnderLock(t *testing.T) {
+func TestWriteWithTimeoutAppliesDeadlineUnderGate(t *testing.T) {
 	probe := &deadlinerProbe{}
 	c := NewConn(probe)
 

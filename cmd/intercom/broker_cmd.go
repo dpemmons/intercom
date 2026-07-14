@@ -23,13 +23,17 @@ func newBrokerCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "broker",
-		Short: "Run the local message router",
-		Long: `Run the broker: a single in-memory router process that all shims connect to.
-Normally auto-spawned by the first shim; you can run it manually for debugging or to set a custom idle timeout.
+		Short: "Runs the local message router",
+		Long: `intercom broker runs the single in-memory router used by all Intercom adapters.
+The first adapter normally starts the broker. Direct invocation supports diagnostics and custom idle timeouts.
 
-Lock semantics: only one broker runs at a time. If another broker already holds the lock, this command exits 0 (so auto-spawn is idempotent).`,
+Only one broker holds a socket lock. A second broker invocation exits successfully when that lock is held.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			resolvedIdleAfter, err := resolveBrokerIdleAfter(cmd, idleAfter)
+			if err != nil {
+				return err
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 			defer stop()
 
@@ -55,7 +59,7 @@ Lock semantics: only one broker runs at a time. If another broker already holds 
 			err = broker.Run(ctx, broker.Options{
 				SocketPath: sock,
 				LockPath:   lock,
-				IdleAfter:  idleAfter,
+				IdleAfter:  resolvedIdleAfter,
 				Logger:     logger,
 			})
 			if errors.Is(err, broker.ErrLockHeld) {
@@ -72,6 +76,30 @@ Lock semantics: only one broker runs at a time. If another broker already holds 
 	cmd.Flags().DurationVar(&idleAfter, "idle-after", broker.DefaultIdleAfter, "exit after this long with zero connected peers (0 disables)")
 	cmd.Flags().BoolVar(&foreground, "foreground", false, "log to stderr instead of the broker log file")
 	return cmd
+}
+
+func resolveBrokerIdleAfter(cmd *cobra.Command, flagValue time.Duration) (time.Duration, error) {
+	value := flagValue
+	if !cmd.Flags().Changed("idle-after") {
+		if raw := os.Getenv("INTERCOM_IDLE_EXIT"); raw != "" {
+			parsed, err := time.ParseDuration(raw)
+			if err != nil {
+				return 0, fmt.Errorf("broker: invalid INTERCOM_IDLE_EXIT %q: %w", raw, err)
+			}
+			value = parsed
+		}
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("broker: idle exit must be non-negative, got %s", value)
+	}
+	return brokerIdleAfter(value), nil
+}
+
+func brokerIdleAfter(value time.Duration) time.Duration {
+	if value == 0 {
+		return broker.IdleExitDisabled
+	}
+	return value
 }
 
 // openLogger returns a slog.Logger configured for the broker. In the default

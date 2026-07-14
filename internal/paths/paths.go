@@ -16,6 +16,7 @@ const (
 	sockName = "broker.sock"
 	lockName = "broker.sock.lock"
 	logName  = "broker.log"
+	codexDir = "codex"
 )
 
 // Dir returns the runtime directory (~/.claude-intercom by default).
@@ -74,4 +75,36 @@ func Log() (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, logName), nil
+}
+
+// CodexDir returns the directory containing managed Codex peer state.
+func CodexDir() (string, error) {
+	d, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	p := filepath.Join(d, codexDir)
+	if err := os.MkdirAll(p, 0o700); err != nil {
+		return "", fmt.Errorf("paths: mkdir %s: %w", p, err)
+	}
+	return p, nil
+}
+
+// CodexState returns the managed state path for peer. Callers must validate
+// peer before using it as a path component.
+func CodexState(peer string) (string, error) {
+	d, err := CodexDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, peer+".json"), nil
+}
+
+// CodexLock returns the lifetime lock path for a managed Codex peer.
+func CodexLock(peer string) (string, error) {
+	d, err := CodexDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, peer+".lock"), nil
 }

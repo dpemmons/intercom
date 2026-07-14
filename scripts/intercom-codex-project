@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -u
+
+# Supported project supervisor for one dedicated Codex app-server and one Intercom
+# adapter. Configure binary locations with CODEX_BIN and INTERCOM_BIN. Runtime
+# arguments other than help and the prohibited app-server option are forwarded
+# to `intercom codex`.
+
+codex_bin=${CODEX_BIN:-codex}
+intercom_bin=${INTERCOM_BIN:-intercom}
+startup_timeout=${INTERCOM_CODEX_STARTUP_TIMEOUT_SECONDS:-30}
+shutdown_timeout=${INTERCOM_CODEX_SHUTDOWN_TIMEOUT_SECONDS:-40}
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]' \
+    '' \
+    'Description:' \
+    '  Starts one dedicated Codex app-server and one Intercom Codex adapter.' \
+    '  The service group runs in the foreground until either child exits or a' \
+    '  terminating signal arrives. Polling checks the adapter before app-server.' \
+    '' \
+    'Options:' \
+    '  --name NAME       Sets the Intercom peer name.' \
+    '  --cwd DIRECTORY   Sets the managed project directory.' \
+    '  --new             Starts a new managed thread and replaces its binding.' \
+    '  -h, --help        Prints this help text and exits.' \
+    '' \
+    'Environment:' \
+    '  CODEX_BIN                                  Codex executable; default: codex.' \
+    '  INTERCOM_BIN                               Source default: intercom; package: bundled.' \
+    '  INTERCOM_CODEX_STARTUP_TIMEOUT_SECONDS      Readiness timeout; empty/default: 30.' \
+    '  INTERCOM_CODEX_SHUTDOWN_TIMEOUT_SECONDS     Per-child timeout; empty/default: 40.' \
+    '  XDG_RUNTIME_DIR                            Temporary socket directory base.' \
+    '  TMPDIR                                     Fallback socket directory base.' \
+    '' \
+    'Exit status:' \
+    '  0     Help was requested or the adapter exited successfully.' \
+    '  1     Launcher failure, app-server status 0, or observed child status 1.' \
+    '  2     Launcher validation failure or observed child status 2.' \
+    '  129   SIGHUP terminated the launcher, or an observed child returned 129.' \
+    '  130   SIGINT terminated the launcher, or an observed child returned 130.' \
+    '  143   SIGTERM terminated the launcher, or an observed child returned 143.' \
+    '  Other The nonzero status of the child observed to have exited.'
+}
+
+show_help=0
+for arg in "$@"; do
+  case $arg in
+    -h | --help)
+      show_help=1
+      ;;
+    --app-server | --app-server=*)
+      printf 'intercom-codex-project: --app-server is managed by the launcher and must not be supplied\n' >&2
+      exit 2
+      ;;
+  esac
+done
+if ((show_help)); then
+  usage
+  exit 0
+fi
+
+# Timeout values are multiplied by ten for decisecond polling. Keep the
+# canonical value within signed 64-bit arithmetic even after that multiply.
+max_timeout_seconds=922337203685477580
+
+parse_timeout() {
+  local name=$1
+  local value=$2
+  local output=$3
+
+  case $value in
+    '' | *[!0-9]*)
+      printf 'intercom-codex-project: %s must be a positive integer\n' "$name" >&2
+      exit 2
+      ;;
+  esac
+  local leading_zeros=${value%%[!0]*}
+  value=${value#"$leading_zeros"}
+  if [[ -z $value ]] || ((${#value} > ${#max_timeout_seconds})) ||
+    ((${#value} == ${#max_timeout_seconds} && 10#$value > max_timeout_seconds)); then
+    printf 'intercom-codex-project: %s must be a positive integer no greater than %s\n' \
+      "$name" "$max_timeout_seconds" >&2
+    exit 2
+  fi
+  printf -v "$output" '%d' "$((10#$value))"
+}
+
+parse_timeout INTERCOM_CODEX_STARTUP_TIMEOUT_SECONDS "$startup_timeout" startup_timeout
+parse_timeout INTERCOM_CODEX_SHUTDOWN_TIMEOUT_SECONDS "$shutdown_timeout" shutdown_timeout
+
+runtime_base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+runtime_dir=$(mktemp -d "${runtime_base%/}/intercom-codex.XXXXXX") || exit 1
+if ! chmod 700 "$runtime_dir"; then
+  rm -rf "$runtime_dir"
+  exit 1
+fi
+socket_path=$runtime_dir/app-server.sock
+endpoint=unix://$socket_path
+
+server_pid=
+adapter_pid=
+cleaned=0
+
+is_running() {
+  local want=$1
+  local pid
+  while IFS= read -r pid; do
+    if [[ $pid == "$want" ]]; then
+      return 0
+    fi
+  done < <(jobs -pr)
+  return 1
+}
+
+wait_dead() {
+  local pid=$1
+  local timeout=$2
+  local ticks=$((timeout * 10))
+  local i
+  for ((i = 0; i < ticks; i++)); do
+    if ! is_running "$pid"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_process() {
+  local pid=$1
+  local label=$2
+  if [[ -z $pid ]] || ! is_running "$pid"; then
+    if [[ -n $pid ]]; then
+      wait "$pid" 2>/dev/null || true
+    fi
+    return
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  if ! wait_dead "$pid" "$shutdown_timeout"; then
+    printf 'intercom-codex-project: %s did not stop; killing it\n' "$label" >&2
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+cleanup() {
+  if ((cleaned)); then
+    return
+  fi
+  cleaned=1
+  # The adapter must disappear from the broker and drain its turn before the
+  # app-server is stopped.
+  stop_process "$adapter_pid" adapter
+  stop_process "$server_pid" app-server
+  rm -rf "$runtime_dir"
+}
+
+on_signal() {
+  local status=$1
+  trap - INT TERM HUP EXIT
+  cleanup
+  exit "$status"
+}
+
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap 'on_signal 129' HUP
+trap cleanup EXIT
+
+"$codex_bin" app-server --listen "$endpoint" &
+server_pid=$!
+
+# Waiting for the socket avoids a noisy initial failure while the adapter's
+# own bounded dial retry verifies the actual WebSocket handshake.
+startup_ticks=$((startup_timeout * 10))
+for ((i = 0; i < startup_ticks; i++)); do
+  if [[ -S $socket_path ]]; then
+    break
+  fi
+  if ! is_running "$server_pid"; then
+    wait "$server_pid" || status=$?
+    printf 'intercom-codex-project: app-server exited before readiness\n' >&2
+    exit "${status:-1}"
+  fi
+  sleep 0.1
+done
+if [[ ! -S $socket_path ]]; then
+  printf 'intercom-codex-project: app-server was not ready after %ss\n' "$startup_timeout" >&2
+  exit 1
+fi
+
+"$intercom_bin" codex --app-server "$endpoint" "$@" &
+adapter_pid=$!
+
+while :; do
+  if ! is_running "$adapter_pid"; then
+    status=0
+    wait "$adapter_pid" || status=$?
+    adapter_pid=
+    stop_process "$server_pid" app-server
+    server_pid=
+    exit "$status"
+  fi
+  if ! is_running "$server_pid"; then
+    status=0
+    wait "$server_pid" || status=$?
+    server_pid=
+    stop_process "$adapter_pid" adapter
+    adapter_pid=
+    if ((status == 0)); then
+      status=1
+    fi
+    exit "$status"
+  fi
+  sleep 0.1
+done

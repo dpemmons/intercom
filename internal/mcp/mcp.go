@@ -6,9 +6,8 @@
 //   - tools/list and tools/call dispatch
 //   - Public Notify(method, params) for sending arbitrary outbound notifications
 //
-// The package exists because, as of v1.5.0, the official Go MCP SDK does not
-// expose a way to send notifications with non-standard methods, and the entire
-// purpose of this binary is to emit notifications/claude/channel events.
+// The package keeps non-standard outbound notifications explicit because the
+// shim emits notifications/claude/channel events.
 //
 // This is not a full MCP implementation. It serves one well-defined client
 // (Claude Code) over one transport (stdio).
@@ -16,6 +15,7 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -208,6 +208,11 @@ func (s *Server) dispatch(ctx context.Context, wg *sync.WaitGroup, raw []byte) {
 		// frames.
 		return
 	}
+	notification, validID := classifyRequestID(msg.ID)
+	if !validID {
+		s.replyError(nil, codeInvalidRequest, "id must be a string, number, or null")
+		return
+	}
 	if msg.JSONRPC != "2.0" {
 		// Wrong version: protocol-level error.
 		s.replyError(msg.ID, codeInvalidRequest, "expected jsonrpc 2.0")
@@ -215,7 +220,7 @@ func (s *Server) dispatch(ctx context.Context, wg *sync.WaitGroup, raw []byte) {
 	}
 
 	// Notification: no id, no response expected.
-	if msg.ID == nil {
+	if notification {
 		switch msg.Method {
 		case "notifications/initialized":
 			s.initOnce.Do(func() { close(s.initCh) })
@@ -260,7 +265,7 @@ type initializeResult struct {
 	Instructions    string         `json:"instructions,omitempty"`
 }
 
-func (s *Server) handleInitialize(id any, paramsRaw json.RawMessage) {
+func (s *Server) handleInitialize(id json.RawMessage, paramsRaw json.RawMessage) {
 	var params initializeParams
 	if len(paramsRaw) > 0 {
 		_ = json.Unmarshal(paramsRaw, &params) // tolerate missing/partial params
@@ -299,7 +304,7 @@ type toolDef struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
-func (s *Server) handleListTools(id any) {
+func (s *Server) handleListTools(id json.RawMessage) {
 	s.toolsMu.RLock()
 	defer s.toolsMu.RUnlock()
 	out := listToolsResult{Tools: make([]toolDef, 0, len(s.tools))}
@@ -328,7 +333,7 @@ type textContent struct {
 	Text string `json:"text"`
 }
 
-func (s *Server) handleCallTool(ctx context.Context, id any, paramsRaw json.RawMessage) {
+func (s *Server) handleCallTool(ctx context.Context, id json.RawMessage, paramsRaw json.RawMessage) {
 	var params callToolParams
 	if err := json.Unmarshal(paramsRaw, &params); err != nil {
 		s.replyError(id, codeInvalidParams, "invalid tools/call params: "+err.Error())
@@ -373,16 +378,31 @@ func (s *Server) invokeHandler(ctx context.Context, tool Tool, args json.RawMess
 
 // ----- JSON-RPC plumbing ---------------------------------------------------
 
-// jsonrpcMessage models any JSON-RPC 2.0 frame. ID is interface{} because
-// per the spec it may be a string, number, or null. We pass it through
-// opaque-ly when echoing in responses.
+// jsonrpcMessage models any JSON-RPC 2.0 frame. RawMessage preserves the exact
+// string or number spelling used for request correlation.
 type jsonrpcMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      any             `json:"id,omitempty"`
+	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
 	Params  json.RawMessage `json:"params,omitempty"`
 	Result  any             `json:"result,omitempty"`
 	Error   *jsonrpcError   `json:"error,omitempty"`
+}
+
+// classifyRequestID returns notification=true for an absent or null ID. A
+// request ID must be a JSON string or number; all other JSON types violate the
+// JSON-RPC contract.
+func classifyRequestID(id json.RawMessage) (notification, valid bool) {
+	trimmed := bytes.TrimSpace(id)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return true, true
+	}
+	switch trimmed[0] {
+	case '"', '-':
+		return false, true
+	default:
+		return false, trimmed[0] >= '0' && trimmed[0] <= '9'
+	}
 }
 
 type jsonrpcError struct {
@@ -397,23 +417,23 @@ const (
 	codeInternal       = -32603
 )
 
-func (s *Server) replyResult(id, result any) {
+func (s *Server) replyResult(id json.RawMessage, result any) {
 	msg := struct {
-		JSONRPC string `json:"jsonrpc"`
-		ID      any    `json:"id"`
-		Result  any    `json:"result"`
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  any             `json:"result"`
 	}{JSONRPC: "2.0", ID: id, Result: result}
 	// If the write fails the session is dead; the next read on Run will
 	// return an error and unwind cleanly. Nothing useful to do here.
 	_ = s.writeMessage(&msg)
 }
 
-func (s *Server) replyError(id any, code int, message string) {
-	msg := jsonrpcMessage{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error:   &jsonrpcError{Code: code, Message: message},
-	}
+func (s *Server) replyError(id json.RawMessage, code int, message string) {
+	msg := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   *jsonrpcError   `json:"error"`
+	}{JSONRPC: "2.0", ID: id, Error: &jsonrpcError{Code: code, Message: message}}
 	_ = s.writeMessage(&msg)
 }
 

@@ -4,8 +4,8 @@
 // Frames are 4-byte big-endian length-prefixed UTF-8 JSON. Each JSON object
 // carries a "kind" discriminator. The Go API uses one concrete type per kind
 // (see Hello, Welcome, Send, SendAck, ListPeers, ListPeersReply, Deliver,
-// Goodbye, Error), all satisfying the [Frame] interface. See DESIGN.md for the
-// full protocol contract.
+// Goodbye, Error), all satisfying the [Frame] interface. See
+// docs/BROKER_PROTOCOL.md for the protocol contract.
 package wire
 
 import (
@@ -16,8 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
-	"sync"
 	"time"
 )
 
@@ -126,9 +126,11 @@ type ListPeersReply struct {
 func (ListPeersReply) Kind() Kind                { return KindListPeersReply }
 func (l ListPeersReply) encode() ([]byte, error) { return marshalEnvelope(KindListPeersReply, l) }
 
-// Deliver: the broker pushes a message to a peer. From is the sender's
-// registered (and validated) name.
+// Deliver: the broker pushes a message to a peer. ID is copied from the
+// originating Send when available; it is optional for compatibility with
+// older brokers. From is the sender's registered (and validated) name.
 type Deliver struct {
+	ID        string `json:"id,omitempty"`
 	From      string `json:"from"`
 	Message   string `json:"message"`
 	Timestamp string `json:"timestamp"`
@@ -180,6 +182,17 @@ func marshalEnvelope(k Kind, body any) ([]byte, error) {
 	return out, nil
 }
 
+// EncodedFrameSize returns the number of JSON payload bytes a frame occupies,
+// excluding the four-byte length prefix. Callers that accept user-controlled
+// strings can use this to reject JSON-escaping expansion before a write.
+func EncodedFrameSize(f Frame) (int, error) {
+	payload, err := f.encode()
+	if err != nil {
+		return 0, fmt.Errorf("wire: marshal %s: %w", f.Kind(), err)
+	}
+	return len(payload), nil
+}
+
 // decode parses a single frame body into the concrete type for k.
 func decode(k Kind, body []byte) (Frame, error) {
 	switch k {
@@ -224,8 +237,10 @@ func decode(k Kind, body []byte) (Frame, error) {
 
 // ----- Codec ---------------------------------------------------------------
 
-// ErrOversize is returned when a frame exceeds [MaxFrameSize]. The connection
-// is unusable after this error and should be closed.
+// ErrOversize is returned when a frame exceeds [MaxFrameSize]. An oversize
+// inbound length makes the connection unusable because the payload remains on
+// the stream. An outbound oversize frame is rejected before any bytes are
+// written, so the connection remains usable.
 var ErrOversize = errors.New("wire: frame exceeds max size")
 
 // ErrShortRead is returned when the underlying reader returns EOF mid-frame.
@@ -239,15 +254,17 @@ type deadliner interface {
 
 // Conn is a length-prefixed JSON frame channel over an [io.ReadWriter].
 //
-// Write is goroutine-safe (a per-Conn mutex serializes writes). Read is not;
+// Write is goroutine-safe (a per-Conn gate serializes writes). Read is not;
 // drive a single read goroutine per connection.
 type Conn struct {
-	rw     io.ReadWriter
-	writeM sync.Mutex
+	rw        io.ReadWriter
+	writeGate chan struct{}
 }
 
 // NewConn wraps rw in a length-prefixed JSON frame channel.
-func NewConn(rw io.ReadWriter) *Conn { return &Conn{rw: rw} }
+func NewConn(rw io.ReadWriter) *Conn {
+	return &Conn{rw: rw, writeGate: make(chan struct{}, 1)}
+}
 
 // Write encodes f and sends it as a single length-prefixed JSON frame. If the
 // encoded payload exceeds MaxFrameSize, Write returns ErrOversize and nothing
@@ -256,17 +273,22 @@ func (c *Conn) Write(f Frame) error {
 	return c.WriteWithTimeout(f, 0)
 }
 
-// WriteWithTimeout is like [Conn.Write] but applies a write deadline of
-// time.Now()+timeout for the duration of this single frame. timeout <= 0
-// means no deadline.
+// WriteWithTimeout is like [Conn.Write], with timeout as one total budget for
+// encoding, waiting behind another writer, and writing this frame. timeout <=
+// 0 means no deadline.
 //
-// The deadline is applied inside the per-Conn write mutex, so concurrent
-// callers don't clobber each other's deadlines: each frame either finishes
-// or trips its own deadline.
+// The socket deadline is applied while holding the per-Conn write gate, so
+// concurrent callers don't clobber each other's deadlines. A caller whose
+// budget expires while queued returns without touching the stream.
 //
 // If the underlying io.ReadWriter doesn't support SetWriteDeadline (e.g. a
-// bytes.Buffer in tests), the timeout is silently ignored.
+// bytes.Buffer in tests), the queue wait is still bounded but an in-progress
+// underlying Write cannot be interrupted.
 func (c *Conn) WriteWithTimeout(f Frame, timeout time.Duration) error {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 	payload, err := f.encode()
 	if err != nil {
 		return fmt.Errorf("wire: marshal %s: %w", f.Kind(), err)
@@ -277,20 +299,73 @@ func (c *Conn) WriteWithTimeout(f Frame, timeout time.Duration) error {
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
 
-	c.writeM.Lock()
-	defer c.writeM.Unlock()
+	if err := c.acquireWrite(deadline); err != nil {
+		return err
+	}
+	defer c.releaseWrite()
 
-	if timeout > 0 {
+	if !deadline.IsZero() {
 		if dc, ok := c.rw.(deadliner); ok {
-			_ = dc.SetWriteDeadline(time.Now().Add(timeout))
+			_ = dc.SetWriteDeadline(deadline)
 			defer dc.SetWriteDeadline(time.Time{})
 		}
 	}
-	if _, err := c.rw.Write(hdr[:]); err != nil {
+	if err := writeAll(c.rw, hdr[:]); err != nil {
 		return fmt.Errorf("wire: write header: %w", err)
 	}
-	if _, err := c.rw.Write(payload); err != nil {
+	if err := writeAll(c.rw, payload); err != nil {
 		return fmt.Errorf("wire: write payload: %w", err)
+	}
+	return nil
+}
+
+func (c *Conn) acquireWrite(deadline time.Time) error {
+	if deadline.IsZero() {
+		c.writeGate <- struct{}{}
+		return nil
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return writeDeadlineExceeded()
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case c.writeGate <- struct{}{}:
+		// If release and deadline became ready together, do not grant a fresh
+		// socket-write budget after the caller's total budget has elapsed.
+		if !time.Now().Before(deadline) {
+			c.releaseWrite()
+			return writeDeadlineExceeded()
+		}
+		return nil
+	case <-timer.C:
+		return writeDeadlineExceeded()
+	}
+}
+
+func (c *Conn) releaseWrite() { <-c.writeGate }
+
+func writeDeadlineExceeded() error {
+	return fmt.Errorf("wire: write deadline exceeded before frame write: %w", os.ErrDeadlineExceeded)
+}
+
+// writeAll defensively completes short writes while refusing a no-progress
+// writer. A frame stays under the write gate for the entire loop, so its bytes
+// cannot interleave with another frame.
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n < 0 || n > len(p) {
+			return fmt.Errorf("invalid write count %d for %d-byte buffer", n, len(p))
+		}
+		p = p[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
 	return nil
 }

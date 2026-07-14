@@ -11,15 +11,17 @@ import (
 func newNameCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "name",
-		Short: "Print the peer name the shim would register with for the current cwd",
-		Long:  "Resolves the peer name using the same rules as the shim ($INTERCOM_NAME or basename of cwd). Useful for sanity-checking before starting Claude Code.",
+		Short: "Prints the resolved peer name",
+		Long:  "intercom name prints INTERCOM_NAME after validation, or the basename of the current working directory when INTERCOM_NAME is empty.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			n, err := shim.ResolveName()
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), n)
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), n); err != nil {
+				return fmt.Errorf("name: write output: %w", err)
+			}
 			return nil
 		},
 	}

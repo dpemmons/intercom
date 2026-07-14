@@ -1,176 +1,143 @@
 # intercom
 
-A local-only chat bridge between Claude Code sessions. One Claude Code session
-calls `send_message`; the other receives it as a `<channel>` tag in its
-context, in real time, via the [Channels API](https://code.claude.com/docs/en/channels-reference).
+## NAME
 
-Inspired by [`MuhammadTalhaMT/claude-intercom`](https://github.com/MuhammadTalhaMT/claude-intercom),
-rewritten in Go with a single-binary, broker-plus-shim architecture optimized
-for the realistic case of two or more local Claude Code sessions on the same
-machine.
+`intercom` — routes messages between local Claude Code sessions and managed Codex app-server sessions.
 
-See [`DESIGN.md`](./DESIGN.md) for the full architecture, wire protocols, and
-non-goals.
+## SYNOPSIS
 
-## Requirements
+```text
+intercom [--help] [--version]
+intercom shim
+intercom codex --app-server ENDPOINT [--name NAME] [--cwd DIRECTORY] [--new]
+intercom broker [--idle-after DURATION] [--foreground]
+intercom name
+intercom peers
+intercom completion {bash|fish|powershell|zsh} [--no-descriptions]
+intercom help [COMMAND ...]
 
-- macOS or Linux
-- Go 1.25+ (to build)
-- Claude Code v2.1.80+ (the Channels API is in research preview)
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]
 
-## Install
+send_message(to=NAME, message=TEXT)
+list_peers()
+```
+
+## DESCRIPTION
+
+Intercom provides named, same-machine peers behind one Unix-domain-socket broker. `intercom shim` adapts the broker to Claude Code MCP and Channels. `intercom codex` adapts the broker to one dedicated Codex app-server thread. Both adapters expose the same `send_message` and `list_peers` tools to their models.
+
+The broker stores no messages. A successful send means that the broker completed a delivery-frame write to the connected destination adapter. It does not establish that the destination model observed, processed, or answered the message.
+
+## QUICK START
+
+### Requirements
+
+- Linux or macOS.
+- Nix with flakes, or Go 1.25.5 and Bash.
+- Claude Code 2.1.80 or later for Claude peers.
+- `codex-cli` 0.144.1 for Codex peers.
+- A Claude authentication method supported by Claude Code Channels.
+- A Codex authentication method supported by `codex app-server`.
+
+Claude Code Channels is a research-preview interface. Organization-managed Claude Team and Enterprise accounts require the Channels setting to be enabled. Anthropic Console organizations that deploy managed settings require `channelsEnabled: true`; Console organizations without managed settings have Channels enabled by default. Channels is unavailable through Amazon Bedrock, Google Vertex AI, and Microsoft Foundry.
+
+### Install with Nix
+
+The following command runs from the repository root and installs `intercom` and `intercom-codex-project` into the active Nix profile:
 
 ```sh
-go install github.com/dpemmons/intercom/cmd/intercom@latest
+nix profile add path:.
+hash -r
 ```
 
-Or build from a checkout:
+### Build from a checkout
+
+The following commands run from the repository root:
 
 ```sh
-go build -o /usr/local/bin/intercom ./cmd/intercom
+mkdir -p bin
+go build -o bin/intercom ./cmd/intercom
+install -m 0755 scripts/intercom-codex-project bin/intercom-codex-project
+export PATH="$PWD/bin:$PATH"
 ```
 
-## Configure (one time)
+The exported `PATH` must remain in the shell that starts either program. Without that export, checkout-local launcher use must set `INTERCOM_BIN=./bin/intercom`; invoking only `./bin/intercom-codex-project` can select another `intercom` from `PATH`.
 
-Add the shim to your **user-level** `~/.claude.json` so every Claude Code
-session you start gets it for free:
+### Connect Claude Code
 
-```jsonc
-{
-  "mcpServers": {
-    "intercom": {
-      "command": "/usr/local/bin/intercom",
-      "args": ["shim"]
-    }
-  }
-}
-```
-
-No `env` block needed for the common case. The shim auto-derives a peer name
-from the basename of the directory you started Claude Code in.
-
-### Giving a session a custom name
-
-The auto-derived name (project basename) is fine when each project has a
-distinct name. When it isn't — for instance, two checkouts of the same repo,
-or two windows on the same project — set `INTERCOM_NAME` explicitly via a
-**project-local** `.mcp.json` at the project's root. Project-local config
-overrides the user-level entry above:
-
-```jsonc
-// ~/work/myrepo/.mcp.json — only applies when Claude Code is started from this dir
-{
-  "mcpServers": {
-    "intercom": {
-      "command": "/usr/local/bin/intercom",
-      "args": ["shim"],
-      "env": {
-        "INTERCOM_NAME": "myrepo-work"
-      }
-    }
-  }
-}
-```
-
-Now Claude Code in `~/work/myrepo` registers as `myrepo-work` instead of the
-default `myrepo`. From any other session, `list_peers` will show
-`myrepo-work`, and `send_message(to="myrepo-work", ...)` will route to it.
-
-Sanity-check what name a directory will resolve to without launching Claude:
+The MCP registration is user-scoped and is performed once:
 
 ```sh
-cd ~/work/myrepo
-intercom name        # prints "myrepo-work" (or "myrepo" without the env block)
+claude mcp add --transport stdio --scope user intercom -- intercom shim
+claude mcp get intercom
 ```
 
-You can also set `INTERCOM_NAME` in your shell to override on a per-launch
-basis:
+Each Claude Code peer starts with Channels enabled:
 
 ```sh
-INTERCOM_NAME=myrepo-debug claude --dangerously-load-development-channels server:intercom
+INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:intercom
 ```
 
-## Use
+`INTERCOM_NAME` is optional when the working-directory basename is a suitable peer name.
 
-Start Claude Code with the channel allowlist override (required during the
-research preview):
+### Connect Codex
+
+The launcher owns one child app-server and one child adapter:
 
 ```sh
-claude --dangerously-load-development-channels server:intercom
+intercom-codex-project --name reviewer --cwd .
 ```
 
-In one Claude Code window:
+The launcher adapter joins the broker selected by its inherited `INTERCOM_SOCKET`. The value must match the value inherited by existing Claude peers; leaving it unset joins the default broker group.
 
-> "What sessions are online? Send a message to `<peer>` asking about the API
-> for the dashboard."
+The process remains in the foreground. A subsequent invocation with the same peer name, canonical working directory, Codex home, and compatible Codex server attempts to resume the saved managed thread. Before the first turn is materialized, a missing Codex rollout causes the adapter to start a replacement thread. A materialized binding is never replaced implicitly. `--new` creates another thread and replaces the Intercom binding.
 
-The other session receives the message as a `<channel>` tag and can reply by
-calling `send_message`.
+Arbitrary Codex CLI, TUI, desktop, and shared app-server threads cannot be adopted. Intercom owns a dedicated headless app-server thread because its dynamic tools and lifecycle policy form part of the managed-thread contract.
 
-## Subcommands
+### Exchange messages
 
-| Command            | What it does |
-|--------------------|--------------|
-| `intercom shim`    | The MCP server. Launched by Claude Code via `~/.claude.json`. |
-| `intercom broker`  | The local router. Auto-spawned by the shim; can be run by hand for debugging. |
-| `intercom name`    | Print the peer name the shim would register with for the current cwd. |
-| `intercom peers`   | Connect to the broker and print the names of other connected peers. |
-| `intercom version` | Print version + git SHA (also available via `--version`). |
+The connected model invokes the tools. Intercom has no shell `send` command.
 
-## Configuration
-
-| Env var               | Used by      | Default                          | Purpose |
-|-----------------------|--------------|----------------------------------|---------|
-| `INTERCOM_NAME`       | shim         | basename of cwd                  | This session's peer name. |
-| `INTERCOM_SOCKET`     | shim, broker | `~/.claude-intercom/broker.sock` | Path to the Unix socket. |
-| `INTERCOM_DIR`        | shim, broker | `~/.claude-intercom`             | Override the runtime directory entirely. |
-| `INTERCOM_BROKER_BIN` | shim         | `os.Executable()`                | Override the binary used to auto-spawn the broker. |
-| `INTERCOM_BROKER_LOG` | broker       | `~/.claude-intercom/broker.log`  | Where the broker writes structured logs. |
-
-## How it works
-
-```
-Claude Code A ──stdio (MCP)──► intercom shim A ──┐
-                                                  ├── unix socket ──► intercom broker
-Claude Code B ──stdio (MCP)──► intercom shim B ──┘
+```text
+Call list_peers. Send reviewer a message asking for a review of the current change.
 ```
 
-- Each Claude Code session spawns its own `intercom shim` subprocess. The
-  shim speaks MCP over stdio and declares the `claude/channel` capability,
-  which is what gates the `<channel>` tag treatment in Claude's context.
-- All shims connect to one shared `intercom broker` over a Unix socket. The
-  broker is auto-spawned by the first shim and exits cleanly after 10 idle
-  minutes.
-- `send_message` in one shim becomes a `notifications/claude/channel` event
-  on the destination shim, surfaced to Claude as a `<channel>` tag.
+Claude receives a delivery as a channel event. Codex receives a delivery as a serialized user turn after any active turn finishes. A normal Codex final response remains in its managed thread; only `send_message` sends content to another peer.
 
-## Limitations
+## PUBLIC INTERFACE
 
-- **Single machine only.** The broker listens on a Unix socket; there is no
-  TLS path. Cross-machine support is intentionally deferred (see
-  [DESIGN.md → Future work](./DESIGN.md#future-work-out-of-scope-for-v1)).
-- **No persistence.** Messages are routed in memory; the broker keeps no
-  history. If a peer is offline when you send to it, the send fails with
-  `no_such_peer`.
-- **Same-project collisions are loud.** If you open two Claude Code windows
-  on the same project, both auto-name to the project basename and the second
-  fails to register. See [Giving a session a custom name](#giving-a-session-a-custom-name)
-  for the project-local `.mcp.json` workaround.
-- **Delivery is best-effort within the broker's lifetime.** No queueing, no
-  persistence, no retry — if a recipient is offline at send time, the send
-  fails with `no_such_peer` and the message is gone.
-- **macOS / Linux only.** Unix sockets are POSIX-only.
+| Interface | Contract |
+|---|---|
+| [`intercom`](docs/REFERENCE.md#intercom-root) | Prints command help when invoked without a command. |
+| [`intercom shim`](docs/REFERENCE.md#intercom-shim) | Runs the Claude Code stdio MCP and Channels adapter. |
+| [`intercom codex`](docs/REFERENCE.md#intercom-codex) | Connects an externally supervised dedicated app-server to the broker. |
+| [`intercom broker`](docs/REFERENCE.md#intercom-broker) | Runs the broker. Adapters and `intercom peers` start it on demand. |
+| [`intercom name`](docs/REFERENCE.md#intercom-name) | Prints the validated peer name resolved for the working directory. |
+| [`intercom peers`](docs/REFERENCE.md#intercom-peers) | Prints other connected peer names through a transient broker connection. |
+| [`intercom completion`](docs/REFERENCE.md#intercom-completion) | Generates a shell-completion program for a supported shell. |
+| [`intercom help`](docs/REFERENCE.md#intercom-help) | Prints help for the selected command path. |
+| [`intercom --help`](docs/REFERENCE.md#intercom-root) | Prints root command help. |
+| [`intercom --version`](docs/REFERENCE.md#intercom-root) | Prints the Intercom version and build revision. |
+| [`intercom-codex-project`](docs/REFERENCE.md#intercom-codex-project) | Supervises one dedicated Codex app-server and adapter service group. |
+| [`send_message`](docs/REFERENCE.md#send_message) | Sends one message to one connected peer. |
+| [`list_peers`](docs/REFERENCE.md#list_peers) | Lists other peers connected to the same broker. |
 
-## Tests
+## DOCUMENTATION
 
-```sh
-go test ./... -race
-```
+- [Handbook](docs/HANDBOOK.md) — installation, Claude setup, Codex setup, operation, restart, and troubleshooting tasks.
+- [Command and tool reference](docs/REFERENCE.md) — complete arguments, options, environment, files, limits, errors, and examples.
+- [Architecture](docs/ARCHITECTURE.md) — components, invariants, lifecycles, state, and failure semantics.
+- [Broker protocol](docs/BROKER_PROTOCOL.md) — transport, frame, tool, and error contracts.
+- [Development](docs/DEVELOPMENT.md) — build and verification procedures.
 
-The `e2e_test.go` at the repo root spins up an in-process broker and two
-shims and exercises a full `send_message` → `notifications/claude/channel`
-round trip.
+## NOTES
 
-## License
+Intercom is a local transport, not an offline inference system. Claude Code and Codex may send message content to their configured model providers.
 
-MIT
+Peer messages become model input. A trusted same-user environment is required. Intercom does not authenticate one local peer to another beyond Unix file permissions and unique live peer names.
+
+All peers on one broker should use the same Intercom build. The broker protocol has no version negotiation; tolerant JSON decoding does not establish mixed-build compatibility.
+
+## SEE ALSO
+
+[Codex documentation](https://developers.openai.com/codex/), [Claude Code Channels](https://code.claude.com/docs/en/channels), [Claude Code MCP](https://code.claude.com/docs/en/mcp), [MIT license](LICENSE)

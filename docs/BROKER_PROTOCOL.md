@@ -10,14 +10,41 @@ intercom broker protocol — local peer registration, discovery, and message rou
 - [SYNOPSIS](#synopsis)
 - [DESCRIPTION](#description)
 - [TRANSPORT](#transport)
+  - [Frame format](#frame-format)
+  - [JSON decoding](#json-decoding)
+  - [End of stream](#end-of-stream)
+  - [Common inbound-frame conditions](#common-inbound-frame-conditions)
 - [DATA TYPES](#data-types)
+  - [Peer name](#peer-name)
+  - [Request ID](#request-id)
+  - [Message](#message)
+  - [Timestamp](#timestamp)
 - [CONNECTION LIFECYCLE](#connection-lifecycle)
+  - [Handshake](#handshake)
+  - [Registered state](#registered-state)
+  - [Shutdown](#shutdown)
 - [FRAME REFERENCE](#frame-reference)
+  - [`hello`](#hello)
+  - [`welcome`](#welcome)
+  - [`send`](#send)
+  - [`send_ack`](#send_ack)
+  - [`list_peers`](#list_peers)
+  - [`list_peers_reply`](#list_peers_reply)
+  - [`deliver`](#deliver)
+  - [`goodbye`](#goodbye)
+  - [`error`](#error)
 - [ERROR CODES](#error-codes)
 - [CORRELATION AND ORDERING](#correlation-and-ordering)
 - [DELIVERY SEMANTICS](#delivery-semantics)
 - [CLIENT BEHAVIOR](#client-behavior)
 - [CLAUDE MCP MAPPING](#claude-mcp-mapping)
+  - [Transport profile](#transport-profile)
+  - [Request IDs and dispatch](#request-ids-and-dispatch)
+  - [`tools/call` result envelopes](#toolscall-result-envelopes)
+  - [MCP errors](#mcp-errors)
+  - [`send_message`](#send_message)
+  - [`list_peers` tool](#list_peers-tool)
+  - [Inbound channel notification](#inbound-channel-notification)
 - [LIMITS AND DEADLINES](#limits-and-deadlines)
 - [SECURITY](#security)
 - [VERIFICATION](#verification)
@@ -103,6 +130,25 @@ after part of a prefix or payload is a short read. The broker closes the peer
 connection in both cases. A clean EOF produces no error frame. A short read
 produces a best-effort bad_frame response when the connection still accepts
 writes and broker shutdown has not started.
+
+### Common inbound-frame conditions
+
+The following conditions apply whenever the broker reads a client frame. A
+frame entry's Errors section lists its additional semantic conditions.
+
+| Condition | Error carrier and broker result |
+| --- | --- |
+| The four-byte prefix announces more than 262,144 payload bytes. | A best-effort uncorrelated `error` frame carries `oversize`; the broker closes the connection without reading the announced payload. |
+| The payload is malformed JSON, omits `kind`, has an unknown `kind`, or contains a field whose JSON type cannot decode for that kind. | A best-effort uncorrelated `error` frame carries `bad_frame`; the broker closes the connection. |
+| The stream ends after part of a prefix or payload. | A best-effort uncorrelated `error` frame carries `bad_frame`; the broker closes the connection. |
+| The stream ends before any byte of the next frame. | The broker closes the connection without an error frame. |
+| The broker does not finish reading the first frame before the configured hello deadline. | An uncorrelated `error` frame carries `hello_timeout` under a one-second raw-socket write deadline; the broker then closes the connection. |
+| The first complete decodable frame has a recognized `kind` other than `hello`. | A best-effort uncorrelated `error` frame carries `bad_hello`; the broker closes the connection. |
+| A recognized frame other than `send` or `list_peers` follows successful registration. | A best-effort uncorrelated `error` frame carries `bad_frame`; the broker closes the connection. |
+
+The broker can omit a best-effort error when the connection no longer accepts
+writes or shutdown has started. [ERROR CODES](#error-codes) defines the exact
+diagnostic text and connection action.
 
 ## DATA TYPES
 
@@ -205,6 +251,11 @@ a new interval.
 Every JSON example in this section is the payload. The four-byte big-endian
 payload length precedes it on the socket.
 
+String-field lengths use UTF-8 bytes. A field without a narrower limit in its
+entry or referenced data type is bounded by the 262,144-byte complete-payload
+limit. Client-to-broker frames are also subject to
+[Common inbound-frame conditions](#common-inbound-frame-conditions).
+
 ### hello
 
 #### Signature
@@ -213,11 +264,11 @@ payload length precedes it on the socket.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains hello. |
-| name | string | required by the protocol | empty string | Selects the peer name to register. |
-| version | string | required by the standard client | empty string | Reports the adapter version for logging. The broker does not validate or negotiate it. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `hello` | none | Selects the frame type. |
+| name | string | required by the protocol | 1–64 ASCII bytes; `[A-Za-z0-9_-]` | empty string | Selects the peer name to register. |
+| version | string | required by the standard client | UTF-8 bytes; complete-frame limit | empty string | Reports the adapter version for logging. The broker does not validate or negotiate it. |
 
 #### Semantics
 
@@ -231,13 +282,18 @@ registers the connection. The broker then returns welcome.
 | bad_name | name is empty, exceeds 64 bytes, or contains a byte outside the peer-name alphabet. |
 | name_taken | Another registered connection has the same case-sensitive name. |
 | bad_frame | The JSON or typed fields cannot be decoded. |
+| hello_timeout | The broker does not finish reading the first frame before the configured hello deadline. |
 
 An omitted name therefore raises bad_name, not bad_hello. An omitted version is
 accepted by the broker as an empty informational value.
+[Common inbound-frame conditions](#common-inbound-frame-conditions) define
+oversize prefixes, truncated frames, and end-of-stream results.
 
 #### Example
 
-    {"kind":"hello","name":"reviewer","version":"0.1.0"}
+Payload:
+
+    {"kind":"hello","name":"reviewer","version":"example"}
 
 #### See also
 
@@ -251,9 +307,9 @@ accepted by the broker as an empty informational value.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains welcome. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `welcome` | none | Selects the frame type. |
 
 #### Semantics
 
@@ -265,6 +321,8 @@ issue requests after receiving this frame.
 None.
 
 #### Example
+
+Payload:
 
     {"kind":"welcome"}
 
@@ -280,12 +338,12 @@ None.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains send. |
-| id | string | required by adapter clients | empty string | Correlates deliver and send_ack with this request. |
-| to | string | required by adapter clients | empty string | Names the destination peer. |
-| message | string | required by adapter clients | empty string | Contains the delivered text. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `send` | none | Selects the frame type. |
+| id | string | required by adapter clients | opaque UTF-8 bytes; complete-frame limit | empty string | Correlates deliver and send_ack with this request. |
+| to | string | required by adapter clients | UTF-8 bytes; complete-frame limit | empty string | Names the destination peer. Raw broker input is not subject to the peer-name grammar. |
+| message | string | required by adapter clients | UTF-8 bytes; complete-frame limit | empty string | Contains the delivered text. |
 
 #### Semantics
 
@@ -308,8 +366,12 @@ rules.
 | deliver_failed | The destination exists at lookup time, but its deliver write fails for a reason other than oversize. |
 
 These errors appear in send_ack, not in a standalone error frame.
+[Common inbound-frame conditions](#common-inbound-frame-conditions) define
+malformed, oversized, truncated, lifecycle-invalid, and end-of-stream results.
 
 #### Example
+
+Payload:
 
     {"kind":"send","id":"0123456789abcdef","to":"reviewer","message":"Check the test failure."}
 
@@ -331,13 +393,13 @@ Failure:
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains send_ack. |
-| id | string | required | empty string | Copies send.id. |
-| ok | boolean | required | false | Reports whether the broker completed the destination socket write. |
-| code | string | required when ok is false; omitted when ok is true | empty string | Gives the rejection code. |
-| message | string | required when ok is false; omitted when ok is true | empty string | Gives a diagnostic message. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `send_ack` | none | Selects the frame type. |
+| id | string | required | opaque UTF-8 bytes; complete-frame limit | empty string | Copies `send.id`. |
+| ok | boolean | required | none | false | Reports whether the broker completed the destination socket write. |
+| code | string | required when `ok` is false; omitted when `ok` is true | one code from [ERROR CODES](#error-codes) | empty string | Gives the rejection code. |
+| message | string | required when `ok` is false; omitted when `ok` is true | UTF-8 bytes; complete-frame limit | empty string | Gives a diagnostic message. |
 
 #### Semantics
 
@@ -351,6 +413,8 @@ Failure codes are no_self_send, no_such_peer, oversize, and deliver_failed.
 Their conditions appear in [ERROR CODES](#error-codes).
 
 #### Example
+
+Payload:
 
     {"kind":"send_ack","id":"0123456789abcdef","ok":true}
 
@@ -366,10 +430,10 @@ Their conditions appear in [ERROR CODES](#error-codes).
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains list_peers. |
-| id | string | required by adapter clients | empty string | Correlates list_peers_reply with this request. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `list_peers` | none | Selects the frame type. |
+| id | string | required by adapter clients | opaque UTF-8 bytes; complete-frame limit | empty string | Correlates list_peers_reply with this request. |
 
 #### Semantics
 
@@ -381,8 +445,12 @@ list_peers_reply.
 
 No application-level error is defined. Connection, framing, and write failures
 can prevent a reply.
+[Common inbound-frame conditions](#common-inbound-frame-conditions) define
+malformed, oversized, truncated, lifecycle-invalid, and end-of-stream results.
 
 #### Example
+
+Payload:
 
     {"kind":"list_peers","id":"fedcba9876543210"}
 
@@ -398,11 +466,11 @@ can prevent a reply.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains list_peers_reply. |
-| id | string | required | empty string | Copies list_peers.id. |
-| peers | array of strings | required | null | Lists other registered peer names in lexicographic order. The broker emits an empty array when none exist. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `list_peers_reply` | none | Selects the frame type. |
+| id | string | required | opaque UTF-8 bytes; complete-frame limit | empty string | Copies `list_peers.id`. |
+| peers | array of strings | required | zero or more 1–64-byte peer names; complete-frame limit | null | Lists other registered peer names in lexicographic order. The broker emits an empty array when none exist. |
 
 #### Semantics
 
@@ -414,6 +482,8 @@ the next send. The requester never appears in peers.
 None.
 
 #### Example
+
+Payload:
 
     {"kind":"list_peers_reply","id":"fedcba9876543210","peers":["builder","reviewer"]}
 
@@ -429,13 +499,13 @@ None.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains deliver. |
-| id | string | conditional | omitted | Copies send.id. The encoder omits this member when the ID is empty. |
-| from | string | required | empty string | Contains the sender's registered and validated peer name. |
-| message | string | required | empty string | Copies send.message. |
-| timestamp | string | required | empty string | Gives the broker routing time as a whole-second UTC RFC 3339 value. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `deliver` | none | Selects the frame type. |
+| id | string | conditional | opaque UTF-8 bytes; complete-frame limit | omitted | Copies `send.id`. The encoder omits this member when the ID is empty. |
+| from | string | required | 1–64 ASCII bytes; `[A-Za-z0-9_-]` | empty string | Contains the sender's registered and validated peer name. |
+| message | string | required | UTF-8 bytes; complete-frame limit | empty string | Copies `send.message`. |
+| timestamp | string | required | whole-second UTC RFC 3339 timestamp | empty string | Gives the broker routing time. |
 
 #### Semantics
 
@@ -453,6 +523,8 @@ connection.
 
 #### Example
 
+Payload:
+
     {"kind":"deliver","id":"0123456789abcdef","from":"builder","message":"Check the test failure.","timestamp":"2026-07-13T19:42:00Z"}
 
 #### See also
@@ -467,10 +539,10 @@ connection.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains goodbye. |
-| reason | string | required | empty string | Describes why the broker closes the connection. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `goodbye` | none | Selects the frame type. |
+| reason | string | required | exact literal `shutdown` from the standard broker | empty string | Describes why the broker closes the connection. |
 
 #### Semantics
 
@@ -486,6 +558,8 @@ connection closure.
 
 #### Example
 
+Payload:
+
     {"kind":"goodbye","reason":"shutdown"}
 
 #### See also
@@ -500,12 +574,12 @@ connection closure.
 
 #### Fields
 
-| Field | Type | Mode | Default when omitted | Semantics |
-| --- | --- | --- | --- | --- |
-| kind | string | required | none | Contains error. |
-| id | string | conditional | omitted | Correlates an error with a request when the broker has a usable request ID. |
-| code | string | required | empty string | Gives the protocol error code. |
-| message | string | required | empty string | Gives the diagnostic message. |
+| Field | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| kind | string | required | exact literal `error` | none | Selects the frame type. |
+| id | string | conditional | opaque UTF-8 bytes; complete-frame limit | omitted | Correlates an error with a request when the broker has a usable request ID. |
+| code | string | required | one code from [ERROR CODES](#error-codes) | empty string | Gives the protocol error code. |
+| message | string | required | UTF-8 bytes; complete-frame limit | empty string | Gives the diagnostic message. |
 
 #### Semantics
 
@@ -521,6 +595,8 @@ The broker sends routing rejections in send_ack rather than error.
 The complete code set is defined in [ERROR CODES](#error-codes).
 
 #### Example
+
+Payload:
 
     {"kind":"error","code":"bad_name","message":"invalid peer name"}
 
@@ -795,11 +871,11 @@ in the [list_peers reference](REFERENCE.md#list_peers).
 
 #### Arguments
 
-| Member | Type | Mode | Semantics |
-| --- | --- | --- | --- |
-| params.content | string | required | Copies deliver.message. |
-| params.meta.from | string | required | Copies deliver.from. |
-| params.meta.timestamp | string | required | Copies deliver.timestamp. |
+| Member | Type | Mode | Units or limits | Default when omitted | Semantics |
+| --- | --- | --- | --- | --- | --- |
+| params.content | string | required | UTF-8 bytes; source broker-frame limit | empty string | Copies `deliver.message`. |
+| params.meta.from | string | required | 1–64 ASCII bytes; `[A-Za-z0-9_-]` | empty string | Copies `deliver.from`. |
+| params.meta.timestamp | string | required | whole-second UTC RFC 3339 timestamp | empty string | Copies `deliver.timestamp`. |
 
 #### Semantics
 
@@ -870,6 +946,10 @@ identify connections; they do not establish trust. Message content can leave
 the host when the connected agent provider processes it.
 
 ## VERIFICATION
+
+The package-test and broker-framing commands in this section run from the
+repository root and require the Go version declared by `go.mod`. The installed-
+binary MCP ping is independent of the repository working directory.
 
 The protocol and adapter examples are exercised by the package tests:
 

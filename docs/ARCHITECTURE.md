@@ -9,10 +9,41 @@ Intercom architecture — local peer registration, message routing, Claude Code 
 - [Scope](#scope)
 - [Topology](#topology)
 - [Components](#components)
+  - [Command dispatcher](#command-dispatcher)
+  - [Broker](#broker)
+  - [Broker client](#broker-client)
+  - [Claude Code shim](#claude-code-shim)
+  - [Codex adapter](#codex-adapter)
+  - [Codex MCP bridge](#codex-mcp-bridge)
+  - [App-server client](#app-server-client)
+  - [Codex TUI proxy](#codex-tui-proxy)
+  - [Project launcher](#project-launcher)
+  - [Live-instance registry](#live-instance-registry)
+  - [State store](#state-store)
 - [Invariants](#invariants)
 - [Flows](#flows)
+  - [Broker registration](#broker-registration)
+  - [Claude Code startup and delivery](#claude-code-startup-and-delivery)
+  - [Codex startup](#codex-startup)
+  - [Codex session discovery and selection](#codex-session-discovery-and-selection)
+  - [Codex resume and materialization](#codex-resume-and-materialization)
+  - [Codex TUI attachment](#codex-tui-attachment)
+  - [Codex TUI turn](#codex-tui-turn)
+  - [Codex reverse request](#codex-reverse-request)
+  - [Codex MCP tool call](#codex-mcp-tool-call)
+  - [Codex inbound delivery](#codex-inbound-delivery)
+  - [Outbound message](#outbound-message)
 - [State](#state)
+  - [Volatile state](#volatile-state)
+  - [Persistent Intercom state](#persistent-intercom-state)
+  - [Live discovery state](#live-discovery-state)
+  - [External state](#external-state)
 - [Lifecycles](#lifecycles)
+  - [Broker lifecycle](#broker-lifecycle)
+  - [Claude shim lifecycle](#claude-shim-lifecycle)
+  - [Codex adapter lifecycle](#codex-adapter-lifecycle)
+  - [Codex TUI lifecycle](#codex-tui-lifecycle)
+  - [Project launcher lifecycle](#project-launcher-lifecycle)
 - [Failure semantics](#failure-semantics)
 - [Security](#security)
 - [Compatibility](#compatibility)
@@ -161,6 +192,8 @@ Upstream notifications received before a valid initial `thread/resume` begins ar
 
 The proxy accepts only the `initialized` client notification. The controller applies a closed request allowlist. It validates the managed thread for every thread-scoped method; rewrites `thread/resume` ownership and policy fields; pins `turn/start` directory, roots, and policy; rebuilds idle `thread/settings/update` from the closed interactive-field set plus service policy; pins config, permission-profile, plugin, skill, hook, and fuzzy-search project scopes; suppresses account-token refresh; and restricts interrupt and steer to a TUI-owned turn. It acknowledges `thread/unsubscribe`, closes that downstream session, and retains the upstream subscription. Unknown methods and operations outside the current-thread scheduler receive an invalid-request error. The complete allowlist and common rejected operations are enumerated in [REFERENCE.md](REFERENCE.md#intercom-codex).
 
+A rollback request is always outside the proxy allowlist. A steer request is accepted only for a TUI-owned starting or active turn; Enter during an Intercom-owned turn is therefore rejected. Tab queues composer text locally and sends no proxy request until the active turn completes. Client handling of a rejected request is outside the proxy boundary. `codex-cli` 0.144.4 treats both rejections as fatal and exits with status 1. TUI process exit removes only the downstream session; the adapter, app-server connection, managed thread, active turn, and queued deliveries remain active.
+
 A downstream disconnect clears only the TUI session. The listener and managed service remain active and accept a later session. A second simultaneous connection is rejected. A connection that does not complete initialize and managed-thread resume within the control timeout is closed. A full outbound notification queue or a downstream frame write that exceeds the control timeout disconnects the slow TUI so its reader cannot block the ordered upstream app-server reader. Forwarded downstream requests share one global concurrency bound across the current session and detached sessions whose upstream calls remain active. Each forwarded request has a control-timeout deadline. An interactive reverse request waits for TUI input under the activity timeout. Acceptance of a TUI response starts a fresh control-timeout context for the upstream response write. One response arriving after the input deadline is ignored while its relay ID remains in the bounded expired-ID history; an unrelated response ID closes the downstream session.
 
 ### Project launcher
@@ -305,7 +338,9 @@ TUI disconnection removes the downstream session. Repeating the flow attaches a 
 9. A terminal lifecycle notification enters completing after the validated start response, or awaiting-start-response before it.
 10. Completion processing and the validated start response return the controller to idle, expose the held terminal notification, and permit the next delivery.
 
-If an Intercom delivery reserves the idle controller first, TUI `turn/start` receives a deterministic active-turn error. If the TUI reserves it first, a concurrently selected delivery remains pending and starts after TUI completion. An ambiguous TUI start result is fatal because another turn cannot be admitted safely.
+If an Intercom delivery reserves the idle controller first, TUI `turn/start` receives a deterministic active-turn error. If the TUI reserves it first, a concurrently selected delivery remains pending and starts after TUI completion. An ambiguous TUI start result is fatal because the controller cannot admit another turn under uncertain ownership.
+
+During a TUI-owned turn, Enter submits a steer request and the proxy forwards it. Tab queues composer text inside the TUI and submits it only after the turn completes. During an Intercom-owned turn, Enter submits a steer request that the proxy rejects. `codex-cli` 0.144.4 exits with status 1 after the rejection while the Intercom-owned turn and service continue.
 
 ### Codex reverse request
 
@@ -454,7 +489,9 @@ Cleanup terminates the adapter first and the app-server second. A child that exc
 | A second TUI connects | The proxy returns HTTP status 409 | The existing TUI remains authoritative |
 | A TUI does not complete initialize and resume within 30 seconds | The downstream session closes with a policy violation | The sole-session slot becomes available and the adapter remains active |
 | A 65th forwarded TUI request arrives while 64 current or detached-session handlers remain active | The request receives error -32001 | The connection and existing requests remain active |
-| TUI requests another thread or an ownership-changing operation | The proxy returns a JSON-RPC parameter or invalid-request error | The binding and managed thread remain unchanged |
+| TUI requests another thread or an ownership-changing operation other than rollback | The proxy returns a JSON-RPC parameter or invalid-request error | The binding and managed thread remain unchanged; client handling of the request error is client-defined |
+| `codex-cli` 0.144.4 requests rollback | The proxy returns JSON-RPC error -32600; the TUI exits with status 1 | The adapter, app-server connection, binding, managed thread, active turn, and queued deliveries remain active; a later TUI can attach |
+| `codex-cli` 0.144.4 submits Enter during an Intercom-owned turn | The proxy rejects `turn/steer` with JSON-RPC error -32600; the TUI exits with status 1 | The Intercom turn, adapter, app-server connection, and queued deliveries remain active; a later TUI can attach |
 | TUI `turn/start` races an existing reservation | The later source does not start a second turn | A rejected TUI receives an active-turn error; a pending delivery waits |
 | TUI turn start has an ambiguous outcome | The adapter fails and enters managed shutdown | No later delivery or TUI turn is admitted under uncertain ownership |
 | Another forwarded TUI request exceeds its 30-second upstream deadline | The TUI receives error -32603 and the expired request ID is retained in bounded history | One late upstream response is ignored and the adapter remains active |
@@ -489,7 +526,7 @@ The broker supplies `from` from the registered connection, but registration does
 
 Inbound message bodies are untrusted agent input. Claude Code receives them as channel content. Codex receives them as user-turn content under existing system and developer instructions. Neither representation grants message content a higher instruction priority.
 
-Managed Codex threads begin and resume with approval policy `never`, approvals reviewer `user`, runtime workspace roots containing only the managed directory, and the configured workspace-write or `danger-full-access` sandbox. Every TUI and Intercom `turn/start` reasserts that complete service policy; TUI settings cannot expand it. Without a ready TUI, the adapter declines command and file-change approvals, returns an empty turn-scoped permission grant, declines MCP elicitation, and cannot answer interactive user-input requests. With a ready TUI, those modern reverse requests are delegated to that local human interface and its result is relayed to app-server. Workspace-write permits actions allowed by app-server's returned sandbox policy. Danger-full-access removes the Codex sandbox and therefore gives model-initiated operations the operating-system permissions of the service account.
+Managed Codex threads begin and resume with approval policy `never`, approvals reviewer `user`, runtime workspace roots containing only the managed directory, and the configured workspace-write or `danger-full-access` sandbox. Every TUI and Intercom `turn/start` reasserts that complete service policy; TUI settings cannot expand it. Without a ready TUI, the adapter declines command and file-change approvals, returns an empty turn-scoped permission grant, declines MCP elicitation, and cannot answer interactive user-input requests. With a ready TUI, those supported human-interaction reverse requests are delegated to that local interface and its result is relayed to app-server. Workspace-write permits actions allowed by app-server's returned sandbox policy. Danger-full-access removes the Codex sandbox and therefore gives model-initiated operations the operating-system permissions of the service account.
 
 The dedicated app-server is an authorization premise for inherited Intercom tools. The controller verifies child ancestry from `thread/read` parent and fork links, caches successful paths, and also records explicit `thread/started` ancestry when app-server supplies it. The lower-level adapter must not connect to a shared app-server whose other clients can create threads with copied Intercom dynamic-tool or MCP definitions.
 

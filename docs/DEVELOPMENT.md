@@ -11,7 +11,17 @@
 - [Checkout build](#checkout-build)
 - [Nix package build](#nix-package-build)
 - [Verification tiers](#verification-tiers)
+  - [Tier 1 — format, analysis, and package tests](#tier-1--format-analysis-and-package-tests)
+  - [Tier 2 — race detector and coverage](#tier-2--race-detector-and-coverage)
+  - [Tier 3 — repeated concurrency tests](#tier-3--repeated-concurrency-tests)
+  - [Tier 4 — protocol fuzzing](#tier-4--protocol-fuzzing)
+  - [Tier 5 — target builds](#tier-5--target-builds)
+  - [Tier 6 — Nix flake](#tier-6--nix-flake)
+  - [Tier 7 — real Codex app-server](#tier-7--real-codex-app-server)
+  - [Tier 8 — stock Codex TUI attachment](#tier-8--stock-codex-tui-attachment)
 - [Continuous integration](#continuous-integration)
+  - [Triggers](#triggers)
+  - [Jobs](#jobs)
 - [Notes](#notes)
 - [See also](#see-also)
 
@@ -395,7 +405,7 @@ at or above the known minimum declared by
 codex --version
 INTERCOM_CODEX_SMOKE=1 \
   go test -count=1 -v \
-  -run '^TestCompatibleCodexAppServer(Schema|Smoke|LocalProviderE2E|ForkedSubagentDynamicToolE2E)$' \
+  -run '^TestCompatibleCodexAppServer(Schema|Smoke|LocalProviderE2E|ForkedSubagentDynamicToolE2E|AdoptOrdinarySessionMCPBridgeE2E)$' \
   ./internal/codex
 ```
 
@@ -411,7 +421,7 @@ codex-cli 0.144.1
 ```sh
 CODEX_BIN=./codex INTERCOM_CODEX_SMOKE=1 \
   go test -count=1 -v \
-  -run '^TestCompatibleCodexAppServer(Schema|Smoke|LocalProviderE2E|ForkedSubagentDynamicToolE2E)$' \
+  -run '^TestCompatibleCodexAppServer(Schema|Smoke|LocalProviderE2E|ForkedSubagentDynamicToolE2E|AdoptOrdinarySessionMCPBridgeE2E)$' \
   ./internal/codex
 ```
 
@@ -454,6 +464,14 @@ thread, starts a full-history child thread through the real app-server, verifies
 the child's root ancestry through `thread/read`, and executes an inherited
 Intercom dynamic tool from the child.
 
+`TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E` materializes an
+ordinary remote-TUI thread without Intercom dynamic tools, verifies its VS Code
+source classification, adopts it through the controller, and executes
+`list_peers` through the request-scoped managed MCP helper. It then restarts the
+controller and app-server, resumes the saved binding, reinjects a fresh helper,
+and executes the tool again. The loopback provider and in-process broker require
+no credentials or external network access.
+
 Tier 7 does not start the stock Codex TUI through the downstream proxy. The
 proxy's initialization, remapping, reverse routing, turn arbitration,
 disconnect, and exclusion contracts use simulated app-server and TUI peers in
@@ -462,7 +480,7 @@ client boundary.
 
 #### Success
 
-All four tests pass. No test reports a skip. All generated schemas, Codex
+All five tests pass. No test reports a skip. All generated schemas, Codex
 homes, sockets, model-server state, and project directories remain confined to
 test temporary directories and are removed by the test harness.
 
@@ -477,15 +495,16 @@ test temporary directories and are removed by the test harness.
 - The tests fail when app-server does not accept its Unix-WebSocket connection
   within five seconds.
 - The tests fail when any consumed request, response, sandbox, lifecycle,
-  persistence, dynamic-tool, or crash-recovery invariant differs.
+  persistence, dynamic-tool, MCP-configuration, adoption, or crash-recovery
+  invariant differs.
 
 ### Tier 8 — stock Codex TUI attachment
 
 #### Purpose
 
-Tier 8 verifies the launcher, live descriptor, stock Codex TUI protocol,
-unmaterialized-thread attachment, model turn, detachment, and reconnection as
-one interactive service.
+Tier 8 verifies the launcher, live descriptor, stock Codex TUI initialization
+and resume, unmaterialized-thread attachment, model turn, detachment, and
+reconnection as one interactive service.
 
 #### Prerequisites
 
@@ -534,6 +553,17 @@ resume snapshot before first materialization, one authenticated model turn,
 rollout materialization, downstream disconnect without service shutdown, live
 descriptor reuse, and a second stock-client initialization against the same
 service and thread.
+
+This procedure does not exercise active-turn composer or rollback behavior.
+During a TUI-owned turn, Enter submits a forwarded `turn/steer` request and Tab
+queues the composer text locally until the active turn completes. During an
+Intercom-owned turn, Enter submits a rejected `turn/steer` request. Rollback
+submits rejected `thread/rollback`. Client handling of either request error is
+version-dependent; `codex-cli` 0.144.4 exits with status 1. In both rejection
+cases, the adapter, app-server connection, managed thread, active turn, and
+queued deliveries remain active and a later TUI can attach. Simulated proxy
+tests verify the JSON-RPC rejections and service survival; this interactive tier
+verifies neither stock-client error path.
 
 #### Success
 

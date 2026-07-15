@@ -14,9 +14,9 @@ shutdown_timeout=${INTERCOM_CODEX_SHUTDOWN_TIMEOUT_SECONDS:-40}
 usage() {
   printf '%s\n' \
     'Usage:' \
-    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]' \
-    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID]' \
-    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID]' \
+    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]' \
+    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]' \
+    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]' \
     '  intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]' \
     '' \
     'Description:' \
@@ -27,11 +27,12 @@ usage() {
     '' \
     'Options:' \
     '  --name NAME       Sets the Intercom peer name.' \
-    '  --cwd DIRECTORY   Sets the managed project directory.' \
+    '  --cwd DIRECTORY   Sets the managed project directory. After the preliminary' \
+    '                    help/prohibited-option scan, split form consumes the next token.' \
     '  --new             Starts a new managed thread and replaces its binding.' \
     '  --adopt [ID]      Adopts an interactive session. Omitting ID opens a picker.' \
     '  --fork-from [ID]  Forks an interactive session. Omitting ID opens a picker.' \
-    '  --all-sessions    Includes sessions from every working directory in selection.' \
+    '  --all-sessions    Includes every working directory in listing or ID-less selection.' \
     '  --list-sessions   Lists resumable sessions and exits.' \
     '  --replace-binding Replaces an existing peer binding during adopt or fork.' \
     '  --yolo            Disables approvals and the Codex sandbox for managed turns.' \

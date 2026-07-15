@@ -9,7 +9,9 @@
 ```text
 intercom [--help] [--version]
 intercom shim
-intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new | --adopt-session ID | --fork-session ID] [--replace-binding] [--yolo]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] --mcp-bridge PATH [--name NAME] [--cwd DIRECTORY] --adopt-session ID [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] --mcp-bridge PATH [--name NAME] [--cwd DIRECTORY] --fork-session ID [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
 intercom codex attach --name NAME
 intercom codex sessions --app-server ENDPOINT [--cwd DIRECTORY] [--all] [--list]
 intercom broker [--idle-after DURATION] [--foreground]
@@ -17,7 +19,10 @@ intercom name
 intercom peers
 intercom completion {bash|fish|powershell|zsh} [--no-descriptions]
 intercom help [COMMAND ...]
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new | --adopt [ID] | --fork-from [ID]] [--all-sessions] [--list-sessions] [--replace-binding] [--yolo]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]
 
 send_message(to=NAME, message=TEXT)
 list_peers()
@@ -27,10 +32,27 @@ list_peers()
 
 - [Description](#description)
 - [Commands](#commands)
+  - [`intercom` root](#intercom-root)
+  - [`intercom shim`](#intercom-shim)
+  - [`intercom codex`](#intercom-codex)
+  - [`intercom codex attach`](#intercom-codex-attach)
+  - [`intercom codex sessions`](#intercom-codex-sessions)
+  - [`intercom broker`](#intercom-broker)
+  - [`intercom name`](#intercom-name)
+  - [`intercom peers`](#intercom-peers)
+  - [`intercom completion`](#intercom-completion)
+  - [`intercom help`](#intercom-help)
+  - [`intercom-codex-project`](#intercom-codex-project)
 - [Agent tools](#agent-tools)
+  - [`send_message`](#send_message)
+  - [`list_peers`](#list_peers)
 - [Peer names](#peer-names)
 - [Environment](#environment)
 - [Files](#files)
+  - [Broker files](#broker-files)
+  - [Managed Codex binding](#managed-codex-binding)
+  - [Live Codex instance descriptors](#live-codex-instance-descriptors)
+  - [Launcher files](#launcher-files)
 - [Limits and timers](#limits-and-timers)
 - [Errors](#errors)
 - [Notes](#notes)
@@ -60,16 +82,16 @@ intercom --version
 
 #### Arguments
 
-| Argument | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| command | command name | optional | none | Selects one command described below. |
+| Argument | Type | Mode | Units or limits | Default | Meaning |
+|---|---|---|---|---|---|
+| command | command name | optional | one command token | none | Selects one command described below. |
 
 #### Options
 
-| Option | Type | Default | Meaning |
-|---|---|---|---|
-| `-h`, `--help` | Boolean | false | Prints command help and exits. |
-| `-v`, `--version` | Boolean | false | Prints `intercom version VERSION (REVISION)` and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
+| `-v`, `--version` | Boolean | optional | none | false | Prints `intercom version VERSION (REVISION)` and exits. |
 
 #### Semantics
 
@@ -109,9 +131,9 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Default | Meaning |
-|---|---|---|---|
-| `-h`, `--help` | Boolean | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -160,7 +182,9 @@ INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:
 #### Synopsis
 
 ```text
-intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new | --adopt-session ID | --fork-session ID] [--replace-binding] [--yolo]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] --mcp-bridge PATH [--name NAME] [--cwd DIRECTORY] --adopt-session ID [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] --mcp-bridge PATH [--name NAME] [--cwd DIRECTORY] --fork-session ID [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
 ```
 
 #### Arguments
@@ -169,20 +193,20 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| `--app-server ENDPOINT` | Unix endpoint or filesystem path | required | none | Selects the dedicated Codex app-server Unix socket. A bare value must be an absolute path. A URL value must use `unix`, contain an absolute path, and contain no host, query, fragment, or NUL byte. |
-| `--client-endpoint ENDPOINT` | Unix endpoint or filesystem path | optional | none | Creates a stock-Codex TUI proxy at the selected Unix socket. The syntax is identical to `--app-server`; the two normalized endpoints must differ. An absent option selects headless operation and suppresses live-instance publication and readiness output. |
-| `--mcp-bridge PATH` | absolute Unix socket path | conditional | none | Creates the authenticated controller bridge used by the required Intercom MCP server. Adoption, fork, and resume of a binding whose `toolTransport` is `mcpBridge` require it. The project launcher supplies this option. |
-| `--name NAME` | peer name | optional | `INTERCOM_NAME`, then selected-directory basename | Selects the Intercom peer and state filename. The flag takes precedence over the environment. Surrounding whitespace is removed. |
-| `--cwd DIRECTORY` | directory path | optional | current working directory | Selects the managed project directory. The adapter resolves the path to an absolute, symlink-canonical directory. |
-| `--new` | Boolean | optional | false | Starts a new thread and replaces the saved Intercom binding. It does not delete previous Codex history. |
-| `--adopt-session ID` | Codex thread ID | optional | none | Resumes and binds the existing eligible CLI or VS Code root thread without changing its ID. The value is 1 through 256 printable UTF-8 bytes with no whitespace. |
-| `--fork-session ID` | Codex thread ID | optional | none | Forks the existing eligible CLI or VS Code root thread and binds the new thread ID. The source remains unchanged. Value validation matches `--adopt-session`. |
-| `--replace-binding` | Boolean | optional | false | Authorizes adoption or fork to replace an existing binding for another thread. It requires `--adopt-session` or `--fork-session`. |
-| `--yolo` | Boolean | optional | false | Selects approval policy `never` and sandbox policy `danger-full-access` for the service. |
-| `--dangerously-bypass-approvals-and-sandbox` | Boolean | optional | false | Alias for `--yolo`. |
-| `-h`, `--help` | Boolean | optional | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `--app-server ENDPOINT` | Unix endpoint or filesystem path | required | absolute path or `unix` URL | none | Selects the dedicated Codex app-server Unix socket. A bare value must be an absolute path. A URL value must use `unix`, contain an absolute path, and contain no host, query, fragment, or NUL byte. |
+| `--client-endpoint ENDPOINT` | Unix endpoint or filesystem path | optional | absolute path or `unix` URL | none | Creates a stock-Codex TUI proxy at the selected Unix socket. The syntax is identical to `--app-server`; the two normalized endpoints must differ. An absent option selects headless operation and suppresses live-instance publication and readiness output. |
+| `--mcp-bridge PATH` | Unix socket path | conditional | absolute filesystem path | none | Creates the authenticated controller bridge used by the required Intercom MCP server. Adoption, fork, and resume of a binding whose `toolTransport` is `mcpBridge` require it. The project launcher supplies this option. |
+| `--name NAME` | peer name | optional | 1–64 ASCII bytes; `[A-Za-z0-9_-]` | `INTERCOM_NAME`, then selected-directory basename | Selects the Intercom peer and state filename. The flag takes precedence over the environment. Surrounding whitespace is removed. |
+| `--cwd DIRECTORY` | directory path | optional | filesystem path | current working directory | Selects the managed project directory. The adapter resolves the path to an absolute, symlink-canonical directory. |
+| `--new` | Boolean | optional | none | false | Starts a new thread and replaces the saved Intercom binding. It does not delete previous Codex history. |
+| `--adopt-session ID` | Codex thread ID | optional | when nonempty, 1–256 printable UTF-8 bytes with no whitespace | none | Resumes and binds the existing eligible CLI or VS Code root thread without changing its ID. An explicit empty value is treated as an absent option. |
+| `--fork-session ID` | Codex thread ID | optional | when nonempty, 1–256 printable UTF-8 bytes with no whitespace | none | Forks the existing eligible CLI or VS Code root thread and binds the new thread ID. The source remains unchanged. An explicit empty value is treated as an absent option. |
+| `--replace-binding` | Boolean | optional | none | false | Authorizes adoption or fork to replace an existing binding for another thread. It requires `--adopt-session` or `--fork-session`. |
+| `--yolo` | Boolean | optional | none | false | Selects approval policy `never` and sandbox policy `danger-full-access` for the service. |
+| `--dangerously-bypass-approvals-and-sandbox` | Boolean | optional | none | false | Alias for `--yolo`. |
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -190,7 +214,7 @@ The command connects to an app-server that is already listening and is externall
 
 The adapter initializes the experimental app-server API and requires the app-server user agent to report semantic version 0.144.1 or later. The protocol provides no feature or schema-version negotiation. The adapter establishes compatibility by executing and validating the request, response, lifecycle, managed-thread, sandbox, tool-registration, and session-selection contracts it consumes. JSON decoding ignores unknown additive object fields; required fields, enumerated values, correlation, ownership, and behavioral invariants remain validated. It acquires a nonblocking lifetime lock for the selected peer before connecting and a separate nonblocking lock for the managed Codex thread before ownership begins.
 
-Without a saved binding or selection option, the adapter creates one non-ephemeral thread with the two Intercom app-server dynamic tools. `--adopt-session` and `--fork-session` resolve the explicit ID through non-archived `thread/list` results and require a non-ephemeral CLI or VS Code root in `idle` or `notLoaded` status with the exact managed `cwd`. Adoption resumes that thread under the same ID. Fork invokes app-server fork and manages the returned new ID.
+Without a saved binding or nonempty selection option, the adapter creates one non-ephemeral thread with the two Intercom app-server dynamic tools. An explicit `--adopt-session=` or `--fork-session=` value is indistinguishable from an absent option. `--adopt-session` and `--fork-session` with nonempty IDs resolve the explicit ID through non-archived `thread/list` results and require a non-ephemeral CLI or VS Code root in `idle` or `notLoaded` status with the exact managed `cwd`. Adoption resumes that thread under the same ID. Fork invokes app-server fork and manages the returned new ID.
 
 Adopted and forked threads receive a request-scoped MCP server named `intercom_managed`. Its command is the selected Intercom executable with arguments `codex-mcp-bridge --socket MCP_BRIDGE_PATH --timeout REVERSE_TIMEOUT`; its environment contains the random service-lifetime token as `INTERCOM_CODEX_BRIDGE_TOKEN`. It is required, permits parallel tool calls, enables only `send_message` and `list_peers`, sets default tool approval to `approve`, uses the adapter control timeout in whole seconds for startup, and uses the reverse-request timeout in whole seconds for app-server tool calls. The helper and private controller bridge use the exact reverse-request duration. Each app-server timeout rounded to whole seconds has a minimum of one second; command defaults produce 30-second startup and 10-second tool timeouts. The adapter validates that app-server reports the server and both tools before committing the binding. A cold resume of an MCP-bridge binding reinjects and revalidates the same per-service configuration.
 
@@ -211,6 +235,8 @@ The proxy returns the adapter's cached initialize result, consumes the TUI's `in
 Stock Codex uses preserved non-policy fields to apply interactive model, service-tier, reasoning effort and summary, personality, output-schema, collaboration-mode, and multi-agent-mode selections. The proxy replaces TUI approval, approvals-reviewer, sandbox, permissions, working-directory, and runtime-root fields with the configured service policy during `thread/resume`, `thread/settings/update`, and `turn/start`. Settings update drops every field outside `threadId`, `model`, `serviceTier`, `effort`, `summary`, `collaborationMode`, `multiAgentMode`, and `personality` before adding pinned fields. Each Intercom-delivered turn supplies the same managed directory, runtime root, approval policy, approvals reviewer, and sandbox policy. The thread-level Intercom developer instructions remain a separate developer section when Codex adds collaboration-mode developer instructions.
 
 `turn/interrupt` and `turn/steer` are forwarded only when the attached TUI owns the named starting or active turn. They cannot control an Intercom-delivery turn. Every TUI `turn/start` holds app-server notifications behind its response. Controller lifecycle state is reconciled before the held notifications are exposed. Every managed terminal notification and each later notification remain held until controller completion processing and the corresponding start response have both finished. No later delivery or TUI turn can overtake either boundary.
+
+During an active TUI-owned turn, Enter submits `turn/steer` and the proxy forwards it. During an Intercom-owned turn, Enter submits `turn/steer` and the proxy rejects it. Tab queues composer text inside the TUI and does not submit another proxy request until the active turn completes. The queued text can then start the next TUI-owned turn. Client handling of a rejected request is outside the proxy contract; `codex-cli` 0.144.4 treats this steer rejection as fatal and exits with status 1.
 
 | Downstream operation | Proxy and controller handling |
 |---|---|
@@ -261,9 +287,11 @@ The following TUI operations are unavailable and receive JSON-RPC error -32600 w
 | Background-terminal cleanup or termination | `thread/backgroundTerminals/clean`, `thread/backgroundTerminals/terminate` |
 | Every unlisted protocol operation | The unlisted method name |
 
+Client handling of a rejected `thread/rollback` response is outside the proxy contract. `codex-cli` 0.144.4 treats the response as fatal and exits with status 1. The adapter, app-server connection, managed thread, active turn, and queued deliveries remain active after that TUI process exits. A later attachment resumes the same managed thread.
+
 `thread/unsubscribe` is acknowledged locally and is not forwarded upstream. The proxy then clears readiness, settles pending TUI reverse requests through the headless fallback, closes that downstream session, and frees the attachment slot. The adapter retains app-server subscription and thread ownership.
 
-Dynamic-tool calls always terminate at the Intercom adapter. A root-thread call requires the starting or active managed turn and matching turn ID. For another thread, the adapter issues `thread/read` without turns and follows `parentThreadId` and `forkedFromId` links until it reaches the managed root or a cached descendant. Explicit `thread/started` ancestry can populate the same cache before a call. A successful walk caches its path and authorizes the child without changing the root turn ID. Cycles terminate as unrelated ancestry; a walk examining more than 64 distinct threads is fatal. This descendant rule relies on the required dedicated app-server boundary. Other modern interactive reverse requests are sent to a ready TUI. When no TUI is ready or the TUI disconnects before answering, the following headless policy applies:
+Dynamic-tool calls always terminate at the Intercom adapter. A root-thread call requires the starting or active managed turn and matching turn ID. For another thread, the adapter issues `thread/read` without turns and follows `parentThreadId` and `forkedFromId` links until it reaches the managed root or a cached descendant. Explicit `thread/started` ancestry can populate the same cache before a call. A successful walk caches its path and authorizes the child without changing the root turn ID. Cycles terminate as unrelated ancestry; a walk examining more than 64 distinct threads is fatal. This descendant rule relies on the required dedicated app-server boundary. Other supported human-interaction reverse requests are sent to a ready TUI. When no TUI is ready or the TUI disconnects before answering, the following headless policy applies:
 
 | App-server request | Response |
 |---|---|
@@ -310,7 +338,7 @@ The following table enumerates externally visible adapter and proxy error classe
 | More than one of `--new`, `--adopt-session`, and `--fork-session` is selected. | `codex: --new, --adopt-session, and --fork-session are mutually exclusive` |
 | `--replace-binding` is selected without adoption or fork. | `codex: --replace-binding requires --adopt-session or --fork-session` |
 | Adoption or fork omits either `--mcp-bridge` or the selected Intercom executable. | `codex: adopted and forked threads require the managed MCP bridge` |
-| A session ID is empty, longer than 256 bytes, invalid UTF-8, contains whitespace or a control character, or has leading or trailing whitespace. | `codex: adopt session` or `codex: fork session` validation diagnostic |
+| A nonempty session ID is longer than 256 bytes, invalid UTF-8, contains whitespace or a control character, or has leading or trailing whitespace. | `codex: adopt session` or `codex: fork session` validation diagnostic. An explicit empty value selects no adoption or fork and receives no ID-validation diagnostic. |
 | `--cwd` is absent and the current working directory cannot be obtained. | `codex: get working directory` |
 | `--cwd` cannot be made absolute, resolved through symlinks, statted, or does not name a directory. | `codex: resolve cwd`, `resolve cwd symlinks`, `stat cwd`, or `cwd is not a directory` |
 | The selected peer name violates the peer-name grammar. | `invalid peer name` |
@@ -360,7 +388,9 @@ The following table enumerates externally visible adapter and proxy error classe
 | A dynamic tool call has invalid Intercom tool arguments or names an unknown tool. | The call returns `success: false`; the adapter continues. |
 | Parameters cannot be decoded for a dynamic-tool, command-approval, file-approval, permission-approval, user-input, MCP-elicitation, legacy apply-patch approval, or legacy command-execution approval request. | The call receives app-server error -32602; the adapter continues when the error response succeeds. |
 | A dynamic tool call carries a namespace, omits routing identity, arrives before ownership, names another root turn, or names a foreign thread whose `thread/read` ancestry fails, cycles without reaching the root, exceeds 64 distinct threads, returns another ID, or has no parent or fork path to the root. | The call receives a failure result when possible; the ownership violation then terminates the adapter. A verified or cached descendant is accepted. |
-| An MCP tool call has an invalid bridge token or frame, exceeds 1048576 bytes, exceeds the concurrency or request deadline, names an unsupported method, or carries invalid arguments. | The bridge returns its protocol error when possible; authentication and framing failures close that bridge connection. |
+| An MCP tool call has an invalid bridge token or frame, exceeds 1048576 bytes, names an unsupported method, or carries invalid arguments. | The bridge returns its protocol error when possible and then closes that one-request connection. |
+| A 65th MCP bridge connection is accepted while 64 handlers hold the bridge semaphore. | The accepted connection waits without being read or authenticated until a handler slot becomes available or the bridge shuts down. No overload response is defined. The client can reach its own deadline while waiting. |
+| An admitted MCP bridge handler returns an error after its controller or caller-supplied context deadline has expired. | The bridge returns `deadline_exceeded` when the response can still be written; the client can instead observe its own timeout or connection result. |
 | An MCP tool call omits top-level `threadId`, `x-codex-turn-metadata.session_id`, `thread_id`, or `turn_id`; carries unequal top-level and nested thread identities; carries a session identity other than the managed root; or names a thread or turn outside current managed ownership. | The tool call fails and the ownership violation terminates the adapter. No broker operation occurs. |
 | A reverse-request result or error response cannot be written. | The response-write failure terminates the adapter. |
 | A TUI request has malformed parameters or names another thread. | The TUI receives error -32602; the adapter continues. |
@@ -370,9 +400,11 @@ The following table enumerates externally visible adapter and proxy error classe
 | A TUI sends a client notification other than `initialized` after initialization. | The TUI connection closes with a policy-violation status. The adapter remains active. |
 | A TUI does not complete initialize and managed-thread resume within 30 seconds of connection. | The TUI connection closes with a policy-violation status, the sole-session slot is released, and the adapter remains active. |
 | A TUI repeats an in-flight request ID. | The TUI connection closes because exactly one terminal response can no longer be correlated to the duplicated ID. The adapter remains active. |
-| A TUI requests an unavailable thread operation. | The TUI receives error -32600; the adapter continues. |
+| A TUI requests an unavailable thread operation other than rollback. | The TUI receives error -32600; the adapter continues. The requesting client determines whether the request error is fatal to that client. |
+| `codex-cli` 0.144.4 requests `thread/rollback`. | The TUI receives error -32600 and exits with status 1. The adapter, app-server connection, managed thread, active turn, and queued deliveries remain active; a later attachment can resume the thread. Other client versions determine their own response to the request error. |
 | A TUI requests `thread/settings/update` while the controller is not idle. | The TUI receives error -32600 with `thread/settings/update is allowed only while the managed thread is idle`; the current operation continues. |
-| A TUI `turn/interrupt` or `turn/steer` does not name the managed thread and TUI-owned turn, omits its required turn ID, or is attempted while an Intercom turn owns the controller. | The TUI receives error -32600 or -32602; the existing turn continues. |
+| A TUI `turn/interrupt` or `turn/steer` does not name the managed thread and TUI-owned turn or omits its required turn ID. | The TUI receives error -32600 or -32602; the existing turn continues and the adapter remains active. |
+| `codex-cli` 0.144.4 submits Enter while an Intercom turn owns the controller. | The proxy rejects `turn/steer` with error -32600 and the TUI exits with status 1. The Intercom turn, adapter, app-server connection, and queued deliveries remain active; a later attachment can resume the thread. Other client versions determine their own response to the request error. |
 | A TUI starts a turn while another TUI or Intercom turn is starting or active. | The TUI receives error -32600 with `managed thread already has an active turn`; the existing turn continues. |
 | A forwarded TUI request other than `turn/start` exceeds its 30-second deadline. | The TUI receives error -32603, one late upstream response is discarded through bounded expired-ID tracking, and the adapter continues. |
 | A TUI `turn/start` has an ambiguous failure, malformed result, wrong turn ID, empty turn ID, or non-in-progress result. | Turn-start consistency diagnostic; the adapter terminates because scheduler ownership is ambiguous. |
@@ -399,18 +431,30 @@ Status is 0 after help or a handled `SIGHUP`, `SIGINT`, or `SIGTERM` when shutdo
 The following Bash transcript supplies the app-server ownership that the lower-level command requires:
 
 ```sh
-runtime_dir=$(mktemp -d)
-chmod 700 "$runtime_dir"
-app_socket="$runtime_dir/app-server.sock"
-client_socket="$runtime_dir/client.sock"
-codex app-server --listen "unix://$app_socket" &
-server_pid=$!
-trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -rf "$runtime_dir"' EXIT
-while [ ! -S "$app_socket" ]; do
-  kill -0 "$server_pid" 2>/dev/null || exit 1
-  sleep 0.1
-done
-intercom codex --app-server "unix://$app_socket" --client-endpoint "unix://$client_socket" --name reviewer --cwd .
+(
+  runtime_dir=$(mktemp -d)
+  chmod 700 "$runtime_dir"
+  app_socket="$runtime_dir/app-server.sock"
+  client_socket="$runtime_dir/client.sock"
+  codex app-server --listen "unix://$app_socket" &
+  server_pid=$!
+  cleanup() {
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    rm -rf "$runtime_dir"
+  }
+  trap cleanup EXIT
+  for ((attempt = 0; attempt < 300; attempt++)); do
+    [ -S "$app_socket" ] && break
+    kill -0 "$server_pid" 2>/dev/null || exit 1
+    sleep 0.1
+  done
+  if [ ! -S "$app_socket" ]; then
+    printf 'app-server socket did not appear within 30 seconds\n' >&2
+    exit 1
+  fi
+  intercom codex --app-server "unix://$app_socket" --client-endpoint "unix://$client_socket" --name reviewer --cwd .
+)
 ```
 
 #### See also
@@ -431,10 +475,10 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| `--name NAME` | peer name | required | none | Selects the live managed Codex instance. `INTERCOM_NAME` is not a fallback for this command. |
-| `-h`, `--help` | Boolean | optional | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `--name NAME` | peer name | required | 1–64 ASCII bytes; `[A-Za-z0-9_-]` | none | Selects the live managed Codex instance. `INTERCOM_NAME` is not a fallback for this command. |
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -500,13 +544,13 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| `--app-server ENDPOINT` | Unix endpoint or filesystem path | required | none | Selects the dedicated Codex app-server Unix socket. Syntax matches `intercom codex --app-server`. |
-| `--cwd DIRECTORY` | existing directory path | optional | current working directory | Supplies the working-directory filter and the directory required for the selected result. The command converts it to an absolute path, resolves symbolic links, and requires a directory. |
-| `--all` | Boolean | optional | false | Omits the working-directory filter from app-server listing. Source, archive, ephemeral, root-thread, and idle-or-not-loaded status eligibility rules remain active. |
-| `--list` | Boolean | optional | false | Writes every matching record without reading a terminal selection. |
-| `-h`, `--help` | Boolean | optional | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `--app-server ENDPOINT` | Unix endpoint or filesystem path | required | absolute path or `unix` URL | none | Selects the dedicated Codex app-server Unix socket. Syntax matches `intercom codex --app-server`. |
+| `--cwd DIRECTORY` | existing directory path | optional | filesystem path | current working directory | Supplies the working-directory filter and the directory required for the selected result. The command converts it to an absolute path, resolves symbolic links, and requires a directory. |
+| `--all` | Boolean | optional | none | false | Omits the working-directory filter from app-server listing. Source, archive, ephemeral, root-thread, and idle-or-not-loaded status eligibility rules remain active. |
+| `--list` | Boolean | optional | none | false | Writes every matching record without reading a terminal selection. |
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -529,7 +573,8 @@ With `--list`, each output line contains four tab-separated fields in this order
 | Any `thread/list` page fails, returns an empty cursor, or repeats a cursor. | `codexsession: list sessions` or pagination diagnostic; status 1. |
 | Interactive mode receives no eligible records. | `codexsession: no resumable sessions`; status 1. |
 | Interactive mode's standard input is not a terminal. | `codex sessions: interactive selection requires a terminal; supply an explicit session id`; status 1. |
-| Interactive input ends, reads `q`, or fails. | `codexsession: selection canceled` or read diagnostic; status 1. |
+| Interactive input ends or reads `q`, case-insensitively. | `codexsession: selection canceled`; status 1. |
+| An interactive input token reaches the picker's 4096-byte scanner capacity, or the input stream fails. | `codexsession: read picker`; status 1. |
 | An interactive all-directory selection has another working directory. | Diagnostic names the selected directory and required `--cwd`; status 1. |
 | Picker, list, or selected-ID output fails. | Write diagnostic; status 1. |
 
@@ -542,17 +587,29 @@ Status is 0 after help, complete list output including an empty list, or one val
 The following transcript starts a temporary app-server and writes eligible current-project sessions:
 
 ```sh
-runtime_dir=$(mktemp -d ./.intercom-sessions.XXXXXX)
-chmod 700 "$runtime_dir"
-socket=$(cd "$runtime_dir" && pwd -P)/app-server.sock
-codex app-server --listen "unix://$socket" &
-server_pid=$!
-trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -rf "$runtime_dir"' EXIT
-while [ ! -S "$socket" ]; do
-  kill -0 "$server_pid" 2>/dev/null || exit 1
-  sleep 0.1
-done
-intercom codex sessions --app-server "$socket" --cwd . --list
+(
+  runtime_dir=$(mktemp -d ./.intercom-sessions.XXXXXX)
+  chmod 700 "$runtime_dir"
+  socket=$(cd "$runtime_dir" && pwd -P)/app-server.sock
+  codex app-server --listen "unix://$socket" &
+  server_pid=$!
+  cleanup() {
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    rm -rf "$runtime_dir"
+  }
+  trap cleanup EXIT
+  for ((attempt = 0; attempt < 300; attempt++)); do
+    [ -S "$socket" ] && break
+    kill -0 "$server_pid" 2>/dev/null || exit 1
+    sleep 0.1
+  done
+  if [ ! -S "$socket" ]; then
+    printf 'app-server socket did not appear within 30 seconds\n' >&2
+    exit 1
+  fi
+  intercom codex sessions --app-server "$socket" --cwd . --list
+)
 ```
 
 #### See also
@@ -573,11 +630,11 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Units and format | Default | Meaning |
-|---|---|---|---|---|
-| `--idle-after DURATION` | duration | Go duration | `10m` | Exits after the broker has no registered peers for the selected duration. `0` disables idle exit. An explicit flag takes precedence over `INTERCOM_IDLE_EXIT`. |
-| `--foreground` | Boolean | none | false | Writes structured logs to standard error instead of the broker log file. It does not daemonize the process. |
-| `-h`, `--help` | Boolean | none | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `--idle-after DURATION` | duration | optional | Go duration | `10m` | Exits after the broker has no registered peers for the selected duration. `0` disables idle exit. An explicit flag takes precedence over `INTERCOM_IDLE_EXIT`. |
+| `--foreground` | Boolean | optional | none | false | Writes structured logs to standard error instead of the broker log file. It does not daemonize the process. |
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -629,9 +686,9 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Default | Meaning |
-|---|---|---|---|
-| `-h`, `--help` | Boolean | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -670,9 +727,9 @@ No positional arguments are accepted.
 
 #### Options
 
-| Option | Type | Default | Meaning |
-|---|---|---|---|
-| `-h`, `--help` | Boolean | false | Prints command help and exits. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `-h`, `--help` | Boolean | optional | none | false | Prints command help and exits. |
 
 #### Semantics
 
@@ -713,18 +770,18 @@ intercom completion zsh [--no-descriptions]
 
 #### Arguments
 
-| Argument | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| shell | enumeration | required for generation | none | Selects exactly one of `bash`, `fish`, `powershell`, or `zsh`. An absent or unsupported value selects parent help instead of generation. |
+| Argument | Type | Mode | Units or limits | Default | Meaning |
+|---|---|---|---|---|---|
+| shell | enumeration | required for generation | one token; `bash`, `fish`, `powershell`, or `zsh` | none | Selects the completion target. An absent or unsupported value selects parent help instead of generation. |
 
 No positional arguments follow the shell name.
 
 #### Options
 
-| Option | Type | Default | Meaning |
-|---|---|---|---|
-| `--no-descriptions` | Boolean | false | Omits command and flag descriptions from generated candidates. |
-| `-h`, `--help` | Boolean | false | Prints help for the selected completion command. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `--no-descriptions` | Boolean | optional | none | false | Omits command and flag descriptions from generated candidates. |
+| `-h`, `--help` | Boolean | optional | none | false | Prints help for the selected completion command. |
 
 #### Semantics
 
@@ -758,15 +815,15 @@ intercom help [COMMAND ...]
 
 #### Arguments
 
-| Argument | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| `COMMAND ...` | command-path components | optional | root command | Selects the command whose help is printed. |
+| Argument | Type | Mode | Units or limits | Default | Meaning |
+|---|---|---|---|---|---|
+| `COMMAND ...` | command-path components | optional | zero or more command tokens | root command | Selects the command whose help is printed. |
 
 #### Options
 
-| Option | Type | Default | Meaning |
-|---|---|---|---|
-| `-h`, `--help` | Boolean | false | Prints help for the help command. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `-h`, `--help` | Boolean | optional | none | false | Prints help for the help command. |
 
 #### Semantics
 
@@ -795,36 +852,36 @@ intercom help codex
 #### Synopsis
 
 ```text
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new] [--yolo]
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo]
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
 intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]
 ```
 
 #### Arguments
 
-The launcher scans every token for launcher-owned transport options and internal selection options before any other action and rejects them. When no prohibited token is present, any `-h` or `--help` token prints launcher help and suppresses timeout validation, child creation, and validation of other tokens. It then consumes launcher session-selection options and forwards the remaining tokens to `intercom codex`; that command rejects unknown forwarded tokens. List-only mode accepts only `--cwd`, `--all-sessions`, `--list-sessions`, and help and rejects an adapter-only, unknown, or positional token before child creation. `--adopt` and `--fork-from` consume the immediately following token as an optional session ID only when that token does not begin with `-`. The `--adopt=SESSION_ID` and `--fork-from=SESSION_ID` forms always supply an explicit ID.
+The launcher scans every token for launcher-owned transport options and internal selection options before any other action and rejects them. When no prohibited token is present, any `-h` or `--help` token prints launcher help and suppresses timeout validation, child creation, and validation of other tokens. It then consumes launcher session-selection options and forwards the remaining tokens to `intercom codex`; that command rejects unknown forwarded tokens. List-only mode accepts only `--cwd`, `--all-sessions`, `--list-sessions`, and help and rejects an adapter-only, unknown, or positional token before child creation. `--adopt` and `--fork-from` consume the immediately following token as an optional session ID only when that token does not begin with `-`. A consumed empty token disables the picker and forwards an empty internal ID, which the adapter treats as no adoption or fork selection. The `--adopt=SESSION_ID` and `--fork-from=SESSION_ID` forms always supply an explicit, nonempty ID. After the preliminary scan has found neither a prohibited token nor help, split-form `--cwd` consumes the immediately following token as its directory even when that token begins with `-`; `--cwd=DIRECTORY` does not consume another token.
 
 #### Options
 
-| Option | Type | Mode | Default | Meaning |
-|---|---|---|---|---|
-| `--name NAME` | peer name | optional | adapter default | Forwards the peer name. |
-| `--cwd DIRECTORY` | directory path | optional | adapter default | Forwards the managed directory. |
-| `--new` | Boolean | optional | false | Forwards the new-binding selection. |
-| `--adopt [SESSION_ID]` | optional Codex thread ID | optional | interactive selection | Selects exact adoption. A separate ID token cannot begin with `-`; the `--adopt=SESSION_ID` form accepts any nonempty token for later ID validation. |
-| `--fork-from [SESSION_ID]` | optional Codex thread ID | optional | interactive selection | Selects safe fork. Optional-value parsing matches `--adopt`. |
-| `--all-sessions` | Boolean | optional | false | Removes the working-directory filter from list or ID-less interactive selection. It is invalid with an explicit session ID or without `--list-sessions`, ID-less `--adopt`, or ID-less `--fork-from`. |
-| `--list-sessions` | Boolean | optional | false | Lists matching resumable session records and exits after stopping app-server. It does not start the adapter, broker peer, TUI proxy, or MCP bridge. |
-| `--replace-binding` | Boolean | optional | false | Forwards explicit authorization to replace another saved binding. It requires `--adopt` or `--fork-from`. |
-| `--yolo` | Boolean | optional | false | Forwards service-wide approval `never` and `danger-full-access` selection. |
-| `--dangerously-bypass-approvals-and-sandbox` | Boolean | optional | false | Alias for `--yolo`. |
-| `-h`, `--help` | Boolean | optional | false | Prints launcher help without starting children. |
-| `--app-server` | prohibited | none | launcher-owned | Produces status 2 before starting children, in both split and `=` forms. |
-| `--client-endpoint` | prohibited | none | launcher-owned | Produces status 2 before starting children, in both split and `=` forms. |
-| `--mcp-bridge` | prohibited | none | launcher-owned | Produces status 2 before starting children, in both split and `=` forms. |
-| `--adopt-session` | prohibited | none | internal | Produces status 2 and directs the caller to `--adopt`, in both split and `=` forms. |
-| `--fork-session` | prohibited | none | internal | Produces status 2 and directs the caller to `--fork-from`, in both split and `=` forms. |
+| Option | Type | Mode | Units or format | Default | Meaning |
+|---|---|---|---|---|---|
+| `--name NAME` | peer name | optional | 1–64 ASCII bytes; `[A-Za-z0-9_-]` | adapter default | Forwards the peer name. |
+| `--cwd DIRECTORY` | directory path | optional | one following token in split form, or the `=` value | adapter default | Forwards the managed directory. After the preliminary help and prohibited-option scan, split form consumes the next token even when it resembles another option. |
+| `--new` | Boolean | optional | none | false | Forwards the new-binding selection. |
+| `--adopt [SESSION_ID]` | optional Codex thread ID | optional | zero or one token; a nonempty selected ID is 1–256 printable UTF-8 bytes with no whitespace | interactive selection | Selects exact adoption. A separate ID token cannot begin with `-`. A separate empty token disables the picker but selects no adoption. The `--adopt=SESSION_ID` form accepts any nonempty token for later ID validation. |
+| `--fork-from [SESSION_ID]` | optional Codex thread ID | optional | zero or one token; a nonempty selected ID is 1–256 printable UTF-8 bytes with no whitespace | interactive selection | Forks the selected session into a distinct managed thread and leaves the source unchanged. A separate empty token disables the picker but selects no fork. Other optional-value parsing matches `--adopt`. |
+| `--all-sessions` | Boolean | optional | none | false | Removes the working-directory filter from list or ID-less interactive selection. It is invalid with an explicit session ID or without `--list-sessions`, ID-less `--adopt`, or ID-less `--fork-from`. |
+| `--list-sessions` | Boolean | optional | none | false | Lists matching resumable session records and exits after stopping app-server. It does not start the adapter, broker peer, TUI proxy, or MCP bridge. |
+| `--replace-binding` | Boolean | optional | none | false | Forwards explicit authorization to replace another saved binding. It requires `--adopt` or `--fork-from`. |
+| `--yolo` | Boolean | optional | none | false | Forwards service-wide approval `never` and `danger-full-access` selection. |
+| `--dangerously-bypass-approvals-and-sandbox` | Boolean | optional | none | false | Alias for `--yolo`. |
+| `-h`, `--help` | Boolean | optional | none | false | Prints launcher help without starting children. |
+| `--app-server` | option token | prohibited | split or `=` form | not applicable | Produces status 2 before starting children. The launcher owns the endpoint. |
+| `--client-endpoint` | option token | prohibited | split or `=` form | not applicable | Produces status 2 before starting children. The launcher owns the endpoint. |
+| `--mcp-bridge` | option token | prohibited | split or `=` form | not applicable | Produces status 2 before starting children. The launcher owns the endpoint. |
+| `--adopt-session` | option token | prohibited | split or `=` form | not applicable | Produces status 2 and directs the caller to `--adopt`. |
+| `--fork-session` | option token | prohibited | split or `=` form | not applicable | Produces status 2 and directs the caller to `--fork-from`. |
 
 #### Semantics
 
@@ -848,6 +905,7 @@ The service group remains in the foreground. A 100-millisecond poll checks the a
 | More than one occurrence or kind among `--new`, `--adopt`, `--fork-from`, and `--list-sessions` is selected. | Status 2 before child creation. |
 | `--adopt=` or `--fork-from=` has an empty value. | Status 2 before child creation. |
 | `--cwd` is the final token and has no directory operand. | Status 2 before child creation. |
+| Split-form `--cwd` is followed by an option-looking token other than a globally scanned help or prohibited token. | The launcher consumes that token as the directory operand, so it is not processed as an option. Remaining tokens are processed independently and can fail launcher validation or adapter parsing before directory validation. Otherwise, an invalid consumed path fails directory validation after app-server startup. The `--cwd=DIRECTORY` form prevents option-token consumption. |
 | `--all-sessions` is not paired with `--list-sessions` or ID-less adoption or fork. | Status 2 before child creation. |
 | `--replace-binding` is not paired with adoption or fork. | Status 2 before child creation. |
 | `--list-sessions` is combined with `--name`, yolo selection, an unknown option, or a positional or other adapter-only token. | `--list-sessions does not accept adapter argument`; status 2 before child creation. |
@@ -1074,11 +1132,11 @@ Codex rollout and conversation files remain under `CODEX_HOME` and are owned by 
 | `$INTERCOM_DIR/codex/live/.registry.lock` | 0600 | persistent | Cross-process advisory lock for descriptor publication and ownership-checked removal. The mode is repaired on each lock use. |
 | `$INTERCOM_DIR/codex/live/NAME-DIGEST.json` | 0600 | adapter readiness interval | Atomic live descriptor. `DIGEST` is the lowercase hexadecimal SHA-256 of the canonical broker socket, one NUL separator, and the peer name. A clean stopping callback removes only the descriptor carrying that adapter's nonce. |
 
-The descriptor object contains exactly the following members. Unknown members, duplicate members, missing required values, trailing JSON, control characters in text identities, and a total file size outside 1 through 65536 bytes are rejected.
+The publisher writes a schema-2 descriptor containing every member below. The reader also accepts schema 1 when `executionPolicy` is omitted, null, or empty and normalizes that descriptor in memory to schema 2 with `workspace-write`. Unknown members, duplicate members, other missing required values, trailing JSON, control characters in text identities, and a total file size outside 1 through 65536 bytes are rejected.
 
 | Member | JSON type | Required value or meaning |
 |---|---|---|
-| `schemaVersion` | number | Live-descriptor schema `2`. |
+| `schemaVersion` | number | The publisher writes `2`. The reader accepts `1` only under the `executionPolicy` compatibility rule above. |
 | `peer` | string | Selected Intercom peer name, 1 through 64 bytes under the peer-name grammar. |
 | `cwd` | string | Clean absolute managed directory spelling, at most 4096 bytes and without NUL. Symbolic links are not resolved by descriptor validation. |
 | `brokerSocketIdentity` | string | Clean absolute broker socket identity used in the descriptor key, at most 4096 bytes and without NUL. |
@@ -1087,7 +1145,7 @@ The descriptor object contains exactly the following members. Unknown members, d
 | `pid` | number | Positive adapter process ID. |
 | `instanceNonce` | string | Random 128-bit lowercase hexadecimal owner nonce. Accepted descriptors permit 16 through 256 ASCII letters, digits, hyphens, or underscores. |
 | `codexVersion` | string | Nonblank Codex version, at most 4096 bytes and without control characters. |
-| `executionPolicy` | string | `workspace-write` or `danger-full-access`. Attach derives the Codex CLI policy option from this value. |
+| `executionPolicy` | string or null on schema-1 input | `workspace-write` or `danger-full-access`. It is required as a string in schema 2. An omitted, null, or empty value is accepted only in schema 1 and normalizes to `workspace-write`. Attach derives the Codex CLI policy option from the normalized value. |
 
 Publication holds the registry lock and replaces an absent descriptor, a descriptor with the same nonce, or a descriptor whose recorded PID does not exist. A descriptor with another nonce and an existing PID blocks publication. Attach validates the file and checks the PID but does not probe the downstream socket. A process crash can leave a stale descriptor; attach reports it and the next publisher may replace it.
 
@@ -1106,8 +1164,9 @@ The launcher creates `intercom-codex.XXXXXX` with mode 0700 beneath its selected
 | Codex app-server JSON message | 134217728 | bytes per WebSocket text message |
 | Codex session-list page request | 50 | records requested per app-server page; all cursored pages are collected |
 | Codex session ID | 256 | UTF-8 bytes; printable and free of whitespace |
-| Codex MCP bridge frame | 1048576 | bytes per newline-terminated request or response |
-| Concurrent Codex MCP bridge handlers | 64 | authenticated connections; an excess request receives overload failure and closes |
+| Codex session-picker input | 4096 | scanner-buffer bytes per entered token; a token that reaches the scanner capacity is rejected |
+| Codex MCP bridge frame | 1048576 | JSON bytes excluding the terminating newline; the largest accepted on-wire record is 1048577 bytes |
+| Concurrent Codex MCP bridge handlers | 64 | accepted connections admitted to request handling; authentication occurs after admission. The next accepted connection waits for a slot without an overload response, and the listener accepts no additional connection while it waits. |
 | Broker accepted connections and registered peers | no Intercom limit | operating-system descriptors, memory, and process resources bound the count |
 | Claude concurrent MCP tool handlers | no Intercom limit | one goroutine per active `tools/call`; process resources bound the count |
 | Codex inbound delivery queue | 64 | messages not yet started; an attempted 65th queued delivery is fatal |

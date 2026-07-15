@@ -9,7 +9,9 @@
 ```text
 intercom [--help] [--version]
 intercom shim
-intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new | --adopt-session ID | --fork-session ID] [--replace-binding] [--yolo]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] --mcp-bridge PATH [--name NAME] [--cwd DIRECTORY] --adopt-session ID [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] --mcp-bridge PATH [--name NAME] [--cwd DIRECTORY] --fork-session ID [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
 intercom codex attach --name NAME
 intercom codex sessions --app-server ENDPOINT [--cwd DIRECTORY] [--all] [--list]
 intercom broker [--idle-after DURATION] [--foreground]
@@ -18,7 +20,10 @@ intercom peers
 intercom completion {bash|fish|powershell|zsh} [--no-descriptions]
 intercom help [COMMAND ...]
 
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new | --adopt [ID] | --fork-from [ID]] [--all-sessions] [--list-sessions] [--replace-binding] [--yolo]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo | --dangerously-bypass-approvals-and-sandbox]
+intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]
 
 send_message(to=NAME, message=TEXT)
 list_peers()
@@ -41,7 +46,7 @@ The broker stores no messages. A successful send means that the broker completed
 - A Claude authentication method supported by Claude Code Channels.
 - A Codex authentication method supported by `codex app-server`.
 
-Claude Code Channels is a research-preview interface. Organization-managed Claude Team and Enterprise accounts require the Channels setting to be enabled. Anthropic Console organizations that deploy managed settings require `channelsEnabled: true`; Console organizations without managed settings have Channels enabled by default. Channels is unavailable through Amazon Bedrock, Google Vertex AI, and Microsoft Foundry.
+Claude Code Channels account restrictions and managed-setting requirements are specified in [Handbook: Configure a Claude Code peer](docs/HANDBOOK.md#2-configure-a-claude-code-peer).
 
 ### Install with Nix
 
@@ -63,7 +68,7 @@ install -m 0755 scripts/intercom-codex-project bin/intercom-codex-project
 export PATH="$PWD/bin:$PATH"
 ```
 
-The exported `PATH` must remain in the shell that starts either program. Without that export, checkout-local launcher use must set `INTERCOM_BIN=./bin/intercom`; invoking only `./bin/intercom-codex-project` can select another `intercom` from `PATH`.
+Each independent terminal used by the quick start repeats the `PATH` export from the repository root before it invokes a bare `intercom` or `intercom-codex-project` command. Without that export, checkout-local launcher use must set `INTERCOM_BIN=./bin/intercom`; invoking only `./bin/intercom-codex-project` can select another `intercom` from `PATH`.
 
 ### Connect Claude Code
 
@@ -80,80 +85,33 @@ Each Claude Code peer starts with Channels enabled:
 INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:intercom
 ```
 
-`INTERCOM_NAME` is optional when the working-directory basename is a suitable peer name.
+`INTERCOM_NAME` is optional when the working-directory basename is the required peer name. Peer-name syntax is specified in [Command and tool reference: Peer names](docs/REFERENCE.md#peer-names).
 
 ### Connect Codex
 
-The launcher owns one child app-server and one child adapter/proxy. Each invocation creates a private runtime directory containing three unique endpoint paths: `app-server.sock` connects the adapter to app-server, `client.sock` accepts one Codex TUI connection, and `mcp-bridge.sock` serves Intercom tools when the selected thread uses the MCP bridge.
+The managed service starts in the foreground in terminal 1:
 
-The service starts in its own terminal:
-
-```console
-$ intercom-codex-project --name reviewer --cwd .
-Intercom Codex peer reviewer is ready.
-Execution policy: workspace-write
-
-Attach from another terminal:
-  INTERCOM_DIR=STATE_DIRECTORY INTERCOM_SOCKET=BROKER_SOCKET CODEX_BIN=codex INTERCOM_EXECUTABLE codex attach --name reviewer
-
-Direct Codex command:
-  codex resume --remote unix:///RUNTIME/intercom-codex.INSTANCE/client.sock THREAD_ID
+```sh
+intercom-codex-project --name reviewer --cwd .
 ```
 
-The readiness block appears only after the managed thread, broker registration, client proxy, and live descriptor are ready. Its actual commands contain shell-quoted concrete values rather than the metavariables above. The name-based command includes the canonical `INTERCOM_DIR` and `INTERCOM_SOCKET`, the selected Codex and Intercom executables, and an explicit `CODEX_HOME` when one is configured. Copying that line preserves instance discovery and client selection in another terminal. Provider authentication variables that are not named in the block remain the responsibility of the attachment terminal.
-
-The shorter attachment form is equivalent when the second terminal already has the launcher's environment:
+After the readiness block appears, terminal 2 runs the exact attachment command printed by the launcher. The following shorter form is valid when both terminals use the same Intercom and Codex environment:
 
 ```sh
 intercom codex attach --name reviewer
 ```
 
-The command replaces itself with `codex resume --remote ENDPOINT THREAD_ID` from the managed project directory. Exiting or disconnecting the TUI releases the single attachment slot without stopping the service. The same attachment command reconnects later. A second simultaneous TUI attachment is rejected; it does not disturb the attached TUI or service.
+A third terminal verifies both quick-start peers:
 
-The launcher remains in the foreground and owns service shutdown. `Ctrl-C` in the launcher terminal stops the adapter/proxy and app-server. Exiting the TUI alone does not stop either child.
-
-Distinct names with distinct managed threads run concurrently on one machine. Each command occupies a separate launcher terminal and receives a separate private socket directory:
-
-```sh
-intercom-codex-project --name reviewer --cwd project-a
-intercom-codex-project --name planner --cwd project-b
+```console
+$ intercom peers
+implementer
+reviewer
 ```
 
-An ordinary Codex CLI or VS Code session can become the managed thread. Omitting the session ID opens a newest-first terminal picker restricted to resumable sessions whose working directory exactly matches `--cwd`:
+Exiting the attached TUI releases its attachment slot but leaves the service running. `Ctrl-C` in terminal 1 stops the adapter/proxy and app-server.
 
-```sh
-intercom-codex-project --name reviewer --cwd . --adopt
-```
-
-An explicit thread ID bypasses the picker:
-
-```sh
-intercom-codex-project --name reviewer --cwd . --adopt SESSION_ID
-```
-
-Exact adoption preserves the selected thread ID and conversation. The Codex TUI or IDE process that owns the source session must stop before adoption and must not resume that session while Intercom manages it. Ordinary Codex processes do not honor Intercom's thread lock. `--fork-from` creates and manages a new Codex thread instead; the source remains unchanged and can be resumed independently:
-
-```sh
-intercom-codex-project --name reviewer --cwd . --fork-from
-```
-
-`--list-sessions` prints eligible session records and exits. `--all-sessions` includes CLI and VS Code sessions from other working directories in listing or selection. Selecting a session from another directory reports that directory and requires a new invocation with the matching `--cwd`; the managed directory never changes implicitly.
-
-An existing peer binding accepts its own thread ID idempotently. Adopting or forking from another thread requires `--replace-binding`; the saved binding changes only after the selected thread starts, passes validation, and exposes both Intercom tools.
-
-`--yolo` and `--dangerously-bypass-approvals-and-sandbox` select approval policy `never`, approvals reviewer `user`, and Codex `danger-full-access` for the entire service. Intercom-delivered turns, attached-TUI turns, thread resume, and TUI settings updates retain that policy. The printed attachment command and `intercom codex attach` supply the matching Codex CLI option automatically.
-
-The launcher adapter joins the broker selected by its inherited `INTERCOM_SOCKET`. The value must match the value inherited by existing Claude peers; leaving it unset joins the default broker group. Attachment uses the same broker identity and `INTERCOM_DIR` as the launcher.
-
-The process remains in the foreground. A subsequent invocation with the same peer name, canonical working directory, Codex home, state schema, and tool contract attempts to resume the saved managed thread. The saved app-server user agent and Codex version are diagnostics, not binding identity; a successful resume refreshes them. A Codex upgrade therefore does not require `--new`. Before the first turn is materialized, a missing Codex rollout causes the adapter to start a replacement thread. A materialized binding is never replaced implicitly. `--new` creates another thread and replaces the Intercom binding.
-
-The app-server protocol provides no feature or schema-version negotiation. Intercom accepts an app-server user-agent version of 0.144.1 or later, then executes and validates the request, response, session-list, fork, lifecycle, managed-thread, sandbox, dynamic-tool, and MCP contracts it consumes. Unknown additive object fields are ignored. A newer version that changes a consumed contract fails at the affected startup or runtime validation. An attached TUI must use the same Codex version as the currently running app-server. A launcher that was already running when Codex was upgraded must restart before the upgraded TUI attaches; the binding does not require `--new`.
-
-The durable binding at `$INTERCOM_DIR/codex/NAME.json` survives service shutdown and identifies the resumable thread. The live descriptor under `$INTERCOM_DIR/codex/live` is published while an attachable service owns that name and broker identity. The private socket paths and their runtime directory belong to the launcher lifetime. TUI disconnect does not remove the live descriptor; clean service shutdown removes the descriptor, sockets, and runtime directory. Process or host failure can leave stale entries, which do not represent a usable service.
-
-The attached TUI controls only the selected Intercom-managed thread. Non-archived, non-ephemeral Codex CLI and VS Code root sessions in `idle` or `notLoaded` status and in the managed working directory are eligible for explicit or interactive adoption and fork; child, active, failed, web, desktop-app, and other source kinds are not. Ordinary prompts and the documented current-thread reads, settings, interruption, metadata, and project-search operations are supported. `/new`, `/fork`, thread archive, unarchive, or deletion, `/review`, manual `/compact`, rollback, shell escape, goal mutation, raw history injection, guardian-denied action approval, background-terminal mutation, realtime mutation, and unlisted protocol operations are unavailable through the managed attachment.
-
-Thread creation, resume, TUI turns, and Intercom-delivered turns pin the runtime workspace-root list to the managed directory. Both execution policies set approval `never` and approvals reviewer `user`. The default uses workspace-write sandboxing with no additional writable roots; yolo uses `danger-full-access`. Policy fields from the TUI are replaced with the service policy for resume, settings updates, and every turn. Model and collaboration settings remain available to TUI-originated turns. Threads created by Intercom use app-server dynamic tools. Adopted and forked interactive threads use a required private MCP bridge that is reinjected on every cold resume.
+Session selection, adoption, forking, binding replacement, execution policy, restart behavior, and attachment restrictions are specified in [Handbook: Managed Codex](docs/HANDBOOK.md#3-add-a-managed-codex-peer), [Handbook: Resume, adopt, fork, or replace](docs/HANDBOOK.md#5-resume-adopt-fork-or-replace-a-codex-thread), and [Command and tool reference: `intercom-codex-project`](docs/REFERENCE.md#intercom-codex-project). [Handbook: Multiple managed peers](docs/HANDBOOK.md#7-run-multiple-managed-peers) specifies concurrent and isolated service groups.
 
 ### Exchange messages
 

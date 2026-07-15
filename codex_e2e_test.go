@@ -357,6 +357,9 @@ func TestEndToEndClaudeAndCodexAdapters(t *testing.T) {
 	if threadStartParams.CWD == nil || *threadStartParams.CWD != project || len(threadStartParams.DynamicTools) != 2 {
 		t.Fatalf("thread/start params = %+v", threadStartParams)
 	}
+	if len(threadStartParams.RuntimeWorkspaceRoots) != 1 || threadStartParams.RuntimeWorkspaceRoots[0] != project {
+		t.Fatalf("thread/start runtime workspace roots = %#v", threadStartParams.RuntimeWorkspaceRoots)
+	}
 	thread := appserver.Thread{
 		ID:        "thread-e2e",
 		CWD:       project,
@@ -365,10 +368,11 @@ func TestEndToEndClaudeAndCodexAdapters(t *testing.T) {
 		Turns:     make([]appserver.Turn, 0),
 	}
 	server.respond(t, threadStart, appserver.ThreadStartResponse{ThreadResponse: appserver.ThreadResponse{
-		Thread:         thread,
-		CWD:            project,
-		ApprovalPolicy: string(appserver.ApprovalNever),
-		Sandbox:        appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
+		Thread:                thread,
+		CWD:                   project,
+		RuntimeWorkspaceRoots: []string{project},
+		ApprovalPolicy:        string(appserver.ApprovalNever),
+		Sandbox:               appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
 	}})
 	waitForShimPeer(t, alice, "reviewer", run)
 

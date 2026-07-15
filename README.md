@@ -9,7 +9,8 @@
 ```text
 intercom [--help] [--version]
 intercom shim
-intercom codex --app-server ENDPOINT [--name NAME] [--cwd DIRECTORY] [--new]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--name NAME] [--cwd DIRECTORY] [--new]
+intercom codex attach --name NAME
 intercom broker [--idle-after DURATION] [--foreground]
 intercom name
 intercom peers
@@ -24,7 +25,7 @@ list_peers()
 
 ## DESCRIPTION
 
-Intercom provides named, same-machine peers behind one Unix-domain-socket broker. `intercom shim` adapts the broker to Claude Code MCP and Channels. `intercom codex` adapts the broker to one dedicated Codex app-server thread. Both adapters expose the same `send_message` and `list_peers` tools to their models.
+Intercom provides named, same-machine peers behind one Unix-domain-socket broker. `intercom shim` adapts the broker to Claude Code MCP and Channels. `intercom codex` adapts the broker to one dedicated Codex app-server thread and exposes that managed thread to one attachable Codex TUI. Both adapters expose the same `send_message` and `list_peers` tools to their models.
 
 The broker stores no messages. A successful send means that the broker completed a delivery-frame write to the connected destination adapter. It does not establish that the destination model observed, processed, or answered the message.
 
@@ -82,17 +83,49 @@ INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:
 
 ### Connect Codex
 
-The launcher owns one child app-server and one child adapter:
+The launcher owns one child app-server and one child adapter/proxy. Each invocation creates a private runtime directory containing two unique Unix sockets: `app-server.sock` connects the adapter to app-server, and `client.sock` accepts one Codex TUI connection.
 
-```sh
-intercom-codex-project --name reviewer --cwd .
+The service starts in its own terminal:
+
+```console
+$ intercom-codex-project --name reviewer --cwd .
+Intercom Codex peer reviewer is ready.
+
+Attach from another terminal:
+  INTERCOM_DIR=STATE_DIRECTORY INTERCOM_SOCKET=BROKER_SOCKET CODEX_BIN=codex INTERCOM_EXECUTABLE codex attach --name reviewer
+
+Direct Codex command:
+  codex resume --remote unix:///RUNTIME/intercom-codex.INSTANCE/client.sock THREAD_ID
 ```
 
-The launcher adapter joins the broker selected by its inherited `INTERCOM_SOCKET`. The value must match the value inherited by existing Claude peers; leaving it unset joins the default broker group.
+The readiness block appears only after the managed thread, broker registration, client proxy, and live descriptor are ready. Its actual commands contain shell-quoted concrete values rather than the metavariables above. The name-based command includes the canonical `INTERCOM_DIR` and `INTERCOM_SOCKET`, the selected Codex and Intercom executables, and an explicit `CODEX_HOME` when one is configured. Copying that line preserves instance discovery and client selection in another terminal. Provider authentication variables that are not named in the block remain the responsibility of the attachment terminal.
+
+The shorter attachment form is equivalent when the second terminal already has the launcher's environment:
+
+```sh
+intercom codex attach --name reviewer
+```
+
+The command replaces itself with `codex resume --remote ENDPOINT THREAD_ID` from the managed project directory. Exiting or disconnecting the TUI releases the single attachment slot without stopping the service. The same attachment command reconnects later. A second simultaneous TUI attachment is rejected; it does not disturb the attached TUI or service.
+
+The launcher remains in the foreground and owns service shutdown. `Ctrl-C` in the launcher terminal stops the adapter/proxy and app-server. Exiting the TUI alone does not stop either child.
+
+Distinct names run concurrently on one machine. Each command occupies a separate launcher terminal and receives a separate private socket directory:
+
+```sh
+intercom-codex-project --name reviewer --cwd project-a
+intercom-codex-project --name planner --cwd project-b
+```
+
+The launcher adapter joins the broker selected by its inherited `INTERCOM_SOCKET`. The value must match the value inherited by existing Claude peers; leaving it unset joins the default broker group. Attachment uses the same broker identity and `INTERCOM_DIR` as the launcher.
 
 The process remains in the foreground. A subsequent invocation with the same peer name, canonical working directory, Codex home, and compatible Codex server attempts to resume the saved managed thread. Before the first turn is materialized, a missing Codex rollout causes the adapter to start a replacement thread. A materialized binding is never replaced implicitly. `--new` creates another thread and replaces the Intercom binding.
 
-Arbitrary Codex CLI, TUI, desktop, and shared app-server threads cannot be adopted. Intercom owns a dedicated headless app-server thread because its dynamic tools and lifecycle policy form part of the managed-thread contract.
+The durable binding at `$INTERCOM_DIR/codex/NAME.json` survives service shutdown and identifies the resumable thread. The live descriptor under `$INTERCOM_DIR/codex/live` is published while an attachable service owns that name and broker identity. The two private sockets and their runtime directory belong to the launcher lifetime. TUI disconnect does not remove the live descriptor; clean service shutdown removes the descriptor, sockets, and runtime directory. Process or host failure can leave stale entries, which do not represent a usable service.
+
+Arbitrary Codex CLI, TUI, desktop, and shared app-server threads cannot be adopted. The attached TUI controls only the Intercom-managed thread. Ordinary prompts and the documented current-thread reads, settings, interruption, metadata, and project-search operations are supported. `/new`, `/fork`, thread archive, unarchive, or deletion, `/review`, manual `/compact`, rollback, shell escape, goal mutation, raw history injection, guardian-denied action approval, background-terminal mutation, realtime mutation, and unlisted protocol operations are unavailable through the managed attachment.
+
+Thread creation, resume, TUI turns, and Intercom-delivered turns pin the runtime workspace-root list to the managed directory. Thread creation and resume establish approval policy `never` and workspace-write sandboxing without additional writable roots. An attached stock TUI may select its normal interactive approval, permission, model, and collaboration settings for TUI-originated turns. Every Intercom-delivered turn separately reasserts approval policy `never`, the validated workspace-write sandbox, and the managed runtime root. The thread-level Intercom developer instructions and dynamic tools remain available to both turn sources.
 
 ### Exchange messages
 
@@ -111,6 +144,7 @@ Claude receives a delivery as a channel event. Codex receives a delivery as a se
 | [`intercom`](docs/REFERENCE.md#intercom-root) | Prints command help when invoked without a command. |
 | [`intercom shim`](docs/REFERENCE.md#intercom-shim) | Runs the Claude Code stdio MCP and Channels adapter. |
 | [`intercom codex`](docs/REFERENCE.md#intercom-codex) | Connects an externally supervised dedicated app-server to the broker. |
+| [`intercom codex attach`](docs/REFERENCE.md#intercom-codex-attach) | Attaches one Codex TUI to a live managed peer by name. |
 | [`intercom broker`](docs/REFERENCE.md#intercom-broker) | Runs the broker. Adapters and `intercom peers` start it on demand. |
 | [`intercom name`](docs/REFERENCE.md#intercom-name) | Prints the validated peer name resolved for the working directory. |
 | [`intercom peers`](docs/REFERENCE.md#intercom-peers) | Prints other connected peer names through a transient broker connection. |
@@ -118,7 +152,7 @@ Claude receives a delivery as a channel event. Codex receives a delivery as a se
 | [`intercom help`](docs/REFERENCE.md#intercom-help) | Prints help for the selected command path. |
 | [`intercom --help`](docs/REFERENCE.md#intercom-root) | Prints root command help. |
 | [`intercom --version`](docs/REFERENCE.md#intercom-root) | Prints the Intercom version and build revision. |
-| [`intercom-codex-project`](docs/REFERENCE.md#intercom-codex-project) | Supervises one dedicated Codex app-server and adapter service group. |
+| [`intercom-codex-project`](docs/REFERENCE.md#intercom-codex-project) | Supervises one dedicated Codex app-server and attachable adapter/proxy service group. |
 | [`send_message`](docs/REFERENCE.md#send_message) | Sends one message to one connected peer. |
 | [`list_peers`](docs/REFERENCE.md#list_peers) | Lists other peers connected to the same broker. |
 

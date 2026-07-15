@@ -31,7 +31,8 @@ from the repository root.
 | Host utilities | `chmod`, `mktemp`, `rm`, and `sleep` | Launcher execution and its tests |
 | C toolchain | A compiler supported by the Go race detector | Race-enabled tests |
 | Nix | A Nix installation with flake support | Nix package verification |
-| Codex CLI | `codex-cli 0.144.1` | Opt-in real app-server tests |
+| Codex CLI | `codex-cli 0.144.1` | Opt-in real app-server tests and stock-TUI verification |
+| Codex authentication and model access | A working Codex 0.144.1 interactive configuration | Opt-in stock-TUI verification only |
 
 The Go toolchain downloads the modules declared by [`go.mod`](../go.mod) and
 [`go.sum`](../go.sum) when they are absent from the module cache. Nix downloads
@@ -39,8 +40,10 @@ the locked inputs declared by [`flake.lock`](../flake.lock) when they are absent
 from the Nix store. These operations require network access unless the
 corresponding caches contain all inputs.
 
-The real Codex tests require no OpenAI credentials and make no external model
-request. They start an installed Codex executable with an isolated `CODEX_HOME`.
+The Tier 7 real Codex tests require no OpenAI credentials and make no external
+model request. They start an installed Codex executable with an isolated
+`CODEX_HOME`. Tier 8 uses the normal authenticated Codex home and makes one
+model request.
 
 The flake development shell supplies the Go toolchain selected by `flake.nix`,
 `gopls`, and `gotools`:
@@ -141,6 +144,7 @@ required when a higher tier applies.
 | Broker frames, MCP messages, app-server messages, or tool schemas | 1–4 |
 | Supported target or packaged artifact | 1–6 |
 | Codex app-server protocol or managed-thread lifecycle | 1–7 |
+| Stock Codex TUI attachment or downstream-proxy compatibility | 1–8 |
 
 ### Tier 1 — format, analysis, and package tests
 
@@ -163,19 +167,21 @@ go test -count=1 ./...
 | Package | Boundary exercised by `go test ./...` |
 |---|---|
 | `.` | Broker-to-shim end-to-end delivery and combined Claude/Codex adapter behavior with a simulated app-server |
-| `./cmd/intercom` | Command registration, option precedence, validation, and signal handling |
+| `./cmd/intercom` | Command registration, option precedence, endpoint validation, live-descriptor publication, attach process replacement, readiness output, and signal handling |
 | `./docs/examples` | Compilation of the standalone manual broker-framing example |
 | `./internal/appserver` | Unix-WebSocket transport, request correlation, reverse requests, limits, cancellation, and protocol shapes |
+| `./internal/appserverproxy` | Downstream Unix-WebSocket service, TUI initialization, request-ID remapping, notification forwarding, reverse-request relay, connection exclusion, queue limits, and disconnect recovery |
 | `./internal/broker` | Registration, routing, ordering, shutdown, idle exit, locking, deadlines, and concurrent delivery |
 | `./internal/brokerclient` | Connection, broker auto-start, request handling, reconnection, cancellation, and concurrent callers |
-| `./internal/codex` | Managed-thread state, lifecycle control, delivery serialization, dynamic tools, recovery, and simulated app-server integration |
+| `./internal/codex` | Managed-thread state, lifecycle control, Intercom/TUI turn arbitration, reverse routing, delivery serialization, dynamic tools, recovery, and simulated app-server integration |
+| `./internal/codexinstance` | Live-descriptor validation, broker-scoped keys, atomic publication, cross-process exclusion, stale-PID handling, and nonce-checked cleanup |
 | `./internal/intercomtools` | Shared tool schemas, strict argument decoding, size limits, result formatting, and fuzz seeds |
 | `./internal/mcp` | MCP initialization, tool dispatch, notifications, errors, concurrency, and ping |
 | `./internal/paths` | Environment overrides and derived runtime paths |
 | `./internal/peername` | Peer-name precedence and validation |
 | `./internal/shim` | Claude shim name resolution |
 | `./internal/wire` | Broker framing, compatibility, limits, deadlines, concurrent writes, and peer-name grammar |
-| `./scripts` | Launcher supervision, readiness, signals, exit propagation, timeout validation, and cleanup |
+| `./scripts` | Two-socket launcher setup, readiness output preservation, supervision, signals, exit propagation, timeout validation, and cleanup |
 
 #### Success
 
@@ -235,6 +241,7 @@ exercise scheduling-dependent behavior.
 ```sh
 go test -race -count=20 \
   ./internal/appserver \
+  ./internal/appserverproxy \
   ./internal/broker \
   ./internal/brokerclient \
   ./internal/codex
@@ -242,9 +249,10 @@ go test -race -count=20 \
 
 #### Coverage
 
-The command executes each test in the four listed packages 20 times. It covers
-WebSocket request correlation, broker routing and shutdown, broker-client
-reconnection, and managed Codex lifecycle serialization.
+The command executes each test in the five listed packages 20 times. It covers
+upstream and downstream WebSocket request correlation, TUI connection and
+request arbitration, broker routing and shutdown, broker-client reconnection,
+and managed Codex lifecycle serialization.
 
 #### Success
 
@@ -429,6 +437,12 @@ against the real executable and a loopback Responses-compatible model server:
 5. Starts app-server again, resumes the thread, verifies the interrupted turn,
    and verifies that the outstanding request is not replayed.
 
+Tier 7 does not start the stock Codex TUI through the downstream proxy. The
+proxy's initialization, remapping, reverse routing, turn arbitration,
+disconnect, and exclusion contracts use simulated app-server and TUI peers in
+`./internal/appserverproxy` and `./internal/codex`. Tier 8 supplies the real
+client boundary.
+
 #### Success
 
 Both tests pass. Neither test reports a skip. All Codex homes, sockets, model
@@ -445,6 +459,79 @@ directories and are removed by the test harness.
   within five seconds.
 - The tests fail when any pinned request, response, sandbox, lifecycle,
   persistence, dynamic-tool, or crash-recovery invariant differs.
+
+### Tier 8 — stock Codex TUI attachment
+
+#### Purpose
+
+Tier 8 verifies the launcher, live descriptor, stock Codex TUI protocol,
+unmaterialized-thread attachment, model turn, detachment, and reconnection as
+one interactive service.
+
+#### Prerequisites
+
+`intercom`, `intercom-codex-project`, and Codex CLI 0.144.1 must be available in
+`PATH`. The normal Codex home must contain working authentication and model
+configuration. Two interactive terminals are required.
+
+#### Procedure
+
+The service terminal creates isolated Intercom state and an empty project, then
+starts the foreground launcher:
+
+```sh
+codex --version
+smoke_root=$(mktemp -d)
+mkdir -p "$smoke_root/state" "$smoke_root/project"
+chmod 700 "$smoke_root" "$smoke_root/state" "$smoke_root/project"
+INTERCOM_DIR="$smoke_root/state" \
+  intercom-codex-project --name tui-smoke --cwd "$smoke_root/project"
+launcher_status=$?
+rm -rf "$smoke_root"
+test "$launcher_status" -eq 130
+```
+
+The version output must be `codex-cli 0.144.1`. After readiness, the attachment
+terminal executes the complete command printed beneath `Attach from another
+terminal:`. The TUI submits this prompt:
+
+```text
+Reply with exactly TUI_SMOKE_OK. Do not call tools.
+```
+
+After the terminal answer reaches completion, an empty composer receives
+`Ctrl-C` and the TUI process exits. The attachment terminal executes the same
+printed attachment command again, verifies that the prior prompt and answer
+appear in the resumed thread, and exits the TUI again. The service terminal
+then receives `Ctrl-C`; the remaining cleanup commands remove the isolated
+state and require launcher status 130.
+
+#### Coverage
+
+The procedure exercises a real stock client initialize and resume, the local
+resume snapshot before first materialization, one authenticated model turn,
+rollout materialization, downstream disconnect without service shutdown, live
+descriptor reuse, and a second stock-client initialization against the same
+service and thread.
+
+#### Success
+
+The first attachment opens the managed thread before it has prior turns. The
+model returns `TUI_SMOKE_OK`. TUI exit leaves the launcher running and the peer
+registered. The second attachment opens the same thread and displays the first
+turn. Launcher interruption returns status 130 and removes its private sockets.
+
+#### Errors
+
+- A version other than `codex-cli 0.144.1` invalidates the verification.
+- Missing Codex authentication or model access prevents the model turn.
+- Missing readiness output identifies launcher, app-server, adapter, broker,
+  proxy, descriptor, or output failure.
+- A failed first attachment identifies descriptor discovery, executable,
+  remote-socket, initialization, or synthetic-resume failure.
+- A failed second attachment or missing first turn identifies detach,
+  materialization, descriptor-reuse, or resume failure.
+- A launcher status other than 130 identifies signal or child-status failure.
 
 ## CONTINUOUS INTEGRATION
 
@@ -470,7 +557,7 @@ The `verify` job executes these commands in order:
 test -z "$(gofmt -l .)"
 go vet ./...
 go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
-go test -race -count=20 ./internal/appserver ./internal/broker ./internal/brokerclient ./internal/codex
+go test -race -count=20 ./internal/appserver ./internal/appserverproxy ./internal/broker ./internal/brokerclient ./internal/codex
 go test -run=^$ -fuzz=FuzzConnRead -fuzztime=5s ./internal/wire
 go test -run=^$ -fuzz=FuzzRequestIDJSON -fuzztime=5s ./internal/appserver
 go test -run=^$ -fuzz=FuzzParseUnixEndpoint -fuzztime=5s ./internal/appserver

@@ -120,7 +120,7 @@ func TestDocumentationNavigationContract(t *testing.T) {
 func TestReferenceEntrySkeletons(t *testing.T) {
 	content := readDocument(t, "docs/REFERENCE.md")
 	for _, heading := range []string{
-		"intercom root", "intercom shim", "intercom codex", "intercom broker",
+		"intercom root", "intercom shim", "intercom codex", "intercom codex attach", "intercom broker",
 		"intercom name", "intercom peers", "intercom completion", "intercom help",
 		"intercom-codex-project",
 	} {
@@ -136,6 +136,54 @@ func TestReferenceEntrySkeletons(t *testing.T) {
 			"#### Signature", "#### Arguments", "#### Semantics", "#### Errors",
 			"#### Minimal example", "#### See also",
 		})
+	}
+}
+
+func TestInteractiveCodexDocumentationContract(t *testing.T) {
+	reference := readDocument(t, "docs/REFERENCE.md")
+	for _, required := range []string{
+		"--client-endpoint ENDPOINT",
+		"intercom codex attach --name NAME",
+		"Intercom Codex peer NAME is ready.",
+		"CODEX_EXECUTABLE resume --remote CLIENT_ENDPOINT THREAD_ID",
+		"INTERCOM_DIR=STATE_DIRECTORY INTERCOM_SOCKET=BROKER_SOCKET CODEX_BIN=CODEX_EXECUTABLE",
+		"$INTERCOM_DIR/codex/live/NAME-DIGEST.json",
+		"one downstream TUI session at a time",
+		"Codex app-server JSON message | 134217728",
+		"Codex TUI proxy JSON message | 134217728",
+		"Expired Codex TUI reverse-response ID history | 1024",
+		"Codex TUI interactive reverse-response relay | 30",
+		"A TUI disconnect does not stop the adapter or app-server.",
+		"`/new`",
+		"`/fork`",
+		"`review/start`",
+		"`thread/compact/start`",
+		"`thread/rollback`",
+		"`thread/shellCommand`",
+		"`thread/realtime/start`",
+		"`thread/settings/update`",
+		"`turn/interrupt` and `turn/steer`",
+		"`initialTurnsPage: null`",
+		"A verified or cached descendant is accepted.",
+	} {
+		if !strings.Contains(reference, required) {
+			t.Errorf("docs/REFERENCE.md: missing interactive Codex contract %q", required)
+		}
+	}
+
+	architecture := readDocument(t, "docs/ARCHITECTURE.md")
+	for _, required := range []string{
+		"sole upstream subscriber",
+		"remapped request IDs",
+		"App-server dynamic-tool reverse requests never reach the TUI.",
+		"Codex TUI turn",
+		"fresh control-timeout context",
+		"removes its owned live descriptor",
+		"bounded `thread/read` parent or fork ancestry",
+	} {
+		if !strings.Contains(architecture, required) {
+			t.Errorf("docs/ARCHITECTURE.md: missing interactive Codex architecture %q", required)
+		}
 	}
 }
 

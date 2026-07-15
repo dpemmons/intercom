@@ -23,7 +23,7 @@ type reverseResponder interface {
 	RespondError(context.Context, *appserver.RPCError) error
 }
 
-type reverseAuthorizer func(threadID, turnID string) error
+type reverseAuthorizer func(context.Context, string, string) error
 
 type reverseHandler struct {
 	broker     brokerTools
@@ -166,7 +166,7 @@ func (h *reverseHandler) handleDynamicTool(ctx context.Context, raw json.RawMess
 	if h.authorize == nil {
 		return responder.Respond(ctx, dynamicFailure("adapter is not ready"))
 	}
-	if err := h.authorize(params.ThreadID, params.TurnID); err != nil {
+	if err := h.authorize(ctx, params.ThreadID, params.TurnID); err != nil {
 		if respondErr := responder.Respond(ctx, dynamicFailure(err.Error())); respondErr != nil {
 			return respondErr
 		}

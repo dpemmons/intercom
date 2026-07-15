@@ -87,7 +87,7 @@ func TestReverseHandlerSendMessage(t *testing.T) {
 	broker := &fakeBrokerTools{ack: wire.SendAck{OK: true}}
 	h := reverseHandler{
 		broker: broker,
-		authorize: func(threadID, turnID string) error {
+		authorize: func(_ context.Context, threadID, turnID string) error {
 			if threadID != "thread-1" || turnID != "turn-1" {
 				t.Fatalf("authorize(%q, %q)", threadID, turnID)
 			}
@@ -109,7 +109,7 @@ func TestReverseHandlerSendMessage(t *testing.T) {
 
 func TestReverseHandlerStartupGate(t *testing.T) {
 	t.Parallel()
-	h := reverseHandler{authorize: func(string, string) error { return errors.New("adapter not ready") }}
+	h := reverseHandler{authorize: func(context.Context, string, string) error { return errors.New("adapter not ready") }}
 	response := &fakeResponder{}
 	err := h.handle(t.Context(), appserver.MethodDynamicToolCall, dynamicParams(intercomtools.ListPeersName, `{}`), response)
 	if err == nil {
@@ -135,7 +135,7 @@ func TestReverseHandlerRejectsInvalidDynamicRouting(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			broker := &fakeBrokerTools{ack: wire.SendAck{OK: true}}
-			h := reverseHandler{broker: broker, authorize: func(string, string) error { return nil }}
+			h := reverseHandler{broker: broker, authorize: func(context.Context, string, string) error { return nil }}
 			raw, err := json.Marshal(tt.params)
 			if err != nil {
 				t.Fatal(err)
@@ -160,7 +160,7 @@ func TestReverseHandlerListPeersRequiresEmptyObject(t *testing.T) {
 	for _, args := range []string{`null`, `[]`, `{"extra":true}`} {
 		t.Run(args, func(t *testing.T) {
 			broker := &fakeBrokerTools{peers: []string{"alice"}}
-			h := reverseHandler{broker: broker, authorize: func(string, string) error { return nil }}
+			h := reverseHandler{broker: broker, authorize: func(context.Context, string, string) error { return nil }}
 			response := &fakeResponder{}
 			if err := h.handle(t.Context(), appserver.MethodDynamicToolCall, dynamicParams(intercomtools.ListPeersName, args), response); err != nil {
 				t.Fatal(err)
@@ -182,7 +182,7 @@ func TestReverseHandlerCanRespondAfterBrokerDeadline(t *testing.T) {
 	cancel()
 	response := &fakeResponder{}
 	responder := freshResponseResponder{next: response, timeout: time.Second}
-	h := reverseHandler{broker: deadlineBrokerTools{}, authorize: func(string, string) error { return nil }}
+	h := reverseHandler{broker: deadlineBrokerTools{}, authorize: func(context.Context, string, string) error { return nil }}
 	if err := h.handle(workCtx, appserver.MethodDynamicToolCall,
 		dynamicParams(intercomtools.SendMessageName, `{"to":"bob","message":"hi"}`), responder); err != nil {
 		t.Fatal(err)

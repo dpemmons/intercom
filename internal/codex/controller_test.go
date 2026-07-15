@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,18 +24,20 @@ import (
 type fakeAppServer struct {
 	mu sync.Mutex
 
-	opts               appserver.Options
-	init               appserver.InitializeResponse
-	start              appserver.ThreadStartResponse
-	startErr           error
-	resume             appserver.ThreadResumeResponse
-	resumeErr          error
-	readErr            error
-	turnStart          appserver.TurnStartResponse
-	turnStartResponses []appserver.TurnStartResponse
-	turnStartHook      func(context.Context, appserver.TurnStartParams) error
-	interruptHook      func(appserver.TurnInterruptParams) error
-	waitHandlersHook   func(context.Context) error
+	opts                appserver.Options
+	init                appserver.InitializeResponse
+	start               appserver.ThreadStartResponse
+	startErr            error
+	resume              appserver.ThreadResumeResponse
+	resumeErr           error
+	readErr             error
+	threadReadResponses map[string]appserver.ThreadReadResponse
+	threadReadErrors    map[string]error
+	turnStart           appserver.TurnStartResponse
+	turnStartResponses  []appserver.TurnStartResponse
+	turnStartHook       func(context.Context, appserver.TurnStartParams) error
+	interruptHook       func(appserver.TurnInterruptParams) error
+	waitHandlersHook    func(context.Context) error
 
 	initializeParams []appserver.InitializeParams
 	threadStarts     []appserver.ThreadStartParams
@@ -50,11 +54,13 @@ func newFakeApp(cwd string) *fakeAppServer {
 	var start appserver.ThreadStartResponse
 	start.Thread = thread
 	start.CWD = cwd
+	start.RuntimeWorkspaceRoots = []string{cwd}
 	start.ApprovalPolicy = "never"
 	start.Sandbox = appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
 	var resume appserver.ThreadResumeResponse
 	resume.Thread = thread
 	resume.CWD = cwd
+	resume.RuntimeWorkspaceRoots = []string{cwd}
 	resume.ApprovalPolicy = "never"
 	resume.Sandbox = appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
 	return &fakeAppServer{
@@ -89,8 +95,14 @@ func (f *fakeAppServer) ThreadResume(_ context.Context, params appserver.ThreadR
 }
 func (f *fakeAppServer) ThreadRead(_ context.Context, params appserver.ThreadReadParams) (appserver.ThreadReadResponse, error) {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.threadReads = append(f.threadReads, params)
-	f.mu.Unlock()
+	if response, ok := f.threadReadResponses[params.ThreadID]; ok {
+		return response, f.threadReadErrors[params.ThreadID]
+	}
+	if err, ok := f.threadReadErrors[params.ThreadID]; ok {
+		return appserver.ThreadReadResponse{}, err
+	}
 	return appserver.ThreadReadResponse{Thread: f.start.Thread}, f.readErr
 }
 func (f *fakeAppServer) StartTurn(_ context.Context, params appserver.TurnStartParams) (appserver.TurnStartAwait, error) {
@@ -319,9 +331,18 @@ func TestControllerNewThreadAndCompletionBeforeResponse(t *testing.T) {
 	if len(starts) != 1 || starts[0].ClientUserMessageID == nil || *starts[0].ClientUserMessageID != "delivery-1" {
 		t.Fatalf("turn starts = %#v", starts)
 	}
+	if !slices.Equal(starts[0].RuntimeWorkspaceRoots, []string{h.cfg.CWD}) {
+		t.Fatalf("delivery runtime workspace roots = %#v", starts[0].RuntimeWorkspaceRoots)
+	}
 	if got := starts[0].Input[0].Text; !containsAll(got, "From: alice", "Message-ID: delivery-1", "review this") {
 		t.Fatalf("turn input = %q", got)
 	}
+	h.broker.opts.OnDeliver(wire.Deliver{ID: "delivery-2", From: "bob", Message: "follow up", Timestamp: "2026-07-13T18:43:00Z"})
+	waitFor(t, "second delivery after completion-before-response", func() bool {
+		h.app.mu.Lock()
+		defer h.app.mu.Unlock()
+		return len(h.app.turnStarts) == 2
+	})
 	stopHarness(t, cancel, done)
 }
 
@@ -343,6 +364,9 @@ func TestControllerStartsThreadWithPinnedPolicyAndTools(t *testing.T) {
 	if start.CWD == nil || *start.CWD != h.cfg.CWD {
 		t.Fatalf("thread/start cwd = %#v, want %q", start.CWD, h.cfg.CWD)
 	}
+	if !slices.Equal(start.RuntimeWorkspaceRoots, []string{h.cfg.CWD}) {
+		t.Fatalf("thread/start runtime workspace roots = %#v", start.RuntimeWorkspaceRoots)
+	}
 	if start.ApprovalPolicy != string(appserver.ApprovalNever) {
 		t.Fatalf("thread/start approval = %#v", start.ApprovalPolicy)
 	}
@@ -359,6 +383,72 @@ func TestControllerStartsThreadWithPinnedPolicyAndTools(t *testing.T) {
 		t.Fatalf("thread/start dynamic tools = %#v", start.DynamicTools)
 	}
 	stopHarness(t, cancel, done)
+}
+
+func TestPendingThreadUsesStartSnapshotForTUIResume(t *testing.T) {
+	dir := t.TempDir()
+	app := newFakeApp(dir)
+	app.start.Thread.Turns = []appserver.Turn{}
+	app.start.RuntimeWorkspaceRoots = []string{dir}
+	app.start.InstructionSources = []string{}
+	app.start.ApprovalsReviewer = appserver.ApprovalsReviewerUser
+	app.start.MultiAgentMode = "explicitRequestOnly"
+	store, err := AcquireStateStore(filepath.Join(dir, "state.json"), filepath.Join(dir, "state.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c := &controller{
+		cfg: Config{
+			Name: "reviewer", CWD: dir, ControlTimeout: time.Second,
+		},
+		app: app, store: store,
+	}
+	if err := c.startNewThread(t.Context(), app.init, appserver.ProtocolVersion); err != nil {
+		t.Fatal(err)
+	}
+
+	result, handled, err := c.localTUIRequest(appserver.MethodThreadResume, json.RawMessage(`{"threadId":"thread-1"}`), nil)
+	if err != nil || !handled {
+		t.Fatalf("localTUIRequest() = handled %v, error %v", handled, err)
+	}
+	var resumed appserver.ThreadResumeResponse
+	if err := json.Unmarshal(result, &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Thread.ID != app.start.Thread.ID || resumed.CWD != app.start.CWD || resumed.Model != app.start.Model {
+		t.Fatalf("synthetic resume = %#v, start = %#v", resumed, app.start)
+	}
+	if string(resumed.InitialTurnsPage) != "null" {
+		t.Fatalf("initialTurnsPage = %s, want null", resumed.InitialTurnsPage)
+	}
+	if result, handled, err := c.localTUIRequest("model/list", nil, nil); err != nil || handled || result != nil {
+		t.Fatalf("non-resume local request = %s, %v, %v", result, handled, err)
+	}
+	c.mu.Lock()
+	c.phase = phaseStarting
+	c.turnOwner = turnOwnerIntercom
+	c.mu.Unlock()
+	if _, err := c.applyNotification(appserver.Notification{
+		Method: appserver.NotificationTurnStarted,
+		Params: mustJSONBytes(appserver.TurnStartedNotification{
+			ThreadID: "thread-1",
+			Turn:     appserver.Turn{ID: "turn-1", Status: appserver.TurnStatusInProgress},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if result, handled, err := c.localTUIRequest(appserver.MethodThreadResume, nil, nil); err != nil || handled || result != nil {
+		t.Fatalf("active first-turn resume used stale synthetic snapshot: %s, %v, %v", result, handled, err)
+	}
+
+	app.readErr = nil
+	if materialized, err := c.confirmMaterialized(t.Context(), false); err != nil || !materialized {
+		t.Fatalf("confirmMaterialized() = %v, %v", materialized, err)
+	}
+	if result, handled, err := c.localTUIRequest(appserver.MethodThreadResume, nil, nil); err != nil || handled || result != nil {
+		t.Fatalf("materialized resume was handled locally: %s, %v, %v", result, handled, err)
+	}
 }
 
 func TestControllerUnavailableAppServerNeverRegistersBroker(t *testing.T) {
@@ -407,10 +497,23 @@ func TestControllerRejectsExpandedOrMalformedWorkspaceSandbox(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &controller{cfg: Config{CWD: dir}}
-			if err := c.acceptThread(thread, dir, string(appserver.ApprovalNever), tt.sandbox); err == nil {
+			if err := c.acceptThread(thread, dir, []string{dir}, string(appserver.ApprovalNever), tt.sandbox); err == nil {
 				t.Fatalf("acceptThread() accepted %#v", tt.sandbox)
 			}
 		})
+	}
+}
+
+func TestControllerRejectsUnpinnedRuntimeWorkspaceRoots(t *testing.T) {
+	dir := t.TempDir()
+	thread := appserver.Thread{ID: "thread-1", CWD: dir, Status: appserver.ThreadStatus{Type: appserver.ThreadStatusIdle}}
+	sandbox := appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
+	for _, roots := range [][]string{nil, {}, {dir, "/tmp"}, {"/tmp"}} {
+		if err := (&controller{cfg: Config{CWD: dir}}).acceptThread(
+			thread, dir, roots, string(appserver.ApprovalNever), sandbox,
+		); err == nil {
+			t.Fatalf("acceptThread() accepted runtime workspace roots %#v", roots)
+		}
 	}
 }
 
@@ -438,6 +541,9 @@ func TestControllerResumeReassertsPinnedPolicy(t *testing.T) {
 	}
 	if resume.CWD == nil || *resume.CWD != h.cfg.CWD || resume.ApprovalPolicy != string(appserver.ApprovalNever) {
 		t.Fatalf("thread/resume policy = %#v", resume)
+	}
+	if !slices.Equal(resume.RuntimeWorkspaceRoots, []string{h.cfg.CWD}) {
+		t.Fatalf("thread/resume runtime workspace roots = %#v", resume.RuntimeWorkspaceRoots)
 	}
 	if resume.Sandbox == nil || *resume.Sandbox != appserver.SandboxWorkspaceWrite {
 		t.Fatalf("thread/resume sandbox = %#v", resume.Sandbox)
@@ -601,10 +707,13 @@ func TestControllerShutdownReservesCleanupBudgetWhenBrokerCloseBlocks(t *testing
 				t.Fatal("turn interrupt ran before broker Close started")
 			}
 			interruptAt = time.Now()
-			c.notifications <- appserver.Notification{Method: appserver.NotificationTurnCompleted, Params: mustJSONBytes(appserver.TurnCompletedNotification{
-				ThreadID: params.ThreadID,
-				Turn:     appserver.Turn{ID: params.TurnID, Status: appserver.TurnStatusInterrupted},
-			})}
+			c.notifications <- queuedNotification{notification: appserver.Notification{
+				Method: appserver.NotificationTurnCompleted,
+				Params: mustJSONBytes(appserver.TurnCompletedNotification{
+					ThreadID: params.ThreadID,
+					Turn:     appserver.Turn{ID: params.TurnID, Status: appserver.TurnStatusInterrupted},
+				}),
+			}}
 			return nil
 		}
 		app.waitHandlersHook = func(ctx context.Context) error {
@@ -619,7 +728,7 @@ func TestControllerShutdownReservesCleanupBudgetWhenBrokerCloseBlocks(t *testing
 			logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 			app:           app,
 			broker:        broker,
-			notifications: make(chan appserver.Notification, 1),
+			notifications: make(chan queuedNotification, 1),
 			phase:         phaseActive,
 			threadID:      "thread-1",
 			turnID:        "turn-1",
@@ -833,9 +942,192 @@ func TestControllerRejectsMalformedLifecycleStatuses(t *testing.T) {
 	}
 }
 
+func TestControllerIgnoresLifecycleForAppServerChildThreads(t *testing.T) {
+	c := &controller{
+		phase:         phaseActive,
+		ready:         true,
+		turnOwner:     turnOwnerIntercom,
+		threadID:      "managed-thread",
+		turnID:        "managed-turn",
+		current:       wire.Deliver{ID: "delivery-1"},
+		state:         &ManagedState{ThreadID: "managed-thread", Materialized: false},
+		notifications: make(chan queuedNotification, 4),
+		activity:      make(chan struct{}, 1),
+		fatal:         make(chan error, 1),
+	}
+	notifications := []appserver.Notification{
+		{
+			Method: appserver.NotificationThreadStarted,
+			Params: mustJSONBytes(appserver.ThreadStartedNotification{Thread: appserver.Thread{
+				ID: "child-thread", ParentThreadID: ptr("managed-thread"),
+			}}),
+		},
+		{
+			Method: appserver.NotificationTurnStarted,
+			Params: mustJSONBytes(appserver.TurnStartedNotification{
+				ThreadID: "child-thread",
+				Turn:     appserver.Turn{ID: "child-turn", Status: appserver.TurnStatusInProgress},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: "child-thread",
+				Turn:     appserver.Turn{ID: "child-turn", Status: appserver.TurnStatusCompleted},
+			}),
+		},
+	}
+	c.enqueueNotification(notifications[0])
+	if err := c.authorizeReverse(t.Context(), "child-thread", "child-turn"); err != nil {
+		t.Fatalf("authorize child before controller consumed thread/started = %v", err)
+	}
+	queued := <-c.notifications
+	if err := c.finishNotification(t.Context(), queued); err != nil {
+		t.Fatalf("finishNotification(%s) = %v", queued.notification.Method, err)
+	}
+	for _, notification := range notifications[1:] {
+		if err := c.handleNotification(t.Context(), notification); err != nil {
+			t.Fatalf("handleNotification(%s) = %v", notification.Method, err)
+		}
+	}
+	if c.phase != phaseActive || c.turnOwner != turnOwnerIntercom || c.turnID != "managed-turn" || c.current.ID != "delivery-1" {
+		t.Fatalf("managed turn changed after child events: phase=%s owner=%s turn=%q delivery=%q", c.phase, c.turnOwner, c.turnID, c.current.ID)
+	}
+	if c.state.Materialized {
+		t.Fatal("child completion materialized the managed thread")
+	}
+	if c.turnID != "managed-turn" {
+		t.Fatalf("child authorization changed managed turn id to %q", c.turnID)
+	}
+	c.observeStartedThread(appserver.Thread{ID: "grandchild-thread", ParentThreadID: ptr("child-thread")})
+	if err := c.authorizeReverse(t.Context(), "grandchild-thread", "grandchild-turn"); err != nil {
+		t.Fatalf("authorize nested child dynamic tool = %v", err)
+	}
+	if err := c.authorizeReverse(t.Context(), "unrelated-thread", "unrelated-turn"); err == nil {
+		t.Fatal("unrelated thread dynamic tool was authorized")
+	}
+
+	broker := &fakeBrokerTools{peers: []string{"alice"}}
+	response := &fakeResponder{}
+	raw := mustJSONBytes(appserver.DynamicToolCallParams{
+		ThreadID: "child-thread", TurnID: "child-turn", CallID: "child-call", Tool: "list_peers", Arguments: json.RawMessage(`{}`),
+	})
+	handler := reverseHandler{broker: broker, authorize: c.authorizeReverse}
+	if err := handler.handle(t.Context(), appserver.MethodDynamicToolCall, raw, response); err != nil {
+		t.Fatalf("handle child dynamic tool = %v", err)
+	}
+	result, ok := response.result.(appserver.DynamicToolCallResponse)
+	if !ok || !result.Success || broker.lists != 1 {
+		t.Fatalf("child dynamic result = %#v, broker lists = %d", response.result, broker.lists)
+	}
+}
+
+func TestControllerAuthorizesUnannouncedDescendantByThreadRead(t *testing.T) {
+	app := newFakeApp(t.TempDir())
+	app.threadReadResponses = map[string]appserver.ThreadReadResponse{
+		"child-thread": {
+			Thread: appserver.Thread{ID: "child-thread", ParentThreadID: ptr("managed-thread")},
+		},
+		"grandchild-thread": {
+			Thread: appserver.Thread{ID: "grandchild-thread", ForkedFromID: ptr("child-thread")},
+		},
+	}
+	c := &controller{
+		app:       app,
+		ready:     true,
+		phase:     phaseActive,
+		threadID:  "managed-thread",
+		turnID:    "managed-turn",
+		turnOwner: turnOwnerIntercom,
+	}
+	if err := c.authorizeReverse(t.Context(), "grandchild-thread", "grandchild-turn"); err != nil {
+		t.Fatalf("authorize unannounced descendant = %v", err)
+	}
+	if c.turnID != "managed-turn" {
+		t.Fatalf("descendant authorization changed managed turn id to %q", c.turnID)
+	}
+	app.mu.Lock()
+	reads := append([]appserver.ThreadReadParams(nil), app.threadReads...)
+	app.mu.Unlock()
+	if len(reads) != 2 || reads[0].ThreadID != "grandchild-thread" || reads[1].ThreadID != "child-thread" {
+		t.Fatalf("ancestry reads = %#v", reads)
+	}
+
+	app.threadReadErrors = map[string]error{"child-thread": errors.New("cached child must not be read")}
+	broker := &fakeBrokerTools{peers: []string{"alice"}}
+	response := &fakeResponder{}
+	raw := mustJSONBytes(appserver.DynamicToolCallParams{
+		ThreadID: "child-thread", TurnID: "child-turn", CallID: "child-call", Tool: "list_peers", Arguments: json.RawMessage(`{}`),
+	})
+	handler := reverseHandler{broker: broker, authorize: c.authorizeReverse}
+	if err := handler.handle(t.Context(), appserver.MethodDynamicToolCall, raw, response); err != nil {
+		t.Fatalf("handle cached descendant dynamic tool = %v", err)
+	}
+	result, ok := response.result.(appserver.DynamicToolCallResponse)
+	if !ok || !result.Success || broker.lists != 1 {
+		t.Fatalf("cached descendant result = %#v, broker lists = %d", response.result, broker.lists)
+	}
+}
+
+func TestControllerValidatesDescendantAncestryWalk(t *testing.T) {
+	newController := func(app *fakeAppServer) *controller {
+		return &controller{app: app, ready: true, phase: phaseActive, threadID: "managed-thread", turnID: "managed-turn"}
+	}
+
+	t.Run("alternate fork path survives unreadable parent", func(t *testing.T) {
+		app := newFakeApp(t.TempDir())
+		app.threadReadResponses = map[string]appserver.ThreadReadResponse{
+			"child-thread": {Thread: appserver.Thread{
+				ID: "child-thread", ParentThreadID: ptr("missing-parent"), ForkedFromID: ptr("managed-thread"),
+			}},
+		}
+		app.threadReadErrors = map[string]error{"missing-parent": errors.New("missing parent")}
+		if err := newController(app).authorizeReverse(t.Context(), "child-thread", "child-turn"); err != nil {
+			t.Fatalf("authorize through alternate fork path = %v", err)
+		}
+	})
+
+	t.Run("cycle is unrelated", func(t *testing.T) {
+		app := newFakeApp(t.TempDir())
+		app.threadReadResponses = map[string]appserver.ThreadReadResponse{
+			"cycle-a": {Thread: appserver.Thread{ID: "cycle-a", ParentThreadID: ptr("cycle-b")}},
+			"cycle-b": {Thread: appserver.Thread{ID: "cycle-b", ParentThreadID: ptr("cycle-a")}},
+		}
+		err := newController(app).authorizeReverse(t.Context(), "cycle-a", "cycle-turn")
+		if err == nil || !strings.Contains(err.Error(), "no parent or fork ancestry") {
+			t.Fatalf("cycle authorization error = %v", err)
+		}
+	})
+
+	t.Run("response id mismatch is fatal", func(t *testing.T) {
+		app := newFakeApp(t.TempDir())
+		app.threadReadResponses = map[string]appserver.ThreadReadResponse{
+			"requested-thread": {Thread: appserver.Thread{ID: "different-thread", ParentThreadID: ptr("managed-thread")}},
+		}
+		err := newController(app).authorizeReverse(t.Context(), "requested-thread", "child-turn")
+		if err == nil || !strings.Contains(err.Error(), "returned thread different-thread") {
+			t.Fatalf("mismatched thread/read error = %v", err)
+		}
+	})
+
+	t.Run("walk is bounded", func(t *testing.T) {
+		app := newFakeApp(t.TempDir())
+		app.threadReadResponses = make(map[string]appserver.ThreadReadResponse)
+		for i := 0; i <= maxDescendantAncestry; i++ {
+			id := fmt.Sprintf("chain-%d", i)
+			parent := fmt.Sprintf("chain-%d", i+1)
+			app.threadReadResponses[id] = appserver.ThreadReadResponse{Thread: appserver.Thread{ID: id, ParentThreadID: &parent}}
+		}
+		err := newController(app).authorizeReverse(t.Context(), "chain-0", "child-turn")
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("exceeds %d threads", maxDescendantAncestry)) {
+			t.Fatalf("bounded ancestry error = %v", err)
+		}
+	})
+}
+
 func TestControllerDropsUnconsumedProgressNotifications(t *testing.T) {
 	c := &controller{
-		notifications: make(chan appserver.Notification, 1),
+		notifications: make(chan queuedNotification, 1),
 		activity:      make(chan struct{}, 1),
 		fatal:         make(chan error, 1),
 	}
@@ -848,7 +1140,15 @@ func TestControllerDropsUnconsumedProgressNotifications(t *testing.T) {
 	if got := len(c.activity); got != 1 {
 		t.Fatalf("coalesced activity signals = %d, want 1", got)
 	}
-	c.enqueueNotification(appserver.Notification{Method: appserver.NotificationTurnStarted})
+	c.phase = phaseStarting
+	c.threadID = "thread-1"
+	c.enqueueNotification(appserver.Notification{
+		Method: appserver.NotificationTurnStarted,
+		Params: mustJSONBytes(appserver.TurnStartedNotification{
+			ThreadID: "thread-1",
+			Turn:     appserver.Turn{ID: "turn-1", Status: appserver.TurnStatusInProgress},
+		}),
+	})
 	if got := len(c.notifications); got != 1 {
 		t.Fatalf("queued lifecycle notifications = %d, want 1", got)
 	}
@@ -870,6 +1170,37 @@ func TestControllerShutdownInterruptsActiveTurn(t *testing.T) {
 	h.app.mu.Unlock()
 	if len(interrupts) != 1 || interrupts[0].TurnID != "turn-1" {
 		t.Fatalf("turn interrupts = %#v", interrupts)
+	}
+}
+
+func TestControllerUnpublishesBeforeBrokerShutdown(t *testing.T) {
+	h := newControllerHarness(t)
+	unpublished := make(chan struct{})
+	var once sync.Once
+	h.cfg.OnStopping = func() error {
+		once.Do(func() { close(unpublished) })
+		return nil
+	}
+	cancel, done := runHarness(t, h)
+	ordered := make(chan bool, 1)
+	h.broker.mu.Lock()
+	h.broker.closeHook = func() {
+		select {
+		case <-unpublished:
+			ordered <- true
+		default:
+			ordered <- false
+		}
+	}
+	h.broker.mu.Unlock()
+	stopHarness(t, cancel, done)
+	select {
+	case ok := <-ordered:
+		if !ok {
+			t.Fatal("broker closed before live endpoint was unpublished")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("broker close hook did not run")
 	}
 }
 
@@ -987,6 +1318,65 @@ func TestControllerShutdownStartingTurnUsesEmptyInterruptAndDrainsResponse(t *te
 	close(allowCompletion)
 	if err := waitRunError(t, done); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context canceled", err)
+	}
+}
+
+func TestControllerShutdownDrainsTUIStartResponseAndTerminal(t *testing.T) {
+	dir := t.TempDir()
+	app := newFakeApp(dir)
+	broker := newFakeBroker(brokerclient.ClientOptions{})
+	interruptCalled := make(chan appserver.TurnInterruptParams, 1)
+	app.interruptHook = func(params appserver.TurnInterruptParams) error {
+		interruptCalled <- params
+		return nil
+	}
+	c := &controller{
+		cfg: Config{ControlTimeout: time.Second},
+		ctx: context.Background(), logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		app: app, broker: broker, ready: true, phase: phaseIdle, threadID: "thread-1",
+		notifications: make(chan queuedNotification, proxyEventQueueSize),
+		fatal:         make(chan error, 1), stateChanged: make(chan struct{}, 1),
+	}
+	app.opts.OnNotification = c.enqueueNotification
+	reservation, rpcErr := c.reserveTUITurn()
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.shutdown(nil)
+		close(done)
+	}()
+	select {
+	case params := <-interruptCalled:
+		if params.ThreadID != "thread-1" || params.TurnID != "" {
+			t.Fatalf("starting TUI interrupt = %#v", params)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("starting TUI turn was not interrupted")
+	}
+	select {
+	case <-done:
+		t.Fatal("shutdown returned before the TUI turn/start response")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	c.afterTUIRequest(appserver.MethodTurnStart, reservation, mustJSON(t, appserver.TurnStartResponse{
+		Turn: appserver.Turn{ID: "turn-1", Status: appserver.TurnStatusInProgress},
+	}), nil)
+	select {
+	case <-done:
+		t.Fatal("shutdown returned before the TUI turn terminal event")
+	case <-time.After(20 * time.Millisecond):
+	}
+	app.opts.OnNotification(appserver.Notification{Method: appserver.NotificationTurnCompleted, Params: mustJSON(t, appserver.TurnCompletedNotification{
+		ThreadID: "thread-1", Turn: appserver.Turn{ID: "turn-1", Status: appserver.TurnStatusInterrupted},
+	})})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not drain the TUI turn")
 	}
 }
 
@@ -1208,6 +1598,503 @@ func TestControllerQueueOverflowIsFatal(t *testing.T) {
 	case <-broker.closed:
 	case <-time.After(time.Second):
 		t.Fatal("queue overflow did not close broker")
+	}
+}
+
+func TestTUIResumeRewritePreservesClientFields(t *testing.T) {
+	c := &controller{
+		cfg:      Config{Name: "reviewer", CWD: t.TempDir()},
+		threadID: "thread-1",
+	}
+	params := json.RawMessage(`{
+		"threadId":"thread-1",
+		"cwd":"/wrong",
+		"runtimeWorkspaceRoots":["/wrong","/additional-root"],
+		"developerInstructions":"Render terminal output for the TUI.",
+		"excludeTurns":true,
+		"serviceTier":"fast",
+		"permissions":"workspace-write",
+		"futureField":{"enabled":true}
+	}`)
+	rewritten, state, rpcErr := c.beforeTUIRequest(appserver.MethodThreadResume, params)
+	if rpcErr != nil {
+		t.Fatalf("beforeTUIRequest() error = %v", rpcErr)
+	}
+	if state != nil {
+		t.Fatalf("thread/resume state = %#v, want nil", state)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &object); err != nil {
+		t.Fatal(err)
+	}
+	var cwd, developer, serviceTier, permissions string
+	var exclude bool
+	if err := json.Unmarshal(object["cwd"], &cwd); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(object["developerInstructions"], &developer); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(object["excludeTurns"], &exclude); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(object["serviceTier"], &serviceTier); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(object["permissions"], &permissions); err != nil {
+		t.Fatal(err)
+	}
+	if cwd != c.cfg.CWD || exclude || serviceTier != "fast" || permissions != "workspace-write" {
+		t.Fatalf("rewritten thread/resume = %s", rewritten)
+	}
+	if got := string(object["runtimeWorkspaceRoots"]); got != fmt.Sprintf(`[%q]`, c.cfg.CWD) {
+		t.Fatalf("runtimeWorkspaceRoots = %s", got)
+	}
+	if !containsAll(developer, "Render terminal output", "reviewer", "send_message", "list_peers") {
+		t.Fatalf("developer instructions = %q", developer)
+	}
+	if got := string(object["futureField"]); got != `{"enabled":true}` {
+		t.Fatalf("futureField = %s", got)
+	}
+}
+
+func TestTUISettingsUpdatePinsManagedCWDAndPreservesFields(t *testing.T) {
+	c := &controller{cfg: Config{CWD: t.TempDir()}, threadID: "thread-1"}
+	params := json.RawMessage(`{
+		"threadId":"thread-1",
+		"cwd":"/wrong",
+		"serviceTier":null,
+		"model":"gpt-test",
+		"approvalPolicy":"on-request",
+		"approvalsReviewer":"user",
+		"permissions":"danger-full-access",
+		"collaborationMode":{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":null}},
+		"futureField":{"enabled":true}
+	}`)
+	rewritten, state, rpcErr := c.beforeTUIRequest("thread/settings/update", params)
+	if rpcErr != nil {
+		t.Fatalf("beforeTUIRequest() error = %v", rpcErr)
+	}
+	if state != nil {
+		t.Fatalf("thread/settings/update state = %#v, want nil", state)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &object); err != nil {
+		t.Fatal(err)
+	}
+	var cwd string
+	if err := json.Unmarshal(object["cwd"], &cwd); err != nil {
+		t.Fatal(err)
+	}
+	if cwd != c.cfg.CWD || string(object["serviceTier"]) != "null" || string(object["model"]) != `"gpt-test"` ||
+		string(object["approvalPolicy"]) != `"on-request"` || string(object["approvalsReviewer"]) != `"user"` ||
+		string(object["permissions"]) != `"danger-full-access"` {
+		t.Fatalf("rewritten thread/settings/update = %s", rewritten)
+	}
+	if got := string(object["collaborationMode"]); got != `{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":null}}` {
+		t.Fatalf("collaborationMode = %s", got)
+	}
+	if got := string(object["futureField"]); got != `{"enabled":true}` {
+		t.Fatalf("futureField = %s", got)
+	}
+
+	nullCWD := json.RawMessage(`{"threadId":"thread-1","cwd":null,"model":"gpt-test"}`)
+	rewritten, _, rpcErr = c.beforeTUIRequest("thread/settings/update", nullCWD)
+	if rpcErr != nil {
+		t.Fatalf("null cwd beforeTUIRequest() error = %v", rpcErr)
+	}
+	if !strings.Contains(string(rewritten), `"cwd":null`) {
+		t.Fatalf("null cwd was not preserved: %s", rewritten)
+	}
+}
+
+func TestTUITurnReservationReconcilesEventBeforeResponse(t *testing.T) {
+	c := &controller{
+		cfg:           Config{Name: "reviewer", CWD: t.TempDir()},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ready:         true,
+		phase:         phaseIdle,
+		threadID:      "thread-1",
+		notifications: make(chan queuedNotification, 1),
+		activity:      make(chan struct{}, 1),
+		fatal:         make(chan error, 1),
+	}
+	params := json.RawMessage(`{
+		"threadId":"thread-1",
+		"input":[],
+		"cwd":"/wrong",
+		"runtimeWorkspaceRoots":["/additional-root"],
+		"approvalPolicy":"on-request",
+		"permissions":"danger-full-access",
+		"collaborationMode":{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":null}},
+		"futureField":7
+	}`)
+	rewritten, state, rpcErr := c.beforeTUIRequest(appserver.MethodTurnStart, params)
+	if rpcErr != nil {
+		t.Fatalf("beforeTUIRequest() error = %v", rpcErr)
+	}
+	if _, ok := state.(tuiTurnReservation); !ok {
+		t.Fatalf("turn/start state = %#v", state)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &object); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(object["cwd"]); got != fmt.Sprintf("%q", c.cfg.CWD) {
+		t.Fatalf("turn/start cwd = %s", got)
+	}
+	if got := string(object["futureField"]); got != "7" {
+		t.Fatalf("futureField = %s", got)
+	}
+	for field, want := range map[string]string{
+		"runtimeWorkspaceRoots": fmt.Sprintf(`[%q]`, c.cfg.CWD),
+		"approvalPolicy":        `"on-request"`,
+		"permissions":           `"danger-full-access"`,
+		"collaborationMode":     `{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":null}}`,
+	} {
+		if got := string(object[field]); got != want {
+			t.Fatalf("turn/start %s = %s, want %s", field, got, want)
+		}
+	}
+	if c.phase != phaseStarting || c.turnOwner != turnOwnerTUI {
+		t.Fatalf("reservation = phase %s owner %s", c.phase, c.turnOwner)
+	}
+	if err := c.reconcileTurn("thread-1", "turn-human", appserver.TurnStatusInProgress); err != nil {
+		t.Fatal(err)
+	}
+	c.afterTUIRequest(appserver.MethodTurnStart, state, mustJSON(t, appserver.TurnStartResponse{
+		Turn: appserver.Turn{ID: "turn-human", Status: appserver.TurnStatusInProgress},
+	}), nil)
+	select {
+	case err := <-c.fatal:
+		t.Fatalf("event-before-response caused fatal error: %v", err)
+	default:
+	}
+	c.enqueueNotification(appserver.Notification{
+		Method: appserver.NotificationTurnCompleted,
+		Params: mustJSONBytes(appserver.TurnCompletedNotification{
+			ThreadID: "thread-1", Turn: appserver.Turn{ID: "turn-human", Status: appserver.TurnStatusCompleted},
+		}),
+	})
+	queued := <-c.notifications
+	if c.phase != phaseCompleting || c.turnOwner != turnOwnerTUI {
+		t.Fatalf("unprocessed completion = phase %s owner %s", c.phase, c.turnOwner)
+	}
+	if _, rpcErr := c.reserveTUITurn(); rpcErr == nil {
+		t.Fatal("follow-up TUI turn reserved before completion processing")
+	}
+	if err := c.finishNotification(t.Context(), queued); err != nil {
+		t.Fatalf("finishNotification() = %v", err)
+	}
+	if c.phase != phaseIdle || c.turnOwner != turnOwnerNone {
+		t.Fatalf("completed turn = phase %s owner %s", c.phase, c.turnOwner)
+	}
+	if c.proxyEventGate || len(c.proxyEventQueue) != 0 {
+		t.Fatalf("completion proxy gate = %v, queue length %d", c.proxyEventGate, len(c.proxyEventQueue))
+	}
+}
+
+func TestTUITurnReservationReconcilesCompletionBeforeResponse(t *testing.T) {
+	c := &controller{
+		cfg:           Config{Name: "reviewer", CWD: t.TempDir()},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ready:         true,
+		phase:         phaseIdle,
+		threadID:      "thread-1",
+		notifications: make(chan queuedNotification, 1),
+		activity:      make(chan struct{}, 1),
+		fatal:         make(chan error, 1),
+	}
+	params := json.RawMessage(`{"threadId":"thread-1","input":[]}`)
+	_, state, rpcErr := c.beforeTUIRequest(appserver.MethodTurnStart, params)
+	if rpcErr != nil {
+		t.Fatalf("beforeTUIRequest() error = %v", rpcErr)
+	}
+	c.enqueueNotification(appserver.Notification{
+		Method: appserver.NotificationTurnCompleted,
+		Params: mustJSONBytes(appserver.TurnCompletedNotification{
+			ThreadID: "thread-1", Turn: appserver.Turn{ID: "turn-fast", Status: appserver.TurnStatusCompleted},
+		}),
+	})
+	queued := <-c.notifications
+	if c.phase != phaseAwaitingStartResponse || c.turnOwner != turnOwnerTUI || c.turnID != "turn-fast" {
+		t.Fatalf("completion-before-response = phase %s owner %s turn %q", c.phase, c.turnOwner, c.turnID)
+	}
+	if err := c.startDelivery(t.Context(), wire.Deliver{ID: "queued", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)}); !errors.Is(err, errTurnAlreadyReserved) {
+		t.Fatalf("startDelivery() while awaiting response error = %v, want %v", err, errTurnAlreadyReserved)
+	}
+	if err := c.finishNotification(t.Context(), queued); err != nil {
+		t.Fatalf("finishNotification() before response = %v", err)
+	}
+	if c.phase != phaseAwaitingStartResponse || !c.turnTerminalProcessed {
+		t.Fatalf("processed completion before response = phase %s processed %v", c.phase, c.turnTerminalProcessed)
+	}
+	if !c.proxyEventGate || len(c.proxyEventQueue) != 1 {
+		t.Fatalf("deferred completion gate = %v, queue length %d", c.proxyEventGate, len(c.proxyEventQueue))
+	}
+	c.afterTUIRequest(appserver.MethodTurnStart, state, mustJSON(t, appserver.TurnStartResponse{
+		Turn: appserver.Turn{ID: "turn-fast", Status: appserver.TurnStatusInProgress},
+	}), nil)
+	select {
+	case err := <-c.fatal:
+		t.Fatalf("completion-before-response caused fatal error: %v", err)
+	default:
+	}
+	if c.phase != phaseIdle || c.turnOwner != turnOwnerNone || c.turnID != "" {
+		t.Fatalf("reconciled turn = phase %s owner %s turn %q", c.phase, c.turnOwner, c.turnID)
+	}
+	if c.proxyEventGate || len(c.proxyEventQueue) != 0 {
+		t.Fatalf("released completion gate = %v, queue length %d", c.proxyEventGate, len(c.proxyEventQueue))
+	}
+	if _, rpcErr := c.reserveTUITurn(); rpcErr != nil {
+		t.Fatalf("queued follow-up turn was rejected after completion exposure: %v", rpcErr)
+	}
+}
+
+func TestTUIReservationWinsAtomicRaceWithBrokerDelivery(t *testing.T) {
+	c := &controller{ready: true, phase: phaseIdle, fatal: make(chan error, 1)}
+	if _, rpcErr := c.reserveTUITurn(); rpcErr != nil {
+		t.Fatalf("reserveTUITurn() = %v", rpcErr)
+	}
+	err := c.startDelivery(t.Context(), wire.Deliver{ID: "queued", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)})
+	if !errors.Is(err, errTurnAlreadyReserved) {
+		t.Fatalf("startDelivery() error = %v, want %v", err, errTurnAlreadyReserved)
+	}
+	if c.turnOwner != turnOwnerTUI || c.phase != phaseStarting {
+		t.Fatalf("broker delivery replaced TUI reservation: phase %s owner %s", c.phase, c.turnOwner)
+	}
+}
+
+func TestTUITurnStartFailureOnlyReleasesDefinitiveRejection(t *testing.T) {
+	newController := func() *controller {
+		return &controller{
+			ready: true, phase: phaseStarting, turnOwner: turnOwnerTUI,
+			fatal: make(chan error, 1),
+		}
+	}
+	t.Run("RPC rejection", func(t *testing.T) {
+		c := newController()
+		c.afterTUIRequest(appserver.MethodTurnStart, tuiTurnReservation{}, nil, &appserver.RPCError{
+			Code: appserver.ErrorCodeInvalidRequest, Message: "rejected",
+		})
+		if c.phase != phaseIdle || c.turnOwner != turnOwnerNone {
+			t.Fatalf("definitive rejection = phase %s owner %s", c.phase, c.turnOwner)
+		}
+		select {
+		case err := <-c.fatal:
+			t.Fatalf("definitive rejection caused fatal error: %v", err)
+		default:
+		}
+	})
+	t.Run("ambiguous transport error", func(t *testing.T) {
+		c := newController()
+		c.afterTUIRequest(appserver.MethodTurnStart, tuiTurnReservation{}, nil, context.DeadlineExceeded)
+		select {
+		case err := <-c.fatal:
+			if !containsAll(err.Error(), "ambiguous lifecycle outcome", "deadline exceeded") {
+				t.Fatalf("fatal error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("ambiguous turn/start failure was not fatal")
+		}
+		if c.phase != phaseStarting || c.turnOwner != turnOwnerTUI {
+			t.Fatalf("ambiguous failure discarded reservation: phase %s owner %s", c.phase, c.turnOwner)
+		}
+	})
+}
+
+func TestNonTurnTUIRequestFailureDoesNotChangeControllerOwnership(t *testing.T) {
+	c := &controller{fatal: make(chan error, 1)}
+	c.afterTUIRequest("config/read", nil, nil, context.DeadlineExceeded)
+	select {
+	case err := <-c.fatal:
+		t.Fatalf("timed-out read was fatal: %v", err)
+	default:
+	}
+
+	c.afterTUIRequest("config/read", nil, nil, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "rejected"})
+	select {
+	case err := <-c.fatal:
+		t.Fatalf("definitive forwarded request rejection was fatal: %v", err)
+	default:
+	}
+}
+
+func TestTUIPhaseTransitionsWakeDeliveryLoop(t *testing.T) {
+	app := newFakeApp(t.TempDir())
+	broker := newFakeBroker(brokerclient.ClientOptions{})
+	c := &controller{
+		cfg: Config{
+			CWD: t.TempDir(), ControlTimeout: time.Second, ActivityTimeout: time.Hour,
+		},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		app:           app,
+		broker:        broker,
+		deliveries:    make(chan wire.Deliver, 1),
+		notifications: make(chan queuedNotification, 4),
+		fatal:         make(chan error, 1),
+		activity:      make(chan struct{}, 1),
+		stateChanged:  make(chan struct{}, 1),
+		reconnectDone: make(chan error, 1),
+		ready:         true,
+		phase:         phaseIdle,
+		threadID:      "thread-1",
+		sandbox:       appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- c.loop(ctx) }()
+
+	_, state, rpcErr := c.beforeTUIRequest(appserver.MethodTurnStart, json.RawMessage(`{"threadId":"thread-1","input":[]}`))
+	if rpcErr != nil {
+		cancel()
+		t.Fatalf("reserve TUI turn: %v", rpcErr)
+	}
+	waitFor(t, "reservation phase wake", func() bool { return len(c.stateChanged) == 0 })
+	// Give the loop an opportunity to rebuild its select with broker delivery
+	// disabled while the TUI reservation is outstanding.
+	time.Sleep(10 * time.Millisecond)
+	c.afterTUIRequest(appserver.MethodTurnStart, state, nil, &appserver.RPCError{
+		Code: appserver.ErrorCodeInvalidRequest, Message: "rejected",
+	})
+	c.enqueueDelivery(wire.Deliver{
+		ID: "delivery-after-rejection", From: "alice", Message: "continue",
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	waitFor(t, "delivery after TUI rejection", func() bool {
+		app.mu.Lock()
+		defer app.mu.Unlock()
+		return len(app.turnStarts) == 1
+	})
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("loop error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("controller loop did not stop")
+	}
+}
+
+func TestTUITurnControlRequiresTUIOwnedTurn(t *testing.T) {
+	c := &controller{ready: true, phase: phaseActive, threadID: "thread-1", turnID: "turn-1", turnOwner: turnOwnerIntercom}
+	steer := json.RawMessage(`{"threadId":"thread-1","expectedTurnId":"turn-1","input":[]}`)
+	if _, _, rpcErr := c.beforeTUIRequest("turn/steer", steer); rpcErr == nil || !strings.Contains(rpcErr.Message, "does not own") {
+		t.Fatalf("turn/steer during Intercom turn error = %v", rpcErr)
+	}
+	interrupt := json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1"}`)
+	if _, _, rpcErr := c.beforeTUIRequest(appserver.MethodTurnInterrupt, interrupt); rpcErr == nil || !strings.Contains(rpcErr.Message, "does not own") {
+		t.Fatalf("turn/interrupt during Intercom turn error = %v", rpcErr)
+	}
+
+	c.turnOwner = turnOwnerTUI
+	if _, _, rpcErr := c.beforeTUIRequest("turn/steer", steer); rpcErr != nil {
+		t.Fatalf("TUI-owned turn/steer error = %v", rpcErr)
+	}
+	if _, _, rpcErr := c.beforeTUIRequest(appserver.MethodTurnInterrupt, interrupt); rpcErr != nil {
+		t.Fatalf("TUI-owned turn/interrupt error = %v", rpcErr)
+	}
+	wrong := json.RawMessage(`{"threadId":"thread-1","turnId":"turn-other"}`)
+	if _, _, rpcErr := c.beforeTUIRequest(appserver.MethodTurnInterrupt, wrong); rpcErr == nil || rpcErr.Code != appserver.ErrorCodeInvalidParams {
+		t.Fatalf("wrong-turn interrupt error = %v", rpcErr)
+	}
+}
+
+func TestTUIRejectsOperationsOutsideManagedTurnScheduler(t *testing.T) {
+	c := &controller{threadID: "thread-1"}
+	for _, method := range []string{
+		"thread/start", "thread/fork", "thread/archive", "thread/unarchive", "thread/delete",
+		"thread/compact/start", "thread/shellCommand", "thread/rollback", "review/start",
+		"thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText",
+		"thread/realtime/appendSpeech", "thread/realtime/stop", "thread/goal/set", "thread/goal/clear",
+		"thread/approveGuardianDeniedAction", "thread/inject_items", "thread/backgroundTerminals/terminate",
+		"future/mutatingMethod",
+	} {
+		t.Run(method, func(t *testing.T) {
+			if _, _, rpcErr := c.beforeTUIRequest(method, json.RawMessage(`{"threadId":"thread-1"}`)); rpcErr == nil || rpcErr.Code != appserver.ErrorCodeInvalidRequest {
+				t.Fatalf("beforeTUIRequest(%q) error = %v", method, rpcErr)
+			}
+		})
+	}
+}
+
+func TestTUIRequestAllowlistPinsProjectScopedReads(t *testing.T) {
+	c := &controller{cfg: Config{CWD: t.TempDir()}, threadID: "thread-1"}
+
+	for _, method := range []string{"configRequirements/read", "model/list"} {
+		params := json.RawMessage(`{"clientVersion":"test"}`)
+		rewritten, _, rpcErr := c.beforeTUIRequest(method, params)
+		if rpcErr != nil || string(rewritten) != string(params) {
+			t.Fatalf("beforeTUIRequest(%q) = %s, %v", method, rewritten, rpcErr)
+		}
+	}
+
+	rewritten, _, rpcErr := c.beforeTUIRequest("account/read", json.RawMessage(`{"refreshToken":true,"includeAuth":true}`))
+	if rpcErr != nil {
+		t.Fatalf("account/read error = %v", rpcErr)
+	}
+	var accountRead map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &accountRead); err != nil {
+		t.Fatal(err)
+	}
+	if string(accountRead["refreshToken"]) != "false" || string(accountRead["includeAuth"]) != "true" {
+		t.Fatalf("rewritten account/read = %s", rewritten)
+	}
+
+	for _, method := range []string{"thread/read", "thread/turns/list", "thread/goal/get"} {
+		if _, _, rpcErr := c.beforeTUIRequest(method, json.RawMessage(`{"threadId":"thread-1"}`)); rpcErr != nil {
+			t.Fatalf("managed read %q error = %v", method, rpcErr)
+		}
+		if _, _, rpcErr := c.beforeTUIRequest(method, json.RawMessage(`{"threadId":"other"}`)); rpcErr == nil || rpcErr.Code != appserver.ErrorCodeInvalidParams {
+			t.Fatalf("cross-thread read %q error = %v", method, rpcErr)
+		}
+	}
+
+	for _, method := range []string{"skills/list", "hooks/list", "plugin/list", "plugin/installed"} {
+		rewritten, _, rpcErr := c.beforeTUIRequest(method, json.RawMessage(`{"cwds":["/other"],"forceReload":true}`))
+		if rpcErr != nil {
+			t.Fatalf("%s error = %v", method, rpcErr)
+		}
+		var projectRead map[string]json.RawMessage
+		if err := json.Unmarshal(rewritten, &projectRead); err != nil {
+			t.Fatal(err)
+		}
+		if got := string(projectRead["cwds"]); got != fmt.Sprintf("[%q]", c.cfg.CWD) || string(projectRead["forceReload"]) != "true" {
+			t.Fatalf("rewritten %s = %s", method, rewritten)
+		}
+	}
+
+	for _, method := range []string{"config/read", "permissionProfile/list"} {
+		rewritten, _, rpcErr := c.beforeTUIRequest(method, json.RawMessage(`{"cwd":"/other","includeLayers":true}`))
+		if rpcErr != nil {
+			t.Fatalf("%s error = %v", method, rpcErr)
+		}
+		var projectRead map[string]json.RawMessage
+		if err := json.Unmarshal(rewritten, &projectRead); err != nil {
+			t.Fatal(err)
+		}
+		if string(projectRead["cwd"]) != fmt.Sprintf("%q", c.cfg.CWD) || string(projectRead["includeLayers"]) != "true" {
+			t.Fatalf("rewritten %s = %s", method, rewritten)
+		}
+	}
+
+	rewritten, _, rpcErr = c.beforeTUIRequest("fuzzyFileSearch/sessionStart", json.RawMessage(`{"sessionId":"search-1","roots":["/other"]}`))
+	if rpcErr != nil {
+		t.Fatalf("fuzzy search start error = %v", rpcErr)
+	}
+	var search map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &search); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(search["roots"]); got != fmt.Sprintf("[%q]", c.cfg.CWD) {
+		t.Fatalf("rewritten fuzzy search = %s", rewritten)
+	}
+	for _, method := range []string{"mcpServer/resource/read", "mcpServerStatus/list", "app/list", "experimentalFeature/list"} {
+		if _, _, rpcErr := c.beforeTUIRequest(method, json.RawMessage(`{"threadId":"other","server":"s","uri":"u"}`)); rpcErr == nil || rpcErr.Code != appserver.ErrorCodeInvalidParams {
+			t.Fatalf("cross-thread %s error = %v", method, rpcErr)
+		}
 	}
 }
 

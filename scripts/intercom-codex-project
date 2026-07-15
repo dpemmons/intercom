@@ -2,9 +2,9 @@
 set -u
 
 # Supported project supervisor for one dedicated Codex app-server and one Intercom
-# adapter. Configure binary locations with CODEX_BIN and INTERCOM_BIN. Runtime
-# arguments other than help and the prohibited app-server option are forwarded
-# to `intercom codex`.
+# adapter/proxy. Configure binary locations with CODEX_BIN and INTERCOM_BIN.
+# Runtime arguments other than help and the launcher-owned endpoint options are
+# forwarded to `intercom codex`.
 
 codex_bin=${CODEX_BIN:-codex}
 intercom_bin=${INTERCOM_BIN:-intercom}
@@ -17,7 +17,8 @@ usage() {
     '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]' \
     '' \
     'Description:' \
-    '  Starts one dedicated Codex app-server and one Intercom Codex adapter.' \
+    '  Starts one dedicated Codex app-server and one Intercom Codex adapter/proxy.' \
+    '  After readiness, the adapter prints commands for attaching a Codex TUI.' \
     '  The service group runs in the foreground until either child exits or a' \
     '  terminating signal arrives. Polling checks the adapter before app-server.' \
     '' \
@@ -51,8 +52,9 @@ for arg in "$@"; do
     -h | --help)
       show_help=1
       ;;
-    --app-server | --app-server=*)
-      printf 'intercom-codex-project: --app-server is managed by the launcher and must not be supplied\n' >&2
+    --app-server | --app-server=* | --client-endpoint | --client-endpoint=*)
+      option=${arg%%=*}
+      printf 'intercom-codex-project: %s is managed by the launcher and must not be supplied\n' "$option" >&2
       exit 2
       ;;
   esac
@@ -97,8 +99,22 @@ if ! chmod 700 "$runtime_dir"; then
   rm -rf "$runtime_dir"
   exit 1
 fi
-socket_path=$runtime_dir/app-server.sock
-endpoint=unix://$socket_path
+if ! canonical_runtime_dir=$(cd "$runtime_dir" && pwd -P); then
+  rm -rf "$runtime_dir"
+  exit 1
+fi
+runtime_dir=$canonical_runtime_dir
+case $runtime_dir in
+  *['%?#']*)
+    printf 'intercom-codex-project: runtime directory contains URL-delimiter byte: %s\n' "$runtime_dir" >&2
+    rm -rf "$runtime_dir"
+    exit 2
+    ;;
+esac
+app_server_socket_path=$runtime_dir/app-server.sock
+client_socket_path=$runtime_dir/client.sock
+app_server_endpoint=unix://$app_server_socket_path
+client_endpoint=unix://$client_socket_path
 
 server_pid=
 adapter_pid=
@@ -170,14 +186,16 @@ trap 'on_signal 143' TERM
 trap 'on_signal 129' HUP
 trap cleanup EXIT
 
-"$codex_bin" app-server --listen "$endpoint" &
+# App-server diagnostics belong on the launcher's diagnostic stream. The
+# adapter/proxy retains stdout for its post-readiness attachment instructions.
+"$codex_bin" app-server --listen "$app_server_endpoint" 1>&2 &
 server_pid=$!
 
 # Waiting for the socket avoids a noisy initial failure while the adapter's
 # own bounded dial retry verifies the actual WebSocket handshake.
 startup_ticks=$((startup_timeout * 10))
 for ((i = 0; i < startup_ticks; i++)); do
-  if [[ -S $socket_path ]]; then
+  if [[ -S $app_server_socket_path ]]; then
     break
   fi
   if ! is_running "$server_pid"; then
@@ -187,12 +205,15 @@ for ((i = 0; i < startup_ticks; i++)); do
   fi
   sleep 0.1
 done
-if [[ ! -S $socket_path ]]; then
+if [[ ! -S $app_server_socket_path ]]; then
   printf 'intercom-codex-project: app-server was not ready after %ss\n' "$startup_timeout" >&2
   exit 1
 fi
 
-"$intercom_bin" codex --app-server "$endpoint" "$@" &
+"$intercom_bin" codex \
+  --app-server "$app_server_endpoint" \
+  --client-endpoint "$client_endpoint" \
+  "$@" &
 adapter_pid=$!
 
 while :; do

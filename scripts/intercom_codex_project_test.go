@@ -35,8 +35,18 @@ func TestLauncherAdapterExitStopsServer(t *testing.T) {
 		t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", result.exitCode, result.stderr)
 	}
 	wantEventsInOrder(t, result.events, "adapter-start", "server-term")
-	if !strings.Contains(result.events, "adapter-args=codex\x1f--app-server\x1funix://") ||
-		!strings.Contains(result.events, "\x1f--name\x1freviewer\x1f--cwd\x1f/tmp/project") {
+	adapterArgs := recordedAdapterArgs(t, result.events)
+	appServerEndpoint := requiredFlagValue(t, adapterArgs, "--app-server")
+	clientEndpoint := requiredFlagValue(t, adapterArgs, "--client-endpoint")
+	appServerPath := unixEndpointPath(t, appServerEndpoint)
+	clientPath := unixEndpointPath(t, clientEndpoint)
+	if filepath.Base(appServerPath) != "app-server.sock" || filepath.Base(clientPath) != "client.sock" {
+		t.Fatalf("launcher socket paths = %q, %q", appServerPath, clientPath)
+	}
+	if filepath.Dir(appServerPath) != filepath.Dir(clientPath) || appServerPath == clientPath {
+		t.Fatalf("launcher endpoints are not distinct siblings: %q, %q", appServerPath, clientPath)
+	}
+	if !strings.Contains(result.events, "\x1f--name\x1freviewer\x1f--cwd\x1f/tmp/project") {
 		t.Fatalf("adapter arguments not forwarded as expected:\n%s", result.events)
 	}
 }
@@ -72,6 +82,205 @@ func TestLauncherServerExitBeforeReadiness(t *testing.T) {
 		t.Fatalf("adapter started after early server exit:\n%s", result.events)
 	}
 	wantEventsInOrder(t, result.events, "server-exit-before-ready")
+}
+
+func TestLauncherReservesStdoutForServiceReadiness(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "stream-routing")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 17 {
+		t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", code, stderr.String())
+	}
+	if got, want := stdout.String(), "service-ready\n"; got != want {
+		t.Fatalf("launcher stdout = %q, want only service readiness %q", got, want)
+	}
+	if !strings.Contains(stderr.String(), "app-server-stdout") {
+		t.Fatalf("app-server stdout was not routed to launcher stderr:\n%s", stderr.String())
+	}
+	wantEventsInOrder(t, readEvents(t, eventPath), "server-start", "adapter-start", "server-term")
+	assertRuntimeClean(t, runtimeDir)
+}
+
+func TestLauncherSurvivesClientDisconnect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "client-disconnect")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start launcher: %v", err)
+	}
+	running := true
+	t.Cleanup(func() {
+		if running {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+
+	waitForEvent(t, eventPath, "client-listen", 5*time.Second)
+	clientEndpoint := requiredFlagValue(t, recordedAdapterArgs(t, readEvents(t, eventPath)), "--client-endpoint")
+	conn, err := net.DialTimeout("unix", unixEndpointPath(t, clientEndpoint), time.Second)
+	if err != nil {
+		t.Fatalf("connect fake TUI client: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("disconnect fake TUI client: %v", err)
+	}
+	waitForEvent(t, eventPath, "client-disconnect", 5*time.Second)
+	time.Sleep(100 * time.Millisecond)
+	if events := readEvents(t, eventPath); strings.Contains(events, "adapter-term") || strings.Contains(events, "server-term") {
+		t.Fatalf("client disconnect stopped the service group:\n%s", events)
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal launcher: %v", err)
+	}
+	err = cmd.Wait()
+	running = false
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 143 {
+		t.Fatalf("exit code = %d, want 143; stderr:\n%s", code, stderr.String())
+	}
+	wantEventsInOrder(t, readEvents(t, eventPath), "client-connect", "client-disconnect", "adapter-term", "server-term")
+	assertRuntimeClean(t, runtimeDir)
+}
+
+func TestLaunchersUseDistinctEndpointsInSharedRuntimeBase(t *testing.T) {
+	sharedRuntime, err := os.MkdirTemp("/tmp", "icx-shared-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sharedRuntime) })
+
+	type runningLauncher struct {
+		cmd         *exec.Cmd
+		stderr      *bytes.Buffer
+		eventPath   string
+		runtimeBase string
+		running     bool
+	}
+	launchers := make([]runningLauncher, 2)
+	for index, name := range []string{"alpha", "beta"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd, stderr, eventPath, runtimeBase := launcherCommand(t, ctx, "signal", "--name", name)
+		replaceEnv(cmd, "XDG_RUNTIME_DIR", sharedRuntime)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start launcher %s: %v", name, err)
+		}
+		launchers[index] = runningLauncher{cmd: cmd, stderr: stderr, eventPath: eventPath, runtimeBase: runtimeBase, running: true}
+	}
+	t.Cleanup(func() {
+		for index := range launchers {
+			launcher := &launchers[index]
+			if launcher.running {
+				_ = launcher.cmd.Process.Kill()
+				_ = launcher.cmd.Wait()
+			}
+		}
+	})
+
+	runtimeDirs := make(map[string]struct{}, len(launchers))
+	for index := range launchers {
+		launcher := &launchers[index]
+		waitForEvent(t, launcher.eventPath, "adapter-start", 5*time.Second)
+		args := recordedAdapterArgs(t, readEvents(t, launcher.eventPath))
+		appServerPath := unixEndpointPath(t, requiredFlagValue(t, args, "--app-server"))
+		clientPath := unixEndpointPath(t, requiredFlagValue(t, args, "--client-endpoint"))
+		runtimeDir := filepath.Dir(appServerPath)
+		if filepath.Dir(clientPath) != runtimeDir {
+			t.Fatalf("launcher %d sockets have different directories: %q, %q", index, appServerPath, clientPath)
+		}
+		if filepath.Dir(runtimeDir) != sharedRuntime {
+			t.Fatalf("launcher %d runtime directory = %q, want child of %q", index, runtimeDir, sharedRuntime)
+		}
+		runtimeDirs[runtimeDir] = struct{}{}
+	}
+	if len(runtimeDirs) != len(launchers) {
+		t.Fatalf("%d launchers used only %d runtime directories: %v", len(launchers), len(runtimeDirs), runtimeDirs)
+	}
+
+	for index := range launchers {
+		launcher := &launchers[index]
+		if err := launcher.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("signal launcher %d: %v", index, err)
+		}
+	}
+	for index := range launchers {
+		launcher := &launchers[index]
+		err := launcher.cmd.Wait()
+		launcher.running = false
+		if code := processExitCode(err); code != 143 {
+			t.Fatalf("launcher %d exit code = %d, want 143; stderr:\n%s", index, code, launcher.stderr.String())
+		}
+		assertRuntimeClean(t, launcher.runtimeBase)
+	}
+	assertRuntimeClean(t, sharedRuntime)
+}
+
+func TestLauncherCanonicalizesRelativeRuntimeBase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeBase := launcherCommand(t, ctx, "adapter-first")
+	workingDir, err := os.MkdirTemp("/tmp", "icx-relative-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(workingDir) })
+	relativeBase := "relative-runtime"
+	absBase := filepath.Join(workingDir, relativeBase)
+	if err := os.Mkdir(absBase, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Dir = workingDir
+	replaceEnv(cmd, "XDG_RUNTIME_DIR", relativeBase)
+	err = cmd.Run()
+	if code := processExitCode(err); code != 17 {
+		t.Fatalf("exit code = %d, want 17; stderr:\n%s", code, stderr.String())
+	}
+	args := recordedAdapterArgs(t, readEvents(t, eventPath))
+	for _, flag := range []string{"--app-server", "--client-endpoint"} {
+		path := unixEndpointPath(t, requiredFlagValue(t, args, flag))
+		if filepath.Dir(filepath.Dir(path)) != absBase {
+			t.Fatalf("%s path = %q, want child of %q", flag, path, absBase)
+		}
+	}
+	assertRuntimeClean(t, absBase)
+	assertRuntimeClean(t, runtimeBase)
+}
+
+func TestLauncherRejectsURLDelimiterInRuntimePath(t *testing.T) {
+	for _, delimiter := range []string{"#", "?", "%"} {
+		t.Run(delimiter, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cmd, stderr, eventPath, runtimeBase := launcherCommand(t, ctx, "signal")
+			base := filepath.Join(t.TempDir(), "runtime"+delimiter+"base")
+			if err := os.Mkdir(base, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			replaceEnv(cmd, "XDG_RUNTIME_DIR", base)
+			err := cmd.Run()
+			if code := processExitCode(err); code != 2 {
+				t.Fatalf("exit code = %d, want 2; stderr:\n%s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "runtime directory contains URL-delimiter byte") {
+				t.Fatalf("missing runtime-path diagnostic; stderr:\n%s", stderr.String())
+			}
+			if events := readEvents(t, eventPath); events != "" {
+				t.Fatalf("children started with invalid runtime path:\n%s", events)
+			}
+			assertRuntimeClean(t, base)
+			assertRuntimeClean(t, runtimeBase)
+		})
+	}
 }
 
 func TestLauncherSignalStopsAdapterBeforeServer(t *testing.T) {
@@ -181,26 +390,34 @@ func TestLauncherRejectsInvalidTimeout(t *testing.T) {
 	}
 }
 
-func TestLauncherRejectsAppServerOverrideBeforeStartingChildren(t *testing.T) {
-	for _, args := range [][]string{
-		{"--app-server", "unix:///tmp/other.sock"},
-		{"--app-server=unix:///tmp/other.sock"},
-		{"--help", "--app-server", "unix:///tmp/other.sock"},
-		{"--app-server", "unix:///tmp/other.sock", "--help"},
-		{"--help", "--app-server=unix:///tmp/other.sock"},
+func TestLauncherRejectsEndpointOverridesBeforeStartingChildren(t *testing.T) {
+	for _, tt := range []struct {
+		option string
+		args   []string
+	}{
+		{option: "--app-server", args: []string{"--app-server", "unix:///tmp/other.sock"}},
+		{option: "--app-server", args: []string{"--app-server=unix:///tmp/other.sock"}},
+		{option: "--app-server", args: []string{"--help", "--app-server", "unix:///tmp/other.sock"}},
+		{option: "--app-server", args: []string{"--app-server", "unix:///tmp/other.sock", "--help"}},
+		{option: "--app-server", args: []string{"--help", "--app-server=unix:///tmp/other.sock"}},
+		{option: "--client-endpoint", args: []string{"--client-endpoint", "unix:///tmp/other.sock"}},
+		{option: "--client-endpoint", args: []string{"--client-endpoint=unix:///tmp/other.sock"}},
+		{option: "--client-endpoint", args: []string{"--help", "--client-endpoint", "unix:///tmp/other.sock"}},
+		{option: "--client-endpoint", args: []string{"--client-endpoint", "unix:///tmp/other.sock", "--help"}},
+		{option: "--client-endpoint", args: []string{"--help", "--client-endpoint=unix:///tmp/other.sock"}},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal", args...)
+		cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal", tt.args...)
 		err := cmd.Run()
 		cancel()
 		if code := processExitCode(err); code != 2 {
-			t.Fatalf("args %v exit code = %d, want 2; stderr:\n%s", args, code, stderr.String())
+			t.Fatalf("args %v exit code = %d, want 2; stderr:\n%s", tt.args, code, stderr.String())
 		}
-		if !strings.Contains(stderr.String(), "--app-server is managed by the launcher") {
-			t.Fatalf("args %v missing override error; stderr:\n%s", args, stderr.String())
+		if !strings.Contains(stderr.String(), tt.option+" is managed by the launcher") {
+			t.Fatalf("args %v missing override error; stderr:\n%s", tt.args, stderr.String())
 		}
 		if events := readEvents(t, eventPath); events != "" {
-			t.Fatalf("args %v started children:\n%s", args, events)
+			t.Fatalf("args %v started children:\n%s", tt.args, events)
 		}
 		assertRuntimeClean(t, runtimeDir)
 	}
@@ -436,6 +653,9 @@ func runServerHelper(args []string) int {
 	}
 	defer listener.Close()
 	recordEvent("server-start")
+	if mode == "stream-routing" {
+		_, _ = fmt.Fprintln(os.Stdout, "app-server-stdout")
+	}
 	if mode == "server-first" {
 		if !helperWaitForEvent("adapter-start", 5*time.Second) {
 			return 94
@@ -455,8 +675,41 @@ func runAdapterHelper(args []string) int {
 	}
 	recordEvent("adapter-start")
 	recordEvent("adapter-args=" + strings.Join(args, "\x1f"))
-	if mode == "adapter-first" {
+	if mode == "adapter-first" || mode == "stream-routing" {
+		if mode == "stream-routing" {
+			_, _ = fmt.Fprintln(os.Stdout, "service-ready")
+		}
 		return 17
+	}
+	if mode == "client-disconnect" {
+		endpoint, ok := flagValue(args, "--client-endpoint")
+		if !ok || !strings.HasPrefix(endpoint, "unix://") {
+			return 95
+		}
+		listener, err := net.Listen("unix", strings.TrimPrefix(endpoint, "unix://"))
+		if err != nil {
+			recordEvent("client-listen-error=" + err.Error())
+			return 96
+		}
+		recordEvent("client-listen")
+		clientDone := make(chan struct{})
+		go func() {
+			defer close(clientDone)
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			recordEvent("client-connect")
+			buffer := make([]byte, 1)
+			_, _ = conn.Read(buffer)
+			_ = conn.Close()
+			recordEvent("client-disconnect")
+		}()
+		waitForSignal()
+		_ = listener.Close()
+		<-clientDone
+		recordEvent("adapter-term")
+		return 0
 	}
 	if mode == "adapter-ignore-term" {
 		recordEvent("adapter-ignore-term")
@@ -485,6 +738,39 @@ func flagValue(args []string, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func recordedAdapterArgs(t *testing.T, events string) []string {
+	t.Helper()
+	for _, line := range strings.Split(events, "\n") {
+		if strings.HasPrefix(line, "adapter-args=") {
+			return strings.Split(strings.TrimPrefix(line, "adapter-args="), "\x1f")
+		}
+	}
+	t.Fatalf("adapter arguments not found in events:\n%s", events)
+	return nil
+}
+
+func requiredFlagValue(t *testing.T, args []string, name string) string {
+	t.Helper()
+	value, ok := flagValue(args, name)
+	if !ok {
+		t.Fatalf("flag %s not found in arguments: %q", name, args)
+	}
+	return value
+}
+
+func unixEndpointPath(t *testing.T, endpoint string) string {
+	t.Helper()
+	const prefix = "unix://"
+	if !strings.HasPrefix(endpoint, prefix) {
+		t.Fatalf("endpoint = %q, want %s prefix", endpoint, prefix)
+	}
+	path := strings.TrimPrefix(endpoint, prefix)
+	if !filepath.IsAbs(path) {
+		t.Fatalf("endpoint path = %q, want absolute", path)
+	}
+	return path
 }
 
 func recordEvent(event string) {

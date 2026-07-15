@@ -21,13 +21,14 @@ const ProtocolVersion = "0.144.1"
 
 // Method names used by the minimal managed-thread client.
 const (
-	MethodInitialize    = "initialize"
-	MethodInitialized   = "initialized"
-	MethodThreadStart   = "thread/start"
-	MethodThreadResume  = "thread/resume"
-	MethodThreadRead    = "thread/read"
-	MethodTurnStart     = "turn/start"
-	MethodTurnInterrupt = "turn/interrupt"
+	MethodInitialize        = "initialize"
+	MethodInitialized       = "initialized"
+	MethodThreadStart       = "thread/start"
+	MethodThreadResume      = "thread/resume"
+	MethodThreadRead        = "thread/read"
+	MethodThreadUnsubscribe = "thread/unsubscribe"
+	MethodTurnStart         = "turn/start"
+	MethodTurnInterrupt     = "turn/interrupt"
 )
 
 // Reverse request methods emitted by app-server 0.144.1.

@@ -622,6 +622,95 @@ func TestUnknownResponseIDTerminatesClient(t *testing.T) {
 	server.await(t)
 }
 
+func TestCanceledCallIgnoresOneLateResponseAndKeepsClientUsable(t *testing.T) {
+	firstArrived := make(chan struct{})
+	sendLate := make(chan struct{})
+	server := startUnixTestServer(t, func(ctx context.Context, conn *websocket.Conn) error {
+		first, err := readObject(ctx, conn)
+		if err != nil {
+			return err
+		}
+		firstID, err := objectID(first)
+		if err != nil {
+			return err
+		}
+		close(firstArrived)
+		select {
+		case <-sendLate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if err := writeObject(ctx, conn, map[string]any{"id": firstID, "result": map[string]bool{"late": true}}); err != nil {
+			return err
+		}
+		second, err := readObject(ctx, conn)
+		if err != nil {
+			return err
+		}
+		secondID, err := objectID(second)
+		if err != nil {
+			return err
+		}
+		return writeObject(ctx, conn, map[string]any{"id": secondID, "result": map[string]bool{"ok": true}})
+	})
+	client, err := DialUnix(context.Background(), server.endpoint, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	pending, err := client.StartCall(context.Background(), "test/late", struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstArrived:
+	case <-time.After(time.Second):
+		t.Fatal("first call did not reach server")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pending.Await(canceled, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Await error = %v", err)
+	}
+	close(sendLate)
+
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if err := client.Call(context.Background(), "test/after-late", struct{}{}, &result); err != nil {
+		t.Fatalf("call after late response: %v", err)
+	}
+	if !result.OK {
+		t.Fatalf("call after late response result = %#v", result)
+	}
+	server.await(t)
+}
+
+func TestExpiredResponseHistoryIsBounded(t *testing.T) {
+	client := &Client{
+		pending: make(map[RequestID]*pendingCall),
+		expired: make(map[RequestID]struct{}),
+	}
+	for i := 0; i < responseIDHistory+17; i++ {
+		id := NumberRequestID(int64(i))
+		call := &pendingCall{response: make(chan pendingResponse, 1)}
+		client.pending[id] = call
+		if !client.expirePending(id, call) {
+			t.Fatalf("expirePending(%d) returned false", i)
+		}
+	}
+	if len(client.expired) != responseIDHistory || len(client.expiredFIFO) != responseIDHistory {
+		t.Fatalf("expired history sizes = map %d fifo %d", len(client.expired), len(client.expiredFIFO))
+	}
+	if _, ok := client.expired[NumberRequestID(0)]; ok {
+		t.Fatal("oldest expired response ID was not evicted")
+	}
+	if _, ok := client.expired[NumberRequestID(responseIDHistory+16)]; !ok {
+		t.Fatal("newest expired response ID was evicted")
+	}
+}
+
 func TestBinaryMessageIsRejected(t *testing.T) {
 	server := startUnixTestServer(t, func(ctx context.Context, conn *websocket.Conn) error {
 		err := conn.Write(ctx, websocket.MessageBinary, []byte(`{"id":1,"result":{}}`))

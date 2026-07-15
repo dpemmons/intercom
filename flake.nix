@@ -10,7 +10,7 @@
       revision = self.rev or self.dirtyRev or "unknown";
       revisionLength = builtins.stringLength revision;
       shortRevision = builtins.substring 0 (if revisionLength < 8 then revisionLength else 8) revision;
-      packageVersion = "0.1.0-${shortRevision}";
+      packageVersion = "0.2.0-${shortRevision}";
     in {
       packages = forAll (pkgs: rec {
         intercom = pkgs.buildGoModule {

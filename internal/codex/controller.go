@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/dpemmons/intercom/internal/appserver"
+	"github.com/dpemmons/intercom/internal/appserverproxy"
 	"github.com/dpemmons/intercom/internal/brokerclient"
 	"github.com/dpemmons/intercom/internal/paths"
 	"github.com/dpemmons/intercom/internal/wire"
@@ -23,13 +26,18 @@ const (
 	defaultControlTimeout  = 30 * time.Second
 	defaultReverseTimeout  = 10 * time.Second
 	defaultActivityTimeout = 15 * time.Minute
+	maxDescendantAncestry  = 64
+	proxyEventQueueSize    = 256
 )
+
+var errTurnAlreadyReserved = errors.New("codex: managed thread turn is already reserved")
 
 type Config struct {
 	Name              string
 	Version           string
 	CWD               string
 	AppServerEndpoint string
+	ClientEndpoint    string
 	BrokerSocket      string
 	BrokerBin         string
 	New               bool
@@ -42,10 +50,23 @@ type Config struct {
 	ActivityTimeout time.Duration
 	StatePath       string
 	LockPath        string
+	OnReady         func(ReadyInfo) error
+	OnStopping      func() error
 
 	dialAppServer func(context.Context, string, appserver.Options) (appServerClient, error)
 	newBroker     func(brokerclient.ClientOptions) brokerConnection
 	onTurnActive  func()
+}
+
+// ReadyInfo describes the live managed thread after the broker and optional
+// TUI proxy are ready. OnReady runs synchronously before Run enters its main
+// service loop.
+type ReadyInfo struct {
+	Name           string
+	CWD            string
+	ThreadID       string
+	ClientEndpoint string
+	CodexVersion   string
 }
 
 type appServerClient interface {
@@ -72,9 +93,17 @@ type brokerConnection interface {
 
 type controllerPhase uint8
 
+type turnOwner uint8
+
 type turnStartResult struct {
 	response appserver.TurnStartResponse
 	err      error
+}
+
+type queuedNotification struct {
+	notification      appserver.Notification
+	applied           bool
+	managedCompletion bool
 }
 
 const (
@@ -82,7 +111,15 @@ const (
 	phaseIdle
 	phaseStarting
 	phaseActive
+	phaseAwaitingStartResponse
+	phaseCompleting
 	phaseFailed
+)
+
+const (
+	turnOwnerNone turnOwner = iota
+	turnOwnerIntercom
+	turnOwnerTUI
 )
 
 func (p controllerPhase) String() string {
@@ -95,6 +132,10 @@ func (p controllerPhase) String() string {
 		return "starting"
 	case phaseActive:
 		return "active"
+	case phaseAwaitingStartResponse:
+		return "awaiting-start-response"
+	case phaseCompleting:
+		return "completing"
 	case phaseFailed:
 		return "failed"
 	default:
@@ -102,8 +143,22 @@ func (p controllerPhase) String() string {
 	}
 }
 
+func (o turnOwner) String() string {
+	switch o {
+	case turnOwnerNone:
+		return "none"
+	case turnOwnerIntercom:
+		return "intercom"
+	case turnOwnerTUI:
+		return "tui"
+	default:
+		return "unknown"
+	}
+}
+
 type controller struct {
 	cfg    Config
+	ctx    context.Context
 	logger *slog.Logger
 	store  *StateStore
 	state  *ManagedState
@@ -111,30 +166,47 @@ type controller struct {
 	broker brokerConnection
 
 	deliveries    chan wire.Deliver
-	notifications chan appserver.Notification
+	notifications chan queuedNotification
 	fatal         chan error
 	activity      chan struct{}
+	stateChanged  chan struct{}
 	reconnectDone chan error
 
 	brokerCloseOnce sync.Once
 	brokerCloseDone chan struct{}
 	brokerCloseErr  error
 
-	mu               sync.Mutex
-	phase            controllerPhase
-	ready            bool
-	threadID         string
-	turnID           string
-	current          wire.Deliver
-	outboundCount    int
-	reconnecting     bool
-	reconnectPending bool
-	startupViolation bool
-	sandbox          appserver.SandboxPolicy
-	startResult      <-chan turnStartResult
-	startAmbiguous   bool
+	mu                    sync.Mutex
+	phase                 controllerPhase
+	ready                 bool
+	threadID              string
+	turnID                string
+	current               wire.Deliver
+	outboundCount         int
+	reconnecting          bool
+	reconnectPending      bool
+	startupViolation      bool
+	descendantThreads     map[string]struct{}
+	sandbox               appserver.SandboxPolicy
+	startResult           <-chan turnStartResult
+	startAmbiguous        bool
+	turnTerminalSeen      bool
+	turnTerminalProcessed bool
+	proxyEventGate        bool
+	proxyEventQueue       []appserver.Notification
 
 	reverse reverseHandler
+
+	proxyMu sync.RWMutex
+	proxy   *appserverproxy.Proxy
+
+	syntheticResumeMu sync.RWMutex
+	syntheticResume   json.RawMessage
+
+	initializeResponse    appserver.InitializeResponse
+	codexVersion          string
+	turnOwner             turnOwner
+	turnStartResponseSeen bool
 }
 
 // Run connects one externally supervised app-server thread to the Intercom
@@ -149,12 +221,14 @@ func Run(parent context.Context, cfg Config) error {
 
 	c := &controller{
 		cfg:           cfg,
+		ctx:           ctx,
 		logger:        cfg.Logger,
 		phase:         phaseBooting,
 		deliveries:    make(chan wire.Deliver, cfg.QueueSize),
-		notifications: make(chan appserver.Notification, 256),
+		notifications: make(chan queuedNotification, proxyEventQueueSize),
 		fatal:         make(chan error, 1),
 		activity:      make(chan struct{}, 1),
+		stateChanged:  make(chan struct{}, 1),
 		reconnectDone: make(chan error, 1),
 	}
 
@@ -203,7 +277,7 @@ func Run(parent context.Context, cfg Config) error {
 	appOptions := appserver.Options{
 		OnNotification:           c.enqueueNotification,
 		OnReverseRequestReceived: c.observeReverseRequest,
-		OnReverseRequest:         c.reverse.Handle,
+		OnReverseRequest:         c.handleReverseRequest,
 	}
 	c.app, err = c.dialAppServer(ctx, appOptions)
 	if err != nil {
@@ -213,6 +287,27 @@ func Run(parent context.Context, cfg Config) error {
 
 	if err := c.startup(ctx); err != nil {
 		return err
+	}
+	if err := c.startTUIProxy(ctx); err != nil {
+		return err
+	}
+	if proxy := c.currentProxy(); proxy != nil {
+		defer func() {
+			if err := proxy.Close(); err != nil {
+				c.logger.Warn("close Codex TUI proxy", "err", err)
+			}
+		}()
+	}
+	if cfg.OnReady != nil {
+		if err := cfg.OnReady(ReadyInfo{
+			Name:           cfg.Name,
+			CWD:            cfg.CWD,
+			ThreadID:       c.threadID,
+			ClientEndpoint: cfg.ClientEndpoint,
+			CodexVersion:   c.codexVersion,
+		}); err != nil {
+			return fmt.Errorf("codex: publish readiness: %w", err)
+		}
 	}
 	defer c.shutdown(cancel)
 	shutdownOwnsBroker = true
@@ -228,6 +323,14 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if _, err := appserver.ParseUnixEndpoint(cfg.AppServerEndpoint); err != nil {
 		return Config{}, err
+	}
+	if cfg.ClientEndpoint != "" {
+		if _, err := appserver.ParseUnixEndpoint(cfg.ClientEndpoint); err != nil {
+			return Config{}, fmt.Errorf("codex: client endpoint: %w", err)
+		}
+		if cfg.ClientEndpoint == cfg.AppServerEndpoint {
+			return Config{}, errors.New("codex: client endpoint must differ from app-server endpoint")
+		}
 	}
 	if cfg.BrokerSocket == "" {
 		return Config{}, errors.New("codex: broker socket is required")
@@ -352,6 +455,8 @@ func (c *controller) startup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.initializeResponse = init
+	c.codexVersion = version
 	control, cancel = context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	err = c.app.Initialized(control)
 	cancel()
@@ -395,6 +500,490 @@ func (c *controller) startup(ctx context.Context) error {
 	return nil
 }
 
+func (c *controller) startTUIProxy(ctx context.Context) error {
+	if c.cfg.ClientEndpoint == "" {
+		return nil
+	}
+	upstream, ok := c.app.(appserverproxy.Upstream)
+	if !ok {
+		return errors.New("codex: app-server client does not expose raw proxy calls")
+	}
+	proxy, err := appserverproxy.Listen(ctx, appserverproxy.Options{
+		Endpoint:               c.cfg.ClientEndpoint,
+		Upstream:               upstream,
+		InitializeResponse:     c.initializeResponse,
+		ExpectedClientVersion:  c.codexVersion,
+		HandshakeTimeout:       c.cfg.ControlTimeout,
+		WriteTimeout:           c.cfg.ControlTimeout,
+		RequestTimeout:         c.cfg.ControlTimeout,
+		TurnStartTimeout:       c.cfg.ControlTimeout,
+		ReverseResponseTimeout: c.cfg.ControlTimeout,
+		BeforeRequest:          c.beforeTUIRequest,
+		LocalRequest:           c.localTUIRequest,
+		AfterRequest:           c.afterTUIRequest,
+		OnAttach: func() {
+			c.logger.Info("Codex TUI attached", "peer", c.cfg.Name, "thread", c.threadID)
+		},
+		OnDetach: func() {
+			c.logger.Info("Codex TUI detached", "peer", c.cfg.Name, "thread", c.threadID)
+		},
+		Logger: c.logger,
+	})
+	if err != nil {
+		return fmt.Errorf("codex: start TUI proxy: %w", err)
+	}
+	c.proxyMu.Lock()
+	c.proxy = proxy
+	c.proxyMu.Unlock()
+	return nil
+}
+
+func (c *controller) currentProxy() *appserverproxy.Proxy {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
+}
+
+// localTUIRequest supplies the thread/start snapshot as a resume response
+// until Codex persists the thread's first rollout. BeforeRequest has already
+// validated the thread identity and pinned its settings when this hook runs.
+func (c *controller) localTUIRequest(method string, _ json.RawMessage, _ any) (json.RawMessage, bool, error) {
+	if method != appserver.MethodThreadResume {
+		return nil, false, nil
+	}
+	c.syntheticResumeMu.RLock()
+	result := append(json.RawMessage(nil), c.syntheticResume...)
+	c.syntheticResumeMu.RUnlock()
+	if len(result) == 0 {
+		return nil, false, nil
+	}
+	return result, true, nil
+}
+
+func (c *controller) setSyntheticResume(response appserver.ThreadStartResponse) error {
+	encoded, err := json.Marshal(appserver.ThreadResumeResponse{
+		ThreadResponse:   response.ThreadResponse,
+		InitialTurnsPage: json.RawMessage("null"),
+	})
+	if err != nil {
+		return fmt.Errorf("codex: encode pending thread resume response: %w", err)
+	}
+	c.syntheticResumeMu.Lock()
+	c.syntheticResume = encoded
+	c.syntheticResumeMu.Unlock()
+	return nil
+}
+
+func (c *controller) clearSyntheticResume() {
+	c.syntheticResumeMu.Lock()
+	c.syntheticResume = nil
+	c.syntheticResumeMu.Unlock()
+}
+
+type tuiTurnReservation struct {
+	result chan turnStartResult
+}
+
+func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (json.RawMessage, any, *appserver.RPCError) {
+	rewritten := params
+	switch method {
+	case appserver.MethodThreadResume:
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		threadID, err := threadIDFromObject(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if threadID != c.threadID {
+			return nil, nil, wrongTUIThread(method, threadID, c.threadID)
+		}
+		developer, err := combinedTUIDeveloperInstructions(object["developerInstructions"], developerInstructions(c.cfg.Name))
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "cwd", c.cfg.CWD); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "runtimeWorkspaceRoots", []string{c.cfg.CWD}); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "developerInstructions", developer); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "excludeTurns", false); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		rewritten = encoded
+	case appserver.MethodTurnStart:
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		threadID, err := threadIDFromObject(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if threadID != c.threadID {
+			return nil, nil, wrongTUIThread(method, threadID, c.threadID)
+		}
+		if err := setTUIField(object, "cwd", c.cfg.CWD); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "runtimeWorkspaceRoots", []string{c.cfg.CWD}); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		reservation, rpcErr := c.reserveTUITurn()
+		if rpcErr != nil {
+			return nil, nil, rpcErr
+		}
+		return encoded, reservation, nil
+	case "thread/settings/update":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		threadID, err := threadIDFromObject(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if threadID != c.threadID {
+			return nil, nil, wrongTUIThread(method, threadID, c.threadID)
+		}
+		if raw, ok := object["cwd"]; ok && strings.TrimSpace(string(raw)) != "null" {
+			if err := setTUIField(object, "cwd", c.cfg.CWD); err != nil {
+				return nil, nil, invalidTUIParams(method, err)
+			}
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		rewritten = encoded
+	case "skills/list", "hooks/list", "plugin/list", "plugin/installed":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "cwds", []string{c.cfg.CWD}); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		rewritten = encoded
+	case "config/read", "permissionProfile/list":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "cwd", c.cfg.CWD); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		rewritten = encoded
+	case "fuzzyFileSearch/sessionStart":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "roots", []string{c.cfg.CWD}); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		rewritten = encoded
+	case "account/read":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "refreshToken", false); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		rewritten = encoded
+	case appserver.MethodTurnInterrupt, "turn/steer":
+		if rpcErr := c.authorizeTUITurnControl(method, params); rpcErr != nil {
+			return nil, nil, rpcErr
+		}
+	case appserver.MethodThreadUnsubscribe,
+		"thread/read", "thread/turns/list", "thread/items/list",
+		"thread/name/set", "thread/metadata/update", "thread/memoryMode/set",
+		"thread/goal/get", "thread/backgroundTerminals/list":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		threadID, err := threadIDFromObject(object)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if threadID != c.threadID {
+			return nil, nil, wrongTUIThread(method, threadID, c.threadID)
+		}
+	case "mcpServer/resource/read", "mcpServerStatus/list", "app/list", "experimentalFeature/list":
+		object, err := tuiRequestObject(params)
+		if err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if rawThreadID, ok := object["threadId"]; ok && string(rawThreadID) != "null" {
+			var threadID string
+			if err := json.Unmarshal(rawThreadID, &threadID); err != nil || threadID == "" {
+				return nil, nil, invalidTUIParams(method, errors.New("threadId must be a nonempty string or null"))
+			}
+			if threadID != c.threadID {
+				return nil, nil, wrongTUIThread(method, threadID, c.threadID)
+			}
+		}
+	case "configRequirements/read",
+		"model/list", "modelProvider/capabilities/read",
+		"collaborationMode/list",
+		"account/rateLimits/read", "account/usage/read", "account/workspaceMessages/read",
+		"plugin/read", "plugin/skill/read", "plugin/share/list",
+		"environment/info",
+		"thread/realtime/listVoices", "fuzzyFileSearch/sessionUpdate", "fuzzyFileSearch/sessionStop":
+		// These pinned-protocol operations either read state or update or stop a
+		// project search session. They do not mutate managed turn ownership.
+	default:
+		return nil, nil, &appserver.RPCError{
+			Code:    appserver.ErrorCodeInvalidRequest,
+			Message: method + " is unavailable while attached to an Intercom-managed thread",
+		}
+	}
+	return rewritten, nil, nil
+}
+
+func (c *controller) authorizeTUITurnControl(method string, params json.RawMessage) *appserver.RPCError {
+	object, err := tuiRequestObject(params)
+	if err != nil {
+		return invalidTUIParams(method, err)
+	}
+	threadID, err := threadIDFromObject(object)
+	if err != nil {
+		return invalidTUIParams(method, err)
+	}
+	turnField := "turnId"
+	if method == "turn/steer" {
+		turnField = "expectedTurnId"
+	}
+	var requestedTurn string
+	raw, ok := object[turnField]
+	if !ok || json.Unmarshal(raw, &requestedTurn) != nil {
+		return invalidTUIParams(method, fmt.Errorf("%s must be a string", turnField))
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if threadID != c.threadID {
+		return wrongTUIThread(method, threadID, c.threadID)
+	}
+	if !c.ready || c.turnOwner != turnOwnerTUI || (c.phase != phaseStarting && c.phase != phaseActive) {
+		return &appserver.RPCError{
+			Code:    appserver.ErrorCodeInvalidRequest,
+			Message: "the attached TUI does not own the managed thread's active turn",
+		}
+	}
+	if method == "turn/steer" && requestedTurn == "" {
+		return invalidTUIParams(method, errors.New("expectedTurnId must not be empty"))
+	}
+	if c.turnID != "" && requestedTurn != c.turnID {
+		return &appserver.RPCError{
+			Code:    appserver.ErrorCodeInvalidParams,
+			Message: fmt.Sprintf("%s targets turn %q; the TUI-owned turn is %q", method, requestedTurn, c.turnID),
+		}
+	}
+	return nil
+}
+
+func (c *controller) afterTUIRequest(method string, state any, result json.RawMessage, err error) {
+	if method != appserver.MethodTurnStart {
+		return
+	}
+	reservation, ok := state.(tuiTurnReservation)
+	if !ok {
+		return
+	}
+	outcome := turnStartResult{err: err}
+	defer c.wakeStateChange()
+	defer func() { c.finishTUIStartResult(reservation, outcome) }()
+	if err != nil {
+		var rpcErr *appserver.RPCError
+		definitive := errors.As(err, &rpcErr)
+		c.mu.Lock()
+		if definitive && c.turnOwner == turnOwnerTUI && c.phase == phaseStarting && c.turnID == "" {
+			c.phase = phaseIdle
+			c.turnOwner = turnOwnerNone
+			c.startAmbiguous = false
+			c.turnTerminalSeen = false
+			c.turnTerminalProcessed = false
+			c.turnStartResponseSeen = false
+			c.mu.Unlock()
+			return
+		}
+		phase := c.phase
+		c.mu.Unlock()
+		if definitive {
+			c.signalFatal(fmt.Errorf("codex: TUI turn/start was rejected after lifecycle activity while controller is %s: %w", phase, err))
+		} else {
+			c.signalFatal(fmt.Errorf("codex: TUI turn/start failed with an ambiguous lifecycle outcome: %w", err))
+		}
+		return
+	}
+	var response appserver.TurnStartResponse
+	if decodeErr := json.Unmarshal(result, &response); decodeErr != nil {
+		outcome.err = fmt.Errorf("codex: decode TUI turn/start response: %w", decodeErr)
+		c.signalFatal(outcome.err)
+		return
+	}
+	outcome.response = response
+	c.mu.Lock()
+	var fatalErr error
+	releaseProxyEvents := false
+	if c.turnOwner != turnOwnerTUI || (c.phase != phaseStarting && c.phase != phaseActive && c.phase != phaseAwaitingStartResponse) {
+		fatalErr = fmt.Errorf("codex: TUI turn/start response arrived while controller is %s", c.phase)
+	} else if response.Turn.ID == "" {
+		fatalErr = errors.New("codex: TUI turn/start returned an empty turn id")
+	} else if c.turnID != "" && c.turnID != response.Turn.ID {
+		fatalErr = fmt.Errorf("codex: TUI turn response %s does not match event %s", response.Turn.ID, c.turnID)
+	} else if response.Turn.Status != appserver.TurnStatusInProgress {
+		fatalErr = fmt.Errorf("codex: TUI turn %s started with status %q", response.Turn.ID, response.Turn.Status)
+	} else if c.turnTerminalSeen {
+		c.turnStartResponseSeen = true
+		if c.turnTerminalProcessed {
+			c.settleCompletedTurnLocked()
+			releaseProxyEvents = true
+		} else {
+			c.phase = phaseCompleting
+		}
+	} else {
+		c.turnID = response.Turn.ID
+		c.phase = phaseActive
+		c.startAmbiguous = false
+		c.turnStartResponseSeen = true
+	}
+	c.mu.Unlock()
+	if releaseProxyEvents {
+		c.releaseProxyEventGate()
+	}
+	if fatalErr != nil {
+		c.signalFatal(fatalErr)
+	}
+}
+
+func (c *controller) finishTUIStartResult(reservation tuiTurnReservation, result turnStartResult) {
+	if reservation.result == nil {
+		return
+	}
+	reservation.result <- result
+	c.mu.Lock()
+	if c.startResult == reservation.result {
+		c.startResult = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *controller) reserveTUITurn() (tuiTurnReservation, *appserver.RPCError) {
+	c.mu.Lock()
+	if !c.ready {
+		c.mu.Unlock()
+		return tuiTurnReservation{}, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "Intercom peer is not ready"}
+	}
+	if c.phase != phaseIdle {
+		c.mu.Unlock()
+		return tuiTurnReservation{}, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "managed thread already has an active turn"}
+	}
+	result := make(chan turnStartResult, 1)
+	c.phase = phaseStarting
+	c.turnOwner = turnOwnerTUI
+	c.turnID = ""
+	c.current = wire.Deliver{}
+	c.outboundCount = 0
+	c.startResult = result
+	c.startAmbiguous = true
+	c.turnTerminalSeen = false
+	c.turnTerminalProcessed = false
+	c.turnStartResponseSeen = false
+	c.mu.Unlock()
+	c.wakeStateChange()
+	return tuiTurnReservation{result: result}, nil
+}
+
+func tuiRequestObject(params json.RawMessage) (map[string]json.RawMessage, error) {
+	if len(params) == 0 || string(params) == "null" {
+		return nil, errors.New("params must be an object")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(params, &object); err != nil {
+		return nil, err
+	}
+	if object == nil {
+		return nil, errors.New("params must be an object")
+	}
+	return object, nil
+}
+
+func threadIDFromObject(object map[string]json.RawMessage) (string, error) {
+	raw, ok := object["threadId"]
+	if !ok {
+		return "", nil
+	}
+	var threadID string
+	if err := json.Unmarshal(raw, &threadID); err != nil {
+		return "", errors.New("threadId must be a string")
+	}
+	return threadID, nil
+}
+
+func setTUIField(object map[string]json.RawMessage, field string, value any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	object[field] = encoded
+	return nil
+}
+
+func combinedTUIDeveloperInstructions(raw json.RawMessage, binding string) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return binding, nil
+	}
+	var client string
+	if err := json.Unmarshal(raw, &client); err != nil {
+		return "", errors.New("developerInstructions must be a string or null")
+	}
+	if strings.TrimSpace(client) == "" {
+		return binding, nil
+	}
+	return client + "\n\n" + binding, nil
+}
+
+func invalidTUIParams(method string, err error) *appserver.RPCError {
+	return &appserver.RPCError{Code: appserver.ErrorCodeInvalidParams, Message: fmt.Sprintf("invalid %s params: %v", method, err)}
+}
+
+func wrongTUIThread(method, got, want string) *appserver.RPCError {
+	return &appserver.RPCError{Code: appserver.ErrorCodeInvalidParams, Message: fmt.Sprintf("%s targets thread %q; managed thread is %q", method, got, want)}
+}
+
 var semanticVersion = regexp.MustCompile(`(?:^|[^0-9])(\d+\.\d+\.\d+)(?:[^0-9]|$)`)
 
 func validateServerVersion(userAgent string) (string, error) {
@@ -433,6 +1022,7 @@ func (c *controller) startNewThread(ctx context.Context, init appserver.Initiali
 	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	response, err := c.app.ThreadStart(control, appserver.ThreadStartParams{
 		CWD:                   &cwd,
+		RuntimeWorkspaceRoots: []string{cwd},
 		ApprovalPolicy:        string(appserver.ApprovalNever),
 		Sandbox:               &sandbox,
 		DeveloperInstructions: &developer,
@@ -443,7 +1033,7 @@ func (c *controller) startNewThread(ctx context.Context, init appserver.Initiali
 	if err != nil {
 		return fmt.Errorf("codex: start thread: %w", err)
 	}
-	if err := c.acceptThread(response.Thread, response.CWD, response.ApprovalPolicy, response.Sandbox); err != nil {
+	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.Sandbox); err != nil {
 		return err
 	}
 	c.state = &ManagedState{
@@ -460,6 +1050,9 @@ func (c *controller) startNewThread(ctx context.Context, init appserver.Initiali
 	if err := c.store.Save(*c.state); err != nil {
 		return fmt.Errorf("codex: persist new thread binding: %w", err)
 	}
+	if err := c.setSyntheticResume(response); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -471,6 +1064,7 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 	response, err := c.app.ThreadResume(control, appserver.ThreadResumeParams{
 		ThreadID:              c.state.ThreadID,
 		CWD:                   &cwd,
+		RuntimeWorkspaceRoots: []string{cwd},
 		ApprovalPolicy:        string(appserver.ApprovalNever),
 		Sandbox:               &sandbox,
 		DeveloperInstructions: &developer,
@@ -485,7 +1079,7 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 		}
 		return fmt.Errorf("codex: resume thread %s: %w", c.state.ThreadID, err)
 	}
-	if err := c.acceptThread(response.Thread, response.CWD, response.ApprovalPolicy, response.Sandbox); err != nil {
+	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.Sandbox); err != nil {
 		return err
 	}
 	if !c.state.Materialized {
@@ -502,12 +1096,15 @@ func isMissingRollout(err error, threadID string) bool {
 		rpcErr.Message == "no rollout found for thread id "+threadID
 }
 
-func (c *controller) acceptThread(thread appserver.Thread, cwd string, approval any, sandbox appserver.SandboxPolicy) error {
+func (c *controller) acceptThread(thread appserver.Thread, cwd string, runtimeWorkspaceRoots []string, approval any, sandbox appserver.SandboxPolicy) error {
 	if thread.ID == "" || thread.ID != c.stateThreadIDOr(thread.ID) {
 		return fmt.Errorf("codex: app-server returned unexpected thread id %q", thread.ID)
 	}
 	if filepath.Clean(cwd) != c.cfg.CWD || filepath.Clean(thread.CWD) != c.cfg.CWD {
 		return fmt.Errorf("codex: app-server returned cwd %q/%q, want %q", cwd, thread.CWD, c.cfg.CWD)
+	}
+	if len(runtimeWorkspaceRoots) != 1 || filepath.Clean(runtimeWorkspaceRoots[0]) != c.cfg.CWD {
+		return fmt.Errorf("codex: app-server runtime workspace roots are %v, want [%s]", runtimeWorkspaceRoots, c.cfg.CWD)
 	}
 	if thread.Ephemeral {
 		return errors.New("codex: app-server returned an ephemeral managed thread")
@@ -560,6 +1157,7 @@ func (c *controller) confirmMaterialized(ctx context.Context, retry bool) (bool,
 				}
 				c.state = &updated
 			}
+			c.clearSyntheticResume()
 			return true, nil
 		}
 		if !isBeforeFirstUserMessage(err, c.threadID) {
@@ -589,10 +1187,26 @@ func isBeforeFirstUserMessage(err error, threadID string) bool {
 
 func (c *controller) loop(ctx context.Context) error {
 	var watchdog *time.Timer
+	var pendingDelivery *wire.Deliver
 	for {
 		phase := c.currentPhase()
+		if phase == phaseIdle && pendingDelivery != nil {
+			err := c.startDelivery(ctx, *pendingDelivery)
+			if errors.Is(err, errTurnAlreadyReserved) {
+				continue
+			}
+			pendingDelivery = nil
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				c.setFailed()
+				return err
+			}
+			continue
+		}
 		var delivery <-chan wire.Deliver
-		if phase == phaseIdle {
+		if phase == phaseIdle && pendingDelivery == nil {
 			delivery = c.deliveries
 		}
 		var watchdogC <-chan time.Time
@@ -610,6 +1224,10 @@ func (c *controller) loop(ctx context.Context) error {
 			}
 			watchdog = nil
 		}
+		var proxyDone <-chan struct{}
+		if proxy := c.currentProxy(); proxy != nil {
+			proxyDone = proxy.Done()
+		}
 
 		select {
 		case <-ctx.Done():
@@ -620,11 +1238,21 @@ func (c *controller) loop(ctx context.Context) error {
 				err = appserver.ErrClosed
 			}
 			return fmt.Errorf("codex: app-server disconnected: %w", err)
+		case <-proxyDone:
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return errors.New("codex: TUI proxy listener stopped")
 		case err := <-c.fatal:
 			c.setFailed()
 			return err
 		case d := <-delivery:
 			if err := c.startDelivery(ctx, d); err != nil {
+				if errors.Is(err, errTurnAlreadyReserved) {
+					pending := d
+					pendingDelivery = &pending
+					continue
+				}
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -632,7 +1260,7 @@ func (c *controller) loop(ctx context.Context) error {
 				return err
 			}
 		case notification := <-c.notifications:
-			if err := c.handleNotification(ctx, notification); err != nil {
+			if err := c.finishNotification(ctx, notification); err != nil {
 				c.setFailed()
 				return err
 			}
@@ -659,6 +1287,9 @@ func (c *controller) loop(ctx context.Context) error {
 				}
 				watchdog.Reset(c.cfg.ActivityTimeout)
 			}
+		case <-c.stateChanged:
+			// Rebuild phase-dependent select cases after a proxy request changes
+			// turn ownership or returns the controller to idle.
 		case <-watchdogC:
 			c.setFailed()
 			return fmt.Errorf("codex: active turn had no app-server activity for %s", c.cfg.ActivityTimeout)
@@ -676,11 +1307,20 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 		sent = time.Now().UTC()
 	}
 	c.mu.Lock()
+	if c.phase != phaseIdle {
+		c.mu.Unlock()
+		return errTurnAlreadyReserved
+	}
 	c.phase = phaseStarting
+	c.turnOwner = turnOwnerIntercom
 	c.turnID = ""
 	c.current = delivery
 	c.outboundCount = 0
+	c.startResult = nil
 	c.startAmbiguous = false
+	c.turnTerminalSeen = false
+	c.turnTerminalProcessed = false
+	c.turnStartResponseSeen = false
 	sandbox := c.sandbox
 	threadID := c.threadID
 	c.mu.Unlock()
@@ -689,12 +1329,13 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 	cwd := c.cfg.CWD
 	writeCtx, cancelWrite := context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	await, err := c.app.StartTurn(writeCtx, appserver.TurnStartParams{
-		ThreadID:            threadID,
-		ClientUserMessageID: &clientID,
-		Input:               []appserver.UserInput{appserver.TextInput(inboundEnvelope(delivery.From, delivery.ID, delivery.Message, sent))},
-		CWD:                 &cwd,
-		ApprovalPolicy:      string(appserver.ApprovalNever),
-		SandboxPolicy:       &sandbox,
+		ThreadID:              threadID,
+		ClientUserMessageID:   &clientID,
+		Input:                 []appserver.UserInput{appserver.TextInput(inboundEnvelope(delivery.From, delivery.ID, delivery.Message, sent))},
+		CWD:                   &cwd,
+		RuntimeWorkspaceRoots: []string{cwd},
+		ApprovalPolicy:        string(appserver.ApprovalNever),
+		SandboxPolicy:         &sandbox,
 	})
 	cancelWrite()
 	if err != nil {
@@ -749,8 +1390,26 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 		c.mu.Unlock()
 		return fmt.Errorf("codex: turn %s started with status %q, want %q", response.Turn.ID, response.Turn.Status, appserver.TurnStatusInProgress)
 	}
-	c.phase = phaseActive
+	completedBeforeResponse := c.turnTerminalSeen
+	c.turnStartResponseSeen = true
+	releaseProxyEvents := false
+	if completedBeforeResponse {
+		if c.turnTerminalProcessed {
+			c.settleCompletedTurnLocked()
+			releaseProxyEvents = true
+		} else {
+			c.phase = phaseCompleting
+		}
+	} else {
+		c.phase = phaseActive
+	}
 	c.mu.Unlock()
+	if completedBeforeResponse {
+		if releaseProxyEvents {
+			c.releaseProxyEventGate()
+		}
+		return nil
+	}
 	if c.cfg.onTurnActive != nil {
 		c.cfg.onTurnActive()
 	}
@@ -758,45 +1417,168 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 	return nil
 }
 
-func (c *controller) handleNotification(ctx context.Context, notification appserver.Notification) error {
+func (c *controller) applyNotification(notification appserver.Notification) (bool, error) {
 	switch notification.Method {
 	case appserver.NotificationThreadStarted:
 		var params appserver.ThreadStartedNotification
 		if err := notification.DecodeParams(&params); err != nil {
-			return err
+			return false, err
 		}
-		if c.threadID != "" && params.Thread.ID != c.threadID {
-			return fmt.Errorf("codex: notification for unexpected thread %s", params.Thread.ID)
+		if params.Thread.ID == "" {
+			return false, errors.New("codex: thread/started carried an empty thread id")
+		}
+		c.observeStartedThread(params.Thread)
+		if params.Thread.ID != c.managedThreadID() {
+			return false, nil
 		}
 	case appserver.NotificationTurnStarted:
 		var params appserver.TurnStartedNotification
 		if err := notification.DecodeParams(&params); err != nil {
-			return err
+			return false, err
+		}
+		if params.ThreadID == "" {
+			return false, errors.New("codex: turn/started carried an empty thread id")
+		}
+		if params.ThreadID != c.managedThreadID() {
+			return false, nil
 		}
 		if err := c.reconcileTurn(params.ThreadID, params.Turn.ID, params.Turn.Status); err != nil {
-			return err
+			return false, err
 		}
+		// Once a managed turn is observable, an attach must resume upstream so
+		// the TUI receives that turn's current snapshot. The zero-turn synthetic
+		// response is valid only before the first lifecycle event.
+		c.clearSyntheticResume()
 	case appserver.NotificationTurnCompleted:
 		var params appserver.TurnCompletedNotification
 		if err := notification.DecodeParams(&params); err != nil {
-			return err
+			return false, err
+		}
+		if params.ThreadID == "" {
+			return false, errors.New("codex: turn/completed carried an empty thread id")
+		}
+		if params.ThreadID != c.managedThreadID() {
+			return false, nil
 		}
 		if err := c.completeTurn(params); err != nil {
-			return err
+			return false, err
 		}
-		if c.state != nil && !c.state.Materialized {
-			if _, err := c.confirmMaterialized(ctx, true); err != nil {
-				return fmt.Errorf("codex: confirm thread materialization: %w", err)
-			}
-		}
+		c.clearSyntheticResume()
+		return true, nil
 	case appserver.NotificationError:
 		var params appserver.ErrorNotification
 		if err := notification.DecodeParams(&params); err != nil {
-			return err
+			return false, err
 		}
 		c.logger.Warn("app-server turn error", "thread", params.ThreadID, "turn", params.TurnID, "retry", params.WillRetry, "err", params.Error.Message)
 	}
+	return false, nil
+}
+
+func (c *controller) finishNotification(ctx context.Context, queued queuedNotification) error {
+	managedCompletion := queued.managedCompletion
+	if !queued.applied {
+		var err error
+		managedCompletion, err = c.applyNotification(queued.notification)
+		if err != nil {
+			return err
+		}
+	}
+	if !managedCompletion {
+		return nil
+	}
+	if c.state != nil && !c.state.Materialized {
+		if _, err := c.confirmMaterialized(ctx, true); err != nil {
+			return fmt.Errorf("codex: confirm thread materialization: %w", err)
+		}
+	}
+	releaseProxyEvents, err := c.finishManagedCompletion()
+	if err != nil {
+		return err
+	}
+	if releaseProxyEvents {
+		c.releaseProxyEventGate()
+		c.wakeStateChange()
+	}
 	return nil
+}
+
+func (c *controller) finishManagedCompletion() (bool, error) {
+	c.mu.Lock()
+	if !c.turnTerminalSeen {
+		phase := c.phase
+		c.mu.Unlock()
+		return false, fmt.Errorf("codex: finish managed completion while controller is %s without a terminal event", phase)
+	}
+	c.turnTerminalProcessed = true
+	if !c.turnStartResponseSeen {
+		if c.phase != phaseAwaitingStartResponse {
+			phase := c.phase
+			c.mu.Unlock()
+			return false, fmt.Errorf("codex: finish managed completion while controller is %s awaiting a turn/start response", phase)
+		}
+		c.mu.Unlock()
+		return false, nil
+	}
+	if c.phase != phaseCompleting {
+		phase := c.phase
+		c.mu.Unlock()
+		return false, fmt.Errorf("codex: finish managed completion while controller is %s", phase)
+	}
+	c.settleCompletedTurnLocked()
+	c.mu.Unlock()
+	return true, nil
+}
+
+// settleCompletedTurnLocked releases a terminal turn after both its start
+// response and controller-side completion processing have finished. c.mu must
+// be held by the caller.
+func (c *controller) settleCompletedTurnLocked() {
+	c.phase = phaseIdle
+	c.turnOwner = turnOwnerNone
+	c.turnID = ""
+	c.startAmbiguous = false
+	c.turnTerminalSeen = false
+	c.turnTerminalProcessed = false
+	c.turnStartResponseSeen = false
+}
+
+func (c *controller) handleNotification(ctx context.Context, notification appserver.Notification) error {
+	return c.finishNotification(ctx, queuedNotification{notification: notification})
+}
+
+func (c *controller) managedThreadID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.threadID
+}
+
+func (c *controller) observeStartedThread(thread appserver.Thread) {
+	if thread.ID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if thread.ID == c.threadID {
+		return
+	}
+	isOwnedAncestor := func(candidate *string) bool {
+		if candidate == nil || *candidate == "" {
+			return false
+		}
+		if *candidate == c.threadID {
+			return true
+		}
+		_, ok := c.descendantThreads[*candidate]
+		return ok
+	}
+	if !isOwnedAncestor(thread.ParentThreadID) && !isOwnedAncestor(thread.ForkedFromID) {
+		return
+	}
+	if c.descendantThreads == nil {
+		c.descendantThreads = make(map[string]struct{})
+	}
+	c.descendantThreads[thread.ID] = struct{}{}
 }
 
 func (c *controller) reconcileTurn(threadID, turnID, status string) error {
@@ -818,6 +1600,7 @@ func (c *controller) reconcileTurn(threadID, turnID, status string) error {
 		return fmt.Errorf("codex: event turn %s does not match active turn %s", turnID, c.turnID)
 	}
 	c.turnID = turnID
+	c.phase = phaseActive
 	return nil
 }
 
@@ -848,8 +1631,19 @@ func (c *controller) completeTurn(params appserver.TurnCompletedNotification) er
 	}
 	delivery := c.current
 	outbound := c.outboundCount
-	c.phase = phaseIdle
-	c.turnID = ""
+	owner := c.turnOwner
+	c.turnID = params.Turn.ID
+	c.turnTerminalSeen = true
+	c.proxyEventGate = true
+	if !c.turnStartResponseSeen {
+		// The app-server can publish terminal notifications before the proxy
+		// goroutine or broker-delivery path receives the corresponding turn/start
+		// response. Retain the reservation until that response is validated so no
+		// subsequent turn can overtake it.
+		c.phase = phaseAwaitingStartResponse
+	} else {
+		c.phase = phaseCompleting
+	}
 	c.current = wire.Deliver{}
 	c.outboundCount = 0
 	c.startAmbiguous = false
@@ -858,7 +1652,7 @@ func (c *controller) completeTurn(params appserver.TurnCompletedNotification) er
 	if params.Turn.DurationMS != nil {
 		durationMS = *params.Turn.DurationMS
 	}
-	c.logger.Info("codex turn completed", "delivery", delivery.ID, "from", delivery.From, "turn", params.Turn.ID, "status", params.Turn.Status, "duration_ms", durationMS, "outbound_sends", outbound, "replied", outbound > 0)
+	c.logger.Info("codex turn completed", "owner", owner.String(), "delivery", delivery.ID, "from", delivery.From, "turn", params.Turn.ID, "status", params.Turn.Status, "duration_ms", durationMS, "outbound_sends", outbound, "replied", outbound > 0)
 	return nil
 }
 
@@ -872,39 +1666,223 @@ func (c *controller) enqueueDelivery(delivery wire.Deliver) {
 
 func (c *controller) enqueueNotification(notification appserver.Notification) {
 	c.touchActivity()
+	queued := queuedNotification{notification: notification}
 	switch notification.Method {
 	case appserver.NotificationThreadStarted,
 		appserver.NotificationTurnStarted,
 		appserver.NotificationTurnCompleted,
 		appserver.NotificationError:
+		managedCompletion, err := c.applyNotification(notification)
+		if err != nil {
+			c.signalFatal(err)
+			return
+		}
+		queued.applied = true
+		queued.managedCompletion = managedCompletion
 	default:
+		if !c.queueProxyEvent(notification) {
+			if proxy := c.currentProxy(); proxy != nil {
+				proxy.Notify(notification)
+			}
+		}
 		return
 	}
+	// Lifecycle state is reconciled on the ordered app-server reader before the
+	// TUI observes the event. Materialization reads remain on the controller
+	// loop so this callback never waits for a response behind the notification.
+	if !c.queueProxyEvent(notification) {
+		if proxy := c.currentProxy(); proxy != nil {
+			proxy.Notify(notification)
+		}
+	}
 	select {
-	case c.notifications <- notification:
+	case c.notifications <- queued:
 	default:
 		c.signalFatal(errors.New("codex: app-server notification queue is full"))
 	}
 }
 
-func (c *controller) authorizeReverse(threadID, turnID string) error {
+func (c *controller) queueProxyEvent(notification appserver.Notification) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if !c.proxyEventGate {
+		c.mu.Unlock()
+		return false
+	}
+	if len(c.proxyEventQueue) >= proxyEventQueueSize {
+		c.mu.Unlock()
+		c.signalFatal(errors.New("codex: deferred TUI notification queue is full"))
+		return true
+	}
+	c.proxyEventQueue = append(c.proxyEventQueue, notification)
+	c.mu.Unlock()
+	return true
+}
+
+func (c *controller) releaseProxyEventGate() {
+	proxy := c.currentProxy()
+	for {
+		c.mu.Lock()
+		if !c.proxyEventGate {
+			c.mu.Unlock()
+			return
+		}
+		if len(c.proxyEventQueue) == 0 {
+			c.proxyEventGate = false
+			c.mu.Unlock()
+			return
+		}
+		queued := c.proxyEventQueue
+		c.proxyEventQueue = nil
+		c.mu.Unlock()
+
+		if proxy != nil {
+			for _, notification := range queued {
+				proxy.Notify(notification)
+			}
+		}
+	}
+}
+
+func (c *controller) handleReverseRequest(request *appserver.ReverseRequest) {
+	proxy := c.currentProxy()
+	if request.Method != appserver.MethodDynamicToolCall && proxy != nil && forwardToTUI(request.Method) {
+		parent := c.ctx
+		if parent == nil {
+			parent = context.Background()
+		}
+		ctx, cancel := context.WithTimeout(parent, c.cfg.ActivityTimeout)
+		handled, err := proxy.ForwardReverse(ctx, request)
+		cancel()
+		if handled {
+			if err != nil {
+				c.signalFatal(fmt.Errorf("codex: relay %s through TUI: %w", request.Method, err))
+			}
+			return
+		}
+		if err != nil && !errors.Is(err, appserverproxy.ErrNoAttachedTUI) {
+			c.logger.Warn("TUI reverse-request relay failed; apply headless policy", "method", request.Method, "err", err)
+		}
+	}
+	c.reverse.Handle(request)
+}
+
+func forwardToTUI(method string) bool {
+	switch method {
+	case appserver.MethodCommandExecutionApproval,
+		appserver.MethodFileChangeApproval,
+		appserver.MethodPermissionsApproval,
+		appserver.MethodToolRequestUserInput,
+		appserver.MethodMCPServerElicitation:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *controller) authorizeReverse(ctx context.Context, threadID, turnID string) error {
+	c.mu.Lock()
 	if !c.ready {
 		c.startupViolation = true
+		c.mu.Unlock()
 		return errors.New("adapter ownership is not established")
 	}
 	if threadID != c.threadID {
-		return fmt.Errorf("tool call thread %s does not match %s", threadID, c.threadID)
+		if _, ok := c.descendantThreads[threadID]; ok {
+			c.mu.Unlock()
+			return nil
+		}
+		rootThreadID := c.threadID
+		app := c.app
+		c.mu.Unlock()
+		return c.authorizeDescendant(ctx, app, rootThreadID, threadID)
 	}
 	if c.phase != phaseStarting && c.phase != phaseActive {
-		return fmt.Errorf("tool call arrived while controller is %s", c.phase)
+		phase := c.phase
+		c.mu.Unlock()
+		return fmt.Errorf("tool call arrived while controller is %s", phase)
 	}
 	if c.turnID != "" && c.turnID != turnID {
-		return fmt.Errorf("tool call turn %s does not match %s", turnID, c.turnID)
+		managedTurnID := c.turnID
+		c.mu.Unlock()
+		return fmt.Errorf("tool call turn %s does not match %s", turnID, managedTurnID)
 	}
 	c.turnID = turnID
+	c.mu.Unlock()
 	return nil
+}
+
+type descendantCandidate struct {
+	threadID string
+	path     []string
+}
+
+func (c *controller) authorizeDescendant(ctx context.Context, app appServerClient, rootThreadID, requestedThreadID string) error {
+	if app == nil {
+		return fmt.Errorf("tool call thread %s does not match %s and ancestry cannot be inspected", requestedThreadID, rootThreadID)
+	}
+	queue := []descendantCandidate{{threadID: requestedThreadID}}
+	visited := make(map[string]struct{}, maxDescendantAncestry)
+	var firstReadErr error
+	for len(queue) > 0 {
+		candidate := queue[0]
+		queue = queue[1:]
+		if candidate.threadID == "" {
+			continue
+		}
+
+		c.mu.Lock()
+		_, cached := c.descendantThreads[candidate.threadID]
+		currentRoot := c.threadID
+		ready := c.ready
+		c.mu.Unlock()
+		if !ready || currentRoot != rootThreadID {
+			return errors.New("adapter ownership changed while inspecting dynamic tool ancestry")
+		}
+		if candidate.threadID == rootThreadID || cached {
+			c.mu.Lock()
+			if c.ready && c.threadID == rootThreadID {
+				if c.descendantThreads == nil {
+					c.descendantThreads = make(map[string]struct{})
+				}
+				for _, descendant := range candidate.path {
+					c.descendantThreads[descendant] = struct{}{}
+				}
+				c.mu.Unlock()
+				return nil
+			}
+			c.mu.Unlock()
+			return errors.New("adapter ownership changed while caching dynamic tool ancestry")
+		}
+		if _, seen := visited[candidate.threadID]; seen {
+			continue
+		}
+		if len(visited) >= maxDescendantAncestry {
+			return fmt.Errorf("dynamic tool ancestry exceeds %d threads", maxDescendantAncestry)
+		}
+		visited[candidate.threadID] = struct{}{}
+
+		response, err := app.ThreadRead(ctx, appserver.ThreadReadParams{ThreadID: candidate.threadID})
+		if err != nil {
+			if firstReadErr == nil {
+				firstReadErr = fmt.Errorf("read thread %s: %w", candidate.threadID, err)
+			}
+			continue
+		}
+		if response.Thread.ID != candidate.threadID {
+			return fmt.Errorf("thread/read for %s returned thread %s", candidate.threadID, response.Thread.ID)
+		}
+		path := append(append([]string(nil), candidate.path...), candidate.threadID)
+		if parent := response.Thread.ParentThreadID; parent != nil && *parent != "" {
+			queue = append(queue, descendantCandidate{threadID: *parent, path: path})
+		}
+		if forkedFrom := response.Thread.ForkedFromID; forkedFrom != nil && *forkedFrom != "" {
+			queue = append(queue, descendantCandidate{threadID: *forkedFrom, path: path})
+		}
+	}
+	if firstReadErr != nil {
+		return fmt.Errorf("inspect dynamic tool ancestry for thread %s: %w", requestedThreadID, firstReadErr)
+	}
+	return fmt.Errorf("tool call thread %s has no parent or fork ancestry to %s", requestedThreadID, rootThreadID)
 }
 
 func (c *controller) observeReverseRequest(method string) {
@@ -935,6 +1913,13 @@ func (c *controller) noteOutbound() {
 func (c *controller) touchActivity() {
 	select {
 	case c.activity <- struct{}{}:
+	default:
+	}
+}
+
+func (c *controller) wakeStateChange() {
+	select {
+	case c.stateChanged <- struct{}{}:
 	default:
 	}
 }
@@ -1029,7 +2014,14 @@ func (c *controller) shutdown(stop context.CancelFunc) {
 	hasDelivery := c.current.ID != ""
 	startResult := c.startResult
 	startAmbiguous := c.startAmbiguous
+	turnTerminalSeen := c.turnTerminalSeen
+	owner := c.turnOwner
 	c.mu.Unlock()
+	if c.cfg.OnStopping != nil {
+		if err := c.cfg.OnStopping(); err != nil {
+			c.logger.Warn("unpublish Codex TUI endpoint during shutdown", "err", err)
+		}
+	}
 	// Stop reconnect attempts before waiting for broker deregistration. Close has
 	// no context-aware interface and may be serialized behind an in-flight
 	// Connect, so wait for it only within the shared shutdown budget.
@@ -1046,12 +2038,18 @@ func (c *controller) shutdown(stop context.CancelFunc) {
 	}
 	cancelBrokerWait()
 
-	if phase == phaseStarting || phase == phaseActive || hasDelivery {
+	if turnTerminalSeen || phase == phaseAwaitingStartResponse {
+		if startResult != nil {
+			// The terminal notification was already reconciled. Only the outstanding
+			// start response remains to be drained.
+			c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous, true)
+		}
+	} else if phase == phaseStarting || phase == phaseActive || hasDelivery || owner != turnOwnerNone || turnID != "" || startAmbiguous {
 		if err := c.app.TurnInterrupt(ctx, appserver.TurnInterruptParams{ThreadID: threadID, TurnID: turnID}); err != nil {
 			c.logger.Warn("interrupt Codex turn during shutdown", "thread", threadID, "turn", turnID, "err", err)
 		}
 		if turnID != "" || startResult != nil || startAmbiguous {
-			c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous)
+			c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous, false)
 		}
 	}
 	if err := c.app.WaitHandlers(ctx); err != nil {
@@ -1059,8 +2057,7 @@ func (c *controller) shutdown(stop context.CancelFunc) {
 	}
 }
 
-func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID string, startResult <-chan turnStartResult, ambiguous bool) {
-	terminal := false
+func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID string, startResult <-chan turnStartResult, ambiguous, terminal bool) {
 	for !terminal || startResult != nil {
 		select {
 		case started := <-startResult:
@@ -1083,7 +2080,8 @@ func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID str
 			}
 			turnID = started.response.Turn.ID
 			ambiguous = false
-		case notification := <-c.notifications:
+		case queued := <-c.notifications:
+			notification := queued.notification
 			switch notification.Method {
 			case appserver.NotificationTurnStarted:
 				var params appserver.TurnStartedNotification

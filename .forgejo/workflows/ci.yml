@@ -24,7 +24,7 @@ jobs:
       - name: Race tests and coverage
         run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
       - name: Repeated concurrency tests
-        run: go test -race -count=20 ./internal/appserver ./internal/broker ./internal/brokerclient ./internal/codex
+        run: go test -race -count=20 ./internal/appserver ./internal/appserverproxy ./internal/broker ./internal/brokerclient ./internal/codex
       - name: Fuzz protocol boundaries
         run: |
           go test -run=^$ -fuzz=FuzzConnRead -fuzztime=5s ./internal/wire

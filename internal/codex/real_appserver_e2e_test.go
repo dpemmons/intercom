@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -160,9 +161,196 @@ func TestPinnedCodexAppServerLocalProviderE2E(t *testing.T) {
 	probe.assertNoFatal(t)
 }
 
+// TestPinnedCodexAppServerForkedSubagentDynamicToolE2E exercises the real
+// app-server's full-history subagent path while the adapter authorizes an
+// inherited dynamic tool by issuing thread/read on the same WebSocket that is
+// dispatching the reverse request. The loopback provider routes concurrent
+// parent and child requests by their call IDs, so no request ordering is
+// assumed and no external model request is made.
+func TestPinnedCodexAppServerForkedSubagentDynamicToolE2E(t *testing.T) {
+	if os.Getenv("INTERCOM_CODEX_SMOKE") != "1" {
+		t.Skip("set INTERCOM_CODEX_SMOKE=1 to exercise the installed pinned Codex app-server")
+	}
+	codexBin := os.Getenv("CODEX_BIN")
+	if codexBin == "" {
+		var err error
+		codexBin, err = exec.LookPath("codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex-home")
+	cwd := filepath.Join(root, "project")
+	for _, dir := range []string{codexHome, cwd} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const (
+		seedPrompt    = "retain this full-history marker: cobalt-orchid"
+		parentPrompt  = "spawn the requested full-history child"
+		childPrompt   = "invoke the inherited list_peers tool exactly once"
+		spawnCallID   = "spawn-full-history-child"
+		childCallID   = "forked-child-list-peers"
+		collabV1      = "multi_agent_v1"
+		spawnToolName = "spawn_agent"
+	)
+	spawnArguments := fmt.Sprintf(`{"message":%q,"fork_context":true}`, childPrompt)
+	responses := newPinnedResponsesRouter(t, func(request map[string]any) (string, error) {
+		switch {
+		case pinnedRequestContains(request, childCallID):
+			return pinnedAssistantSSE("response-child-final", "message-child-final", "child complete"), nil
+		case pinnedRequestContains(request, spawnCallID):
+			return pinnedAssistantSSE("response-parent-final", "message-parent-final", "parent complete"), nil
+		case pinnedRequestContains(request, childPrompt):
+			return pinnedFunctionCallSSE("response-child-tool", childCallID, intercomtools.ListPeersName, `{}`), nil
+		case pinnedRequestContains(request, parentPrompt):
+			return pinnedNamespacedFunctionCallSSE("response-parent-spawn", spawnCallID, collabV1, spawnToolName, spawnArguments), nil
+		case pinnedRequestContains(request, seedPrompt):
+			return pinnedAssistantSSE("response-seed", "message-seed", "history seeded"), nil
+		default:
+			encoded, _ := json.Marshal(request)
+			return "", fmt.Errorf("unmatched Responses request: %s", encoded)
+		}
+	})
+	writePinnedProviderConfigWithCollab(t, codexHome, responses.URL())
+
+	broker := &pinnedE2EBroker{peers: []string{"alice", "bob"}}
+	fatal := make(chan error, 8)
+	dynamicCalls := make(chan appserver.DynamicToolCallParams, 8)
+	notifications := make(chan appserver.Notification, 512)
+	c := &controller{
+		ctx:      t.Context(),
+		cfg:      Config{ActivityTimeout: 5 * time.Second},
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		phase:    phaseActive,
+		activity: make(chan struct{}, 1),
+	}
+	c.reverse = reverseHandler{
+		broker:     broker,
+		authorize:  c.authorizeReverse,
+		onActivity: c.touchActivity,
+		onFatal: func(err error) {
+			select {
+			case fatal <- err:
+			default:
+			}
+		},
+		timeout: 5 * time.Second,
+		logger:  c.logger,
+	}
+	process := startPinnedAppServer(t, codexBin, codexHome, root, "forked-subagent", appserver.Options{
+		OnNotification: func(notification appserver.Notification) {
+			notifications <- notification
+		},
+		OnReverseRequestReceived: c.observeReverseRequest,
+		OnReverseRequest: func(request *appserver.ReverseRequest) {
+			if request.Method == appserver.MethodDynamicToolCall {
+				var params appserver.DynamicToolCallParams
+				if err := request.DecodeParams(&params); err == nil {
+					dynamicCalls <- params
+				}
+			}
+			c.handleReverseRequest(request)
+		},
+	})
+	readProbe := &pinnedThreadReadProbe{appServerClient: process.client}
+	c.app = readProbe
+	initializePinnedClient(t, process.client)
+
+	instructions := developerInstructions("pinned-forked-subagent-e2e")
+	sandboxMode := appserver.SandboxWorkspaceWrite
+	ephemeral := false
+	started := callPinned(t, func(ctx context.Context) (appserver.ThreadStartResponse, error) {
+		return process.client.ThreadStart(ctx, appserver.ThreadStartParams{
+			CWD:                   &cwd,
+			ApprovalPolicy:        string(appserver.ApprovalNever),
+			Sandbox:               &sandboxMode,
+			DeveloperInstructions: &instructions,
+			Ephemeral:             &ephemeral,
+			DynamicTools:          dynamicToolSpecs(),
+		})
+	})
+	rootThreadID := started.Thread.ID
+	c.mu.Lock()
+	c.threadID = rootThreadID
+	c.ready = true
+	c.mu.Unlock()
+
+	seedTurn := startPinnedTurn(t, process.client, notifications, rootThreadID, cwd, started.Sandbox, seedPrompt)
+	parentTurn := startPinnedTurn(t, process.client, notifications, rootThreadID, cwd, started.Sandbox, parentPrompt)
+	if seedTurn.ID == parentTurn.ID {
+		t.Fatalf("seed and parent turns share id %q", seedTurn.ID)
+	}
+
+	var childCall appserver.DynamicToolCallParams
+	select {
+	case childCall = <-dynamicCalls:
+	case err := <-fatal:
+		t.Fatalf("adapter reverse handler failed: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for forked child dynamic tool call")
+	}
+	if childCall.ThreadID == "" || childCall.TurnID == "" {
+		t.Fatalf("forked child dynamic tool call is missing routing ids: %#v", childCall)
+	}
+	assertPinnedDynamicCall(t, childCall, childCall.ThreadID, childCall.TurnID, childCallID)
+	if childCall.ThreadID == rootThreadID {
+		t.Fatalf("dynamic tool call used root thread %q instead of a child", rootThreadID)
+	}
+
+	childThread := waitPinnedTurnStatus(t, process.client, childCall.ThreadID, childCall.TurnID, appserver.TurnStatusCompleted)
+	if !pinnedThreadHasAncestor(childThread, rootThreadID) {
+		t.Fatalf("forked child ancestry = parent:%v forkedFrom:%v, want root %q", childThread.ParentThreadID, childThread.ForkedFromID, rootThreadID)
+	}
+	reads := readProbe.snapshot()
+	if len(reads) != 1 || reads[0].ThreadID != childCall.ThreadID {
+		t.Fatalf("adapter ancestry thread/read calls = %#v, want one read of child %q", reads, childCall.ThreadID)
+	}
+	if got := broker.listCount(); got != 1 {
+		t.Fatalf("list_peers broker calls = %d, want 1", got)
+	}
+
+	requests := responses.snapshotRequests(t)
+	if len(requests) != 5 {
+		t.Fatalf("Responses requests = %d, want 5", len(requests))
+	}
+	childInitial := pinnedFindRequest(t, requests, func(request map[string]any) bool {
+		return pinnedRequestContains(request, childPrompt) &&
+			!pinnedRequestContains(request, spawnCallID) &&
+			!pinnedRequestContains(request, childCallID)
+	}, "forked child initial request")
+	if !pinnedRequestContains(childInitial, seedPrompt) {
+		t.Fatal("forked child request did not inherit the seed turn history")
+	}
+	assertPinnedToolAdvertised(t, childInitial, intercomtools.ListPeersName)
+	childFollowup := pinnedFindRequest(t, requests, func(request map[string]any) bool {
+		return pinnedRequestContains(request, childCallID)
+	}, "forked child tool follow-up")
+	assertPinnedToolOutput(t, childFollowup, childCallID, "alice")
+
+	select {
+	case err := <-fatal:
+		t.Fatalf("adapter reported a fatal error: %v", err)
+	default:
+	}
+	select {
+	case <-process.client.Done():
+		t.Fatalf("app-server client terminated after re-entrant ancestry lookup: %v", process.client.Wait())
+	default:
+	}
+	rootThread := readPinnedThread(t, process.client, rootThreadID)
+	assertPinnedTurnStatus(t, rootThread, parentTurn.ID, appserver.TurnStatusCompleted)
+	process.stop(t, syscall.SIGTERM, true)
+}
+
 type pinnedResponsesServer struct {
 	server  *httptest.Server
 	scripts []string
+	route   func(map[string]any) (string, error)
 
 	mu       sync.Mutex
 	requests []map[string]any
@@ -172,6 +360,14 @@ type pinnedResponsesServer struct {
 func newPinnedResponsesServer(t *testing.T, scripts []string) *pinnedResponsesServer {
 	t.Helper()
 	s := &pinnedResponsesServer{scripts: scripts}
+	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
+	t.Cleanup(s.server.Close)
+	return s
+}
+
+func newPinnedResponsesRouter(t *testing.T, route func(map[string]any) (string, error)) *pinnedResponsesServer {
+	t.Helper()
+	s := &pinnedResponsesServer{route: route}
 	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
 	t.Cleanup(s.server.Close)
 	return s
@@ -209,14 +405,27 @@ func (s *pinnedResponsesServer) serveHTTP(w http.ResponseWriter, r *http.Request
 	s.mu.Lock()
 	index := len(s.requests)
 	s.requests = append(s.requests, request)
-	if index >= len(s.scripts) {
-		s.errors = append(s.errors, fmt.Sprintf("unexpected Responses request %d", index+1))
-		s.mu.Unlock()
-		http.Error(w, "unexpected request", http.StatusInternalServerError)
-		return
+	route := s.route
+	var script string
+	if route == nil {
+		if index >= len(s.scripts) {
+			s.errors = append(s.errors, fmt.Sprintf("unexpected Responses request %d", index+1))
+			s.mu.Unlock()
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		script = s.scripts[index]
 	}
-	script := s.scripts[index]
 	s.mu.Unlock()
+	if route != nil {
+		var routeErr error
+		script, routeErr = route(request)
+		if routeErr != nil {
+			s.recordError(routeErr.Error())
+			http.Error(w, "unmatched request", http.StatusInternalServerError)
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -239,11 +448,52 @@ func (s *pinnedResponsesServer) snapshotRequests(t *testing.T) []map[string]any 
 	return append([]map[string]any(nil), s.requests...)
 }
 
+func pinnedRequestContains(request map[string]any, text string) bool {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(encoded, []byte(text))
+}
+
+func pinnedFindRequest(
+	t *testing.T,
+	requests []map[string]any,
+	match func(map[string]any) bool,
+	description string,
+) map[string]any {
+	t.Helper()
+	var found map[string]any
+	for _, request := range requests {
+		if !match(request) {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("multiple Responses requests match %s", description)
+		}
+		found = request
+	}
+	if found == nil {
+		t.Fatalf("no Responses request matches %s", description)
+	}
+	return found
+}
+
 func pinnedFunctionCallSSE(responseID, callID, name, arguments string) string {
 	return pinnedSSE(
 		map[string]any{"type": "response.created", "response": map[string]any{"id": responseID}},
 		map[string]any{"type": "response.output_item.done", "item": map[string]any{
 			"type": "function_call", "call_id": callID, "name": name, "arguments": arguments,
+		}},
+		pinnedCompletedEvent(responseID),
+	)
+}
+
+func pinnedNamespacedFunctionCallSSE(responseID, callID, namespace, name, arguments string) string {
+	return pinnedSSE(
+		map[string]any{"type": "response.created", "response": map[string]any{"id": responseID}},
+		map[string]any{"type": "response.output_item.done", "item": map[string]any{
+			"type": "function_call", "call_id": callID, "namespace": namespace, "name": name, "arguments": arguments,
 		}},
 		pinnedCompletedEvent(responseID),
 	)
@@ -283,7 +533,19 @@ func pinnedSSE(events ...map[string]any) string {
 }
 
 func writePinnedProviderConfig(t *testing.T, codexHome, serverURL string) {
+	writePinnedProviderConfigFeatures(t, codexHome, serverURL, false)
+}
+
+func writePinnedProviderConfigWithCollab(t *testing.T, codexHome, serverURL string) {
+	writePinnedProviderConfigFeatures(t, codexHome, serverURL, true)
+}
+
+func writePinnedProviderConfigFeatures(t *testing.T, codexHome, serverURL string, collab bool) {
 	t.Helper()
+	collabConfig := ""
+	if collab {
+		collabConfig = "collab = true\n"
+	}
 	config := fmt.Sprintf(`model = "mock-model"
 model_provider = "intercom_test"
 approval_policy = "never"
@@ -292,6 +554,7 @@ model_auto_compact_token_limit = 1000000
 
 [features]
 enable_request_compression = false
+%s
 
 [model_providers.intercom_test]
 name = "Intercom loopback test provider"
@@ -300,7 +563,7 @@ wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
 supports_websockets = false
-`, serverURL+"/v1")
+`, collabConfig, serverURL+"/v1")
 	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -314,6 +577,26 @@ type pinnedAppServerProcess struct {
 
 	mu      sync.Mutex
 	stopped bool
+}
+
+type pinnedThreadReadProbe struct {
+	appServerClient
+
+	mu    sync.Mutex
+	reads []appserver.ThreadReadParams
+}
+
+func (p *pinnedThreadReadProbe) ThreadRead(ctx context.Context, params appserver.ThreadReadParams) (appserver.ThreadReadResponse, error) {
+	p.mu.Lock()
+	p.reads = append(p.reads, params)
+	p.mu.Unlock()
+	return p.appServerClient.ThreadRead(ctx, params)
+}
+
+func (p *pinnedThreadReadProbe) snapshot() []appserver.ThreadReadParams {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]appserver.ThreadReadParams(nil), p.reads...)
 }
 
 func startPinnedAppServer(
@@ -548,6 +831,39 @@ func readPinnedThread(t *testing.T, client *appserver.Client, threadID string) a
 	}
 }
 
+func waitPinnedTurnStatus(
+	t *testing.T,
+	client *appserver.Client,
+	threadID, turnID, status string,
+) appserver.Thread {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		response, err := client.ThreadRead(ctx, appserver.ThreadReadParams{ThreadID: threadID, IncludeTurns: true})
+		cancel()
+		if err == nil {
+			for _, turn := range response.Thread.Turns {
+				if turn.ID == turnID && turn.Status == status {
+					return response.Thread
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("wait for thread %s turn %s status %s: %v", threadID, turnID, status, err)
+			}
+			t.Fatalf("thread %s turn %s did not reach status %s: %#v", threadID, turnID, status, response.Thread.Turns)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func pinnedThreadHasAncestor(thread appserver.Thread, ancestor string) bool {
+	return thread.ParentThreadID != nil && *thread.ParentThreadID == ancestor ||
+		thread.ForkedFromID != nil && *thread.ForkedFromID == ancestor
+}
+
 func assertPinnedThread(
 	t *testing.T,
 	thread appserver.Thread,
@@ -619,7 +935,7 @@ func newPinnedReverseProbe(broker brokerTools, holdCall string) *pinnedReversePr
 	}
 	probe.handler = reverseHandler{
 		broker:    broker,
-		authorize: func(string, string) error { return nil },
+		authorize: func(context.Context, string, string) error { return nil },
 		onFatal: func(err error) {
 			probe.fatal <- err
 		},

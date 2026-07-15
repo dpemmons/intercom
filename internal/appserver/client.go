@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	DefaultMaxMessageSize        int64 = 16 << 20
+	DefaultMaxMessageSize        int64 = 128 << 20
 	DefaultMaxConcurrentHandlers       = 64
 )
 
@@ -67,11 +67,13 @@ type Client struct {
 
 	nextID atomic.Int64
 
-	writeGate chan struct{}
-	mu        sync.Mutex
-	pending   map[RequestID]*pendingCall
-	seen      map[RequestID]struct{}
-	seenFIFO  []RequestID
+	writeGate   chan struct{}
+	mu          sync.Mutex
+	pending     map[RequestID]*pendingCall
+	seen        map[RequestID]struct{}
+	seenFIFO    []RequestID
+	expired     map[RequestID]struct{}
+	expiredFIFO []RequestID
 
 	handlerMu     sync.Mutex
 	handlerCount  int
@@ -105,6 +107,7 @@ func newClient(conn *websocket.Conn, opts Options) *Client {
 		writeGate: writeGate,
 		pending:   make(map[RequestID]*pendingCall),
 		seen:      make(map[RequestID]struct{}),
+		expired:   make(map[RequestID]struct{}),
 		done:      make(chan struct{}),
 	}
 	conn.SetReadLimit(opts.MaxMessageSize)
@@ -187,8 +190,10 @@ func (c *Client) StartCall(ctx context.Context, method string, params any) (*Pen
 	return &PendingCall{ID: id, client: c, call: call}, nil
 }
 
-// Await waits once for a PendingCall. A canceled deadline removes correlation;
-// managed callers should treat such a mutating-request timeout as fatal.
+// Await waits once for a PendingCall. A canceled deadline replaces live
+// correlation with a bounded tombstone so one late response is ignored.
+// Managed callers must still decide whether a mutating-request timeout makes
+// their higher-level state ambiguous.
 func (p *PendingCall) Await(ctx context.Context, result any) error {
 	p.once.Do(func() {
 		// Prefer an already-buffered response over a simultaneous connection
@@ -201,7 +206,7 @@ func (p *PendingCall) Await(ctx context.Context, result any) error {
 		select {
 		case p.result = <-p.call.response:
 		case <-ctx.Done():
-			if p.client.removePending(p.ID, p.call) {
+			if p.client.expirePending(p.ID, p.call) {
 				p.result.err = ctx.Err()
 			} else {
 				// The reader won the removal race and owns delivering the
@@ -483,6 +488,12 @@ func (c *Client) resolveResponse(id RequestID, response pendingResponse) error {
 		call.response <- response
 		return nil
 	}
+	if _, expired := c.expired[id]; expired {
+		delete(c.expired, id)
+		c.rememberResponseLocked(id)
+		c.mu.Unlock()
+		return nil
+	}
 	_, duplicate := c.seen[id]
 	c.mu.Unlock()
 	if duplicate {
@@ -509,6 +520,23 @@ func (c *Client) removePending(id RequestID, call *pendingCall) bool {
 		return true
 	}
 	return false
+}
+
+func (c *Client) expirePending(id RequestID, call *pendingCall) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending[id] != call {
+		return false
+	}
+	delete(c.pending, id)
+	c.expired[id] = struct{}{}
+	c.expiredFIFO = append(c.expiredFIFO, id)
+	if len(c.expiredFIFO) > responseIDHistory {
+		oldest := c.expiredFIFO[0]
+		c.expiredFIFO = c.expiredFIFO[1:]
+		delete(c.expired, oldest)
+	}
+	return true
 }
 
 func (c *Client) terminate(err error) {

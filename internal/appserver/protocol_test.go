@@ -125,8 +125,8 @@ func TestDecodeTypedLifecycleNotification(t *testing.T) {
 	}
 }
 
-func TestDefaultMessageLimitIs16MiB(t *testing.T) {
-	if DefaultMaxMessageSize != 16*1024*1024 {
+func TestDefaultMessageLimitIs128MiB(t *testing.T) {
+	if DefaultMaxMessageSize != 128*1024*1024 {
 		t.Fatalf("DefaultMaxMessageSize = %d", DefaultMaxMessageSize)
 	}
 }

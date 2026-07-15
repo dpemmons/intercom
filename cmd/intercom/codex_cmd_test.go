@@ -365,7 +365,7 @@ func TestCodexCmdPublishesCanonicalCWDThroughSymlink(t *testing.T) {
 	run := func(_ context.Context, cfg codex.Config) error {
 		if err := cfg.OnReady(codex.ReadyInfo{
 			Name: cfg.Name, CWD: project, ThreadID: "thread-id",
-			ClientEndpoint: cfg.ClientEndpoint, CodexVersion: appserver.ProtocolVersion,
+			ClientEndpoint: cfg.ClientEndpoint, CodexVersion: appserver.MinimumSupportedVersion,
 		}); err != nil {
 			return err
 		}

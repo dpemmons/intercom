@@ -404,7 +404,7 @@ func TestPendingThreadUsesStartSnapshotForTUIResume(t *testing.T) {
 		},
 		app: app, store: store,
 	}
-	if err := c.startNewThread(t.Context(), app.init, appserver.ProtocolVersion); err != nil {
+	if err := c.startNewThread(t.Context(), app.init, appserver.MinimumSupportedVersion); err != nil {
 		t.Fatal(err)
 	}
 
@@ -469,11 +469,11 @@ func TestControllerUnavailableAppServerNeverRegistersBroker(t *testing.T) {
 	}
 }
 
-func TestControllerUnsupportedServerVersionNeverRegistersBroker(t *testing.T) {
+func TestControllerOlderServerVersionNeverRegistersBroker(t *testing.T) {
 	h := newControllerHarness(t)
-	h.app.init.UserAgent = "codex_cli_rs/0.145.0"
+	h.app.init.UserAgent = "codex_cli_rs/0.144.0"
 	err := Run(t.Context(), h.cfg)
-	if err == nil || !containsAll(err.Error(), "unsupported app-server version", appserver.ProtocolVersion) {
+	if err == nil || !containsAll(err.Error(), "unsupported app-server version", appserver.MinimumSupportedVersion, "or later") {
 		t.Fatalf("Run() error = %v", err)
 	}
 	broker := <-h.brokerReady
@@ -481,6 +481,209 @@ func TestControllerUnsupportedServerVersionNeverRegistersBroker(t *testing.T) {
 	case <-broker.connected:
 		t.Fatal("broker registered with an unsupported app-server")
 	default:
+	}
+}
+
+func TestValidateServerVersionUsesLeadingProductAndMinimum(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name      string
+		userAgent string
+		want      string
+		wantError string
+	}{
+		{name: "minimum", userAgent: "codex_cli_rs/0.144.1", want: "0.144.1"},
+		{name: "later patch", userAgent: "intercom/0.144.4 (NixOS 25.11.0; x86_64) (intercom; 0.2.1)", want: "0.144.4"},
+		{name: "numeric patch", userAgent: "intercom/0.144.10", want: "0.144.10"},
+		{name: "later minor", userAgent: "codex-cli/0.145.0 terminal/3.5.11", want: "0.145.0"},
+		{name: "later major", userAgent: "codex-cli/1.0.0", want: "1.0.0"},
+		{name: "older", userAgent: "codex_cli_rs/0.144.0", wantError: "requires 0.144.1 or later"},
+		{name: "missing product version", userAgent: "intercom (NixOS 25.11.0; x86_64)", wantError: "cannot determine"},
+		{name: "version not leading", userAgent: "NixOS 25.11.0 codex_cli_rs/0.144.4", wantError: "cannot determine"},
+		{name: "malformed leading version", userAgent: "codex_cli_rs/0.144", wantError: "cannot determine"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := validateServerVersion(tt.userAgent)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("validateServerVersion(%q) = %q, %v", tt.userAgent, got, err)
+				}
+				return
+			}
+			if err != nil || got != tt.want {
+				t.Fatalf("validateServerVersion(%q) = %q, %v; want %q, nil", tt.userAgent, got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestControllerResumeRefreshesRuntimeDiagnostics(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		storedAgent    string
+		storedVersion  string
+		currentAgent   string
+		currentVersion string
+	}{
+		{
+			name:           "Codex upgrade",
+			storedAgent:    "intercom/0.144.1 (Linux; x86_64) (intercom; 0.2.0)",
+			storedVersion:  "0.144.1",
+			currentAgent:   "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)",
+			currentVersion: "0.144.4",
+		},
+		{
+			name:           "Intercom upgrade",
+			storedAgent:    "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.0)",
+			storedVersion:  "0.144.4",
+			currentAgent:   "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)",
+			currentVersion: "0.144.4",
+		},
+		{
+			name:           "supported Codex rollback",
+			storedAgent:    "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)",
+			storedVersion:  "0.144.4",
+			currentAgent:   "intercom/0.144.1 (Linux; x86_64) (intercom; 0.2.1)",
+			currentVersion: "0.144.1",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newControllerHarness(t)
+			h.app.init.UserAgent = tt.currentAgent
+			state := validState()
+			state.CWD = h.cfg.CWD
+			state.CodexHome = h.app.init.CodexHome
+			state.ThreadID = "thread-1"
+			state.ServerUserAgent = tt.storedAgent
+			state.CodexVersion = tt.storedVersion
+			state.Materialized = true
+			writeManagedState(t, h.cfg, state)
+
+			cancel, done := runHarness(t, h)
+			got, err := readManagedState(h.cfg.StatePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Peer != state.Peer || got.ThreadID != state.ThreadID || got.CWD != state.CWD ||
+				got.CodexHome != state.CodexHome || got.ToolContractVersion != state.ToolContractVersion || !got.Materialized {
+				t.Fatalf("binding identity changed: got %#v, started with %#v", got, state)
+			}
+			if got.ServerUserAgent != tt.currentAgent || got.CodexVersion != tt.currentVersion {
+				t.Fatalf("runtime diagnostics = %q / %q; want %q / %q", got.ServerUserAgent, got.CodexVersion, tt.currentAgent, tt.currentVersion)
+			}
+			h.app.mu.Lock()
+			starts := len(h.app.threadStarts)
+			resumes := len(h.app.threadResumes)
+			h.app.mu.Unlock()
+			if starts != 0 || resumes != 1 {
+				t.Fatalf("thread calls = %d starts, %d resumes", starts, resumes)
+			}
+			stopHarness(t, cancel, done)
+		})
+	}
+}
+
+func TestControllerFailedResumeDoesNotRefreshRuntimeDiagnostics(t *testing.T) {
+	h := newControllerHarness(t)
+	h.app.init.UserAgent = "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)"
+	h.app.resumeErr = errors.New("rollout database unavailable")
+	state := validState()
+	state.CWD = h.cfg.CWD
+	state.CodexHome = h.app.init.CodexHome
+	state.ThreadID = "thread-1"
+	state.ServerUserAgent = "intercom/0.144.1 (Linux; x86_64) (intercom; 0.2.0)"
+	state.CodexVersion = "0.144.1"
+	state.Materialized = true
+	writeManagedState(t, h.cfg, state)
+
+	err := Run(t.Context(), h.cfg)
+	if err == nil || !containsAll(err.Error(), "resume thread thread-1", "rollout database unavailable") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	got, readErr := readManagedState(h.cfg.StatePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got != state {
+		t.Fatalf("failed resume changed binding: got %#v, want %#v", got, state)
+	}
+}
+
+func TestControllerInvalidResumeResponseDoesNotRefreshRuntimeDiagnostics(t *testing.T) {
+	h := newControllerHarness(t)
+	h.app.init.UserAgent = "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)"
+	h.app.resume.CWD = filepath.Join(h.cfg.CWD, "unexpected")
+	state := validState()
+	state.CWD = h.cfg.CWD
+	state.CodexHome = h.app.init.CodexHome
+	state.ThreadID = "thread-1"
+	state.ServerUserAgent = "intercom/0.144.1 (Linux; x86_64) (intercom; 0.2.0)"
+	state.CodexVersion = "0.144.1"
+	state.Materialized = true
+	writeManagedState(t, h.cfg, state)
+
+	err := Run(t.Context(), h.cfg)
+	if err == nil || !strings.Contains(err.Error(), "app-server returned cwd") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	got, readErr := readManagedState(h.cfg.StatePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got != state {
+		t.Fatalf("invalid resume response changed binding: got %#v, want %#v", got, state)
+	}
+}
+
+func TestControllerDiagnosticPersistenceFailureStopsResume(t *testing.T) {
+	dir := t.TempDir()
+	app := newFakeApp(dir)
+	init := app.init
+	init.UserAgent = "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)"
+	state := validState()
+	state.CWD = dir
+	state.CodexHome = init.CodexHome
+	state.ThreadID = "thread-1"
+	state.ServerUserAgent = "intercom/0.144.1 (Linux; x86_64) (intercom; 0.2.0)"
+	state.CodexVersion = "0.144.1"
+	state.Materialized = true
+	statePath := filepath.Join(dir, "state.json")
+	store, err := AcquireStateStore(statePath, filepath.Join(dir, "state.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	store.syncDir = func(string) error { return errors.New("injected directory sync failure") }
+	c := &controller{
+		cfg:   Config{Name: "reviewer", CWD: dir, ControlTimeout: time.Second},
+		app:   app,
+		store: store,
+		state: &state,
+	}
+
+	err = c.resumeOrReplace(t.Context(), init, "0.144.4")
+	if err == nil || !containsAll(err.Error(), "persist validated app-server diagnostics", "injected directory sync failure") {
+		t.Fatalf("resumeOrReplace() error = %v", err)
+	}
+	if c.state.ServerUserAgent != state.ServerUserAgent || c.state.CodexVersion != state.CodexVersion {
+		t.Fatalf("in-memory diagnostics changed after failed persistence: %#v", c.state)
+	}
+	got, err := readManagedState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Peer != state.Peer || got.ThreadID != state.ThreadID || got.CWD != state.CWD ||
+		got.CodexHome != state.CodexHome || got.ToolContractVersion != state.ToolContractVersion || got.Materialized != state.Materialized {
+		t.Fatalf("failed diagnostic persistence changed binding identity: got %#v, want %#v", got, state)
+	}
+	oldDiagnostics := got.ServerUserAgent == state.ServerUserAgent && got.CodexVersion == state.CodexVersion
+	newDiagnostics := got.ServerUserAgent == init.UserAgent && got.CodexVersion == "0.144.4"
+	if !oldDiagnostics && !newDiagnostics {
+		t.Fatalf("failed persistence exposed mixed diagnostics: %#v", got)
 	}
 }
 
@@ -1478,10 +1681,12 @@ func TestControllerResumeUnmaterializedDoesNotTrustPath(t *testing.T) {
 
 func TestControllerResumePendingThreadFailsOnUnexpectedReadError(t *testing.T) {
 	h := newControllerHarness(t)
+	h.app.init.UserAgent = "intercom/0.144.4 (Linux; x86_64) (intercom; 0.2.1)"
 	state := validState()
 	state.CWD = h.cfg.CWD
 	state.CodexHome = h.app.init.CodexHome
-	state.ServerUserAgent = h.app.init.UserAgent
+	state.ServerUserAgent = "intercom/0.144.1 (Linux; x86_64) (intercom; 0.2.0)"
+	state.CodexVersion = "0.144.1"
 	state.ThreadID = "thread-1"
 	writeManagedState(t, h.cfg, state)
 	h.app.readErr = errors.New("database unavailable")
@@ -1489,6 +1694,13 @@ func TestControllerResumePendingThreadFailsOnUnexpectedReadError(t *testing.T) {
 	err := Run(t.Context(), h.cfg)
 	if err == nil || !containsAll(err.Error(), "verify pending thread materialization", "database unavailable") {
 		t.Fatalf("Run() error = %v", err)
+	}
+	got, readErr := readManagedState(h.cfg.StatePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got != state {
+		t.Fatalf("failed pending thread verification changed binding: got %#v, want %#v", got, state)
 	}
 	broker := <-h.brokerReady
 	select {

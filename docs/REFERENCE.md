@@ -181,7 +181,7 @@ No positional arguments are accepted.
 
 The command connects to an app-server that is already listening and is externally supervised. It does not start or stop app-server. `--client-endpoint` adds a private Unix-WebSocket proxy for a stock Codex TUI. The adapter remains the app-server's sole Intercom-owned subscriber and the proxy multiplexes TUI traffic through that connection.
 
-The adapter initializes the experimental app-server API and requires server version 0.144.1. It creates or resumes one non-ephemeral thread with approval policy `never`, workspace-write sandbox, no additional writable roots, a runtime workspace-root list containing only the canonical managed directory, Intercom developer instructions, and the two Intercom dynamic tools. These values establish the unattended startup baseline. It acquires a nonblocking lifetime lock for the selected peer before connecting.
+The adapter initializes the experimental app-server API and requires the app-server user agent to report semantic version 0.144.1 or later. The protocol provides no feature or schema-version negotiation. The adapter establishes compatibility by executing and validating the request, response, lifecycle, managed-thread, sandbox, and dynamic-tool contract it consumes. JSON decoding ignores unknown additive object fields; required fields, enumerated values, correlation, ownership, and behavioral invariants remain validated. It creates or resumes one non-ephemeral thread with approval policy `never`, workspace-write sandbox, no additional writable roots, a runtime workspace-root list containing only the canonical managed directory, Intercom developer instructions, and the two Intercom dynamic tools. These values establish the unattended startup baseline. It acquires a nonblocking lifetime lock for the selected peer before connecting.
 
 One broker delivery occupies one FIFO slot. The adapter starts a Codex root turn only while the managed thread is idle. A TUI `turn/start` reserves the same controller before it reaches app-server. An Intercom delivery and a TUI can therefore never start concurrent root turns. Deliveries that arrive during either kind of turn remain queued. A TUI turn may call the Intercom dynamic tools. Codex child threads whose reported parent or fork ancestry leads to the managed root may use inherited Intercom dynamic tools without replacing root lifecycle state. A normal final answer remains in Codex history. Only a successful `send_message` dynamic-tool call creates an outbound Intercom message.
 
@@ -189,7 +189,7 @@ The `completed`, `failed`, and `interrupted` turn statuses are terminal. Each en
 
 On broker disconnect, the adapter retries registration indefinitely while app-server remains usable. On adapter shutdown, the live TUI descriptor is removed before broker disconnect, active-turn interruption, and app-server reverse-request drain. A TUI disconnect does not stop the adapter or app-server. A later `intercom codex attach` invocation can reconnect to the same managed thread. A proxy-listener failure is fatal.
 
-The proxy accepts WebSocket upgrades at `/` and `/rpc` and accepts one downstream TUI session at a time, including a session that has not initialized. A concurrent upgrade receives HTTP status 409; another request path receives HTTP status 404. A session that does not complete initialize and managed-thread resume within 30 seconds closes with a policy-violation status and releases the slot. The TUI must report client version 0.144.1, a nonempty client name, and the experimental API capability. Request-attestation and OpenAI-form-elicitation capabilities are rejected. Proxy readiness requires a successful local or upstream `thread/resume` result for the managed thread.
+The proxy accepts WebSocket upgrades at `/` and `/rpc` and accepts one downstream TUI session at a time, including a session that has not initialized. A concurrent upgrade receives HTTP status 409; another request path receives HTTP status 404. A session that does not complete initialize and managed-thread resume within 30 seconds closes with a policy-violation status and releases the slot. The TUI must report the same client version as the currently running app-server, a nonempty client name, and the experimental API capability. Request-attestation and OpenAI-form-elicitation capabilities are rejected. Proxy readiness requires a successful local or upstream `thread/resume` result for the managed thread.
 
 The proxy returns the adapter's cached initialize result, consumes the TUI's `initialized` notification, honors its `optOutNotificationMethods`, remaps TUI request IDs before upstream forwarding, remaps app-server reverse-request IDs before TUI forwarding, and restores each caller's original ID in the response. A rejected initialize attempt may be retried; a successful initialize makes every later initialize invalid for that session. A downstream request ID remains claimed until its terminal response is written and may then be reused. `thread/resume` is restricted to the managed thread and is rewritten with the managed directory, the one-entry managed runtime-root list, Intercom developer instructions, and full turn inclusion. `thread/settings/update` requires the managed thread, pins any non-null `cwd` to the managed directory, and preserves every other raw field. `turn/start` is rewritten with the managed directory and one-entry managed runtime-root list and preserves every other raw field. Pipelined `turn/start` requests enter controller admission in downstream wire order; a later request cannot reserve the controller before an earlier request finishes admission. The request allowlist below is closed; a method absent from it is not forwarded.
 
@@ -224,7 +224,7 @@ Stock Codex uses the preserved fields to apply interactive policy. A TUI may upd
 | Managed terminal notification, and each later notification while its controller gate remains active | Buffers at most 256 notifications until controller completion processing and the corresponding start response have both finished, then offers them to the downstream response barrier in source order. |
 | Other app-server notification after the session is ready and outside a response or controller barrier | Enqueues the notification for downstream delivery unless its method is opted out. Controller lifecycle handling remains independent. |
 
-For `thread/resume`, `cwd` is always the managed directory, `runtimeWorkspaceRoots` is always an array containing that directory, and `excludeTurns` is always false. Missing, null, empty, or whitespace-only client developer instructions become the Intercom binding instructions. Other client developer instructions are followed by two newline bytes and the Intercom binding instructions. Codex 0.144.1 can retain the already-running thread's configured developer instructions instead of applying a downstream resume override; Intercom's binding is already installed by the adapter's own thread start or cold resume. For `thread/settings/update`, a null `cwd` remains null and a non-null `cwd` becomes the managed directory.
+For `thread/resume`, `cwd` is always the managed directory, `runtimeWorkspaceRoots` is always an array containing that directory, and `excludeTurns` is always false. Missing, null, empty, or whitespace-only client developer instructions become the Intercom binding instructions. Other client developer instructions are followed by two newline bytes and the Intercom binding instructions. An already-running thread can retain its configured developer instructions instead of applying a downstream resume override; Intercom's binding is already installed by the adapter's own thread start or cold resume. For `thread/settings/update`, a null `cwd` remains null and a non-null `cwd` becomes the managed directory.
 
 A newly started managed thread can be attached before its first turn creates a Codex rollout. Before the first managed `turn/started` or terminal lifecycle event, the adapter terminates TUI `thread/resume` locally with the validated `thread/start` snapshot and `initialTurnsPage: null`; it does not send that resume upstream. The session becomes ready from this synthetic result and can start the first turn. The first managed turn lifecycle event clears the zero-turn snapshot so an attachment made during that turn resumes upstream and receives its current state. A successful materializing `thread/read` also clears the snapshot.
 
@@ -299,8 +299,11 @@ The following table enumerates externally visible adapter and proxy error classe
 | Another adapter holds the same peer lifetime lock. | `codex state: peer is already managed` |
 | The app-server cannot be reached within 30 seconds. | `codex: app-server unavailable after 30s` |
 | App-server initialization or the initialized notification fails. | `initialize app-server` or `send initialized` |
-| The app-server user agent has no semantic version or reports a version other than 0.144.1. | `cannot determine app-server version` or `unsupported app-server version` |
-| Saved peer, canonical directory, `CODEX_HOME`, server identity, Codex version, state schema, or tool-contract version differs. | identity diagnostic; identity changes require `--new` |
+| The app-server user agent does not have the required product/version form. | `cannot determine app-server version` |
+| The app-server user agent reports a semantic version earlier than 0.144.1. | `unsupported app-server version` |
+| App-server version 0.144.1 or later changes a consumed request, response, lifecycle, managed-thread, sandbox, or dynamic-tool contract incompatibly. | The affected RPC, protocol, or managed-thread invariant diagnostic. The binding remains unchanged when startup does not complete. |
+| Saved peer, canonical directory, `CODEX_HOME`, state schema, or tool-contract version differs. | identity or contract diagnostic; exact binding changes require `--new` |
+| A resumed thread validates successfully but the refreshed app-server user-agent or Codex-version diagnostics cannot be persisted. | `persist validated app-server diagnostics` |
 | `thread/start`, `thread/resume`, `thread/read`, or state persistence fails. | operation-specific Codex RPC diagnostic |
 | A resumed unmaterialized thread has no rollout. | The adapter replaces the pending binding. This exact case is not fatal. |
 | App-server returns the wrong thread ID or directory, runtime workspace roots other than the managed directory alone, an ephemeral thread, a non-idle thread, another approval policy, another sandbox type, extra sandbox writable roots, or a non-Boolean workspace network setting. | managed-thread invariant diagnostic |
@@ -412,7 +415,7 @@ codex resume --remote CLIENT_ENDPOINT THREAD_ID
 
 The replacement process inherits the attach command's environment and standard input, standard output, and standard error. Descriptor lookup validates the descriptor and recorded PID but does not probe the downstream socket. Codex performs the Unix-WebSocket connection, authentication-dependent client startup, and proxy initialization after process replacement. Successful process replacement does not return to `intercom`; later socket, authentication, version, and initialization diagnostics and exit status belong to Codex.
 
-The selected `CODEX_BIN` must identify a Codex 0.144.1 client. A different client version reaches the proxy but receives JSON-RPC error -32600 during initialization. The descriptor lookup is scoped to the selected broker socket; equal peer names on different broker sockets resolve independently.
+The selected `CODEX_BIN` must identify the same Codex version as the currently running app-server. A different client version reaches the proxy but receives JSON-RPC error -32600 during initialization. The descriptor lookup is scoped to the selected broker socket; equal peer names on different broker sockets resolve independently.
 
 #### Errors
 
@@ -431,7 +434,7 @@ The selected `CODEX_BIN` must identify a Codex 0.144.1 client. A different clien
 | The attach process cannot obtain its current working directory before replacement. | `codex attach: get working directory`; status 1. |
 | Process replacement fails. | `codex attach: execute`; status 1 after the original working directory is restored when restoration succeeds. |
 | Process replacement fails and the original working directory cannot be restored. | Joined execute and restore diagnostics; status 1. |
-| Process replacement succeeds but Codex cannot connect, authenticate, negotiate version 0.144.1, or initialize the proxy. | Codex diagnostic and Codex exit status. `intercom` has already been replaced. |
+| Process replacement succeeds but Codex cannot connect, authenticate, match the running app-server version, or initialize the proxy. | Codex diagnostic and Codex exit status. `intercom` has already been replaced. |
 
 #### Exit status
 
@@ -911,12 +914,12 @@ The binding object contains every member in the following table:
 | `threadId` | string | Dedicated Codex thread identifier. |
 | `cwd` | string | Canonical managed working directory. |
 | `codexHome` | string | App-server-reported Codex home identity. |
-| `serverUserAgent` | string | App-server user-agent identity. |
-| `codexVersion` | string | Extracted Codex semantic version. |
+| `serverUserAgent` | string | App-server user agent from the runtime that most recently passed thread start or resume validation. The value is diagnostic and does not gate resume. |
+| `codexVersion` | string | Extracted Codex semantic version from the runtime that most recently passed thread start or resume validation. The value is diagnostic and does not gate resume. |
 | `toolContractVersion` | number | Dynamic-tool contract `1`. |
 | `materialized` | Boolean | True after the first terminal turn is confirmed readable. |
 
-The state decoder ignores unknown object members. A missing member receives its JSON zero value. Missing identity members, schema version 0, and tool-contract version 0 fail validation; an omitted `materialized` member is false.
+The state decoder ignores unknown object members. A missing member receives its JSON zero value. Missing required members, schema version 0, and tool-contract version 0 fail validation; an omitted `materialized` member is false. A successful saved-thread resume refreshes `serverUserAgent` and `codexVersion` atomically after the returned thread and materialization state pass validation. A failed resume leaves both diagnostic values unchanged.
 
 Codex rollout and conversation files remain under `CODEX_HOME` and are owned by Codex. `--new` does not delete them.
 
@@ -967,7 +970,7 @@ The launcher creates `intercom-codex.XXXXXX` with mode 0700 beneath its selected
 | Completed app-server response-ID history | 1024 | response IDs; a repeated older ID is classified as unknown rather than duplicate |
 | Expired app-server response-ID history | 1024 | canceled request IDs; one late response is ignored and moved to completed history, while a response for an older expired ID is unknown |
 | Attached Codex TUIs per adapter | 1 | downstream WebSocket session, including a session that has not initialized; a concurrent upgrade receives HTTP status 409 |
-| Codex TUI proxy JSON message | 134217728 | bytes per WebSocket text message in either direction; matches the pinned stock Codex remote-client limit |
+| Codex TUI proxy JSON message | 134217728 | bytes per WebSocket text message in either direction; matches the stock Codex remote-client limit |
 | Concurrent forwarded Codex TUI request handlers | 64 | global across the current TUI, wire-ordered `turn/start` admissions, and detached sessions with unfinished upstream requests; `initialize` and `thread/unsubscribe` do not consume a slot; excess requests receive error -32001 |
 | Codex TUI outbound write queue | 256 | responses, notifications, and reverse requests awaiting WebSocket writes; a nonblocking notification enqueue that finds the queue full disconnects the TUI |
 | Codex TUI response-barrier queue | 256 | app-server notifications held behind one `thread/resume` or `turn/start` response; an attempted 257th notification disconnects the TUI |

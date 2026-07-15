@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -465,7 +466,7 @@ func (c *controller) startup(ctx context.Context) error {
 	}
 
 	if c.state != nil {
-		if err := c.validateStoredIdentity(init, version); err != nil {
+		if err := c.validateStoredBinding(init); err != nil {
 			return err
 		}
 		if err := c.resumeOrReplace(ctx, init, version); err != nil {
@@ -761,7 +762,7 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		"plugin/read", "plugin/skill/read", "plugin/share/list",
 		"environment/info",
 		"thread/realtime/listVoices", "fuzzyFileSearch/sessionUpdate", "fuzzyFileSearch/sessionStop":
-		// These pinned-protocol operations either read state or update or stop a
+		// These allowlisted operations either read state or update or stop a
 		// project search session. They do not mutate managed turn ownership.
 	default:
 		return nil, nil, &appserver.RPCError{
@@ -984,20 +985,60 @@ func wrongTUIThread(method, got, want string) *appserver.RPCError {
 	return &appserver.RPCError{Code: appserver.ErrorCodeInvalidParams, Message: fmt.Sprintf("%s targets thread %q; managed thread is %q", method, got, want)}
 }
 
-var semanticVersion = regexp.MustCompile(`(?:^|[^0-9])(\d+\.\d+\.\d+)(?:[^0-9]|$)`)
+var appServerUserAgentVersion = regexp.MustCompile(`^[^/[:space:]]+/(\d+\.\d+\.\d+)(?:[[:space:]]|$)`)
 
 func validateServerVersion(userAgent string) (string, error) {
-	match := semanticVersion.FindStringSubmatch(userAgent)
+	match := appServerUserAgentVersion.FindStringSubmatch(userAgent)
 	if len(match) != 2 {
 		return "", fmt.Errorf("codex: cannot determine app-server version from user agent %q", userAgent)
 	}
-	if match[1] != appserver.ProtocolVersion {
-		return "", fmt.Errorf("codex: unsupported app-server version %s (requires %s)", match[1], appserver.ProtocolVersion)
+	comparison, err := compareSemanticVersions(match[1], appserver.MinimumSupportedVersion)
+	if err != nil {
+		return "", fmt.Errorf("codex: compare app-server version: %w", err)
+	}
+	if comparison < 0 {
+		return "", fmt.Errorf("codex: unsupported app-server version %s (requires %s or later)", match[1], appserver.MinimumSupportedVersion)
 	}
 	return match[1], nil
 }
 
-func (c *controller) validateStoredIdentity(init appserver.InitializeResponse, version string) error {
+func compareSemanticVersions(left, right string) (int, error) {
+	leftParts, err := parseSemanticVersion(left)
+	if err != nil {
+		return 0, err
+	}
+	rightParts, err := parseSemanticVersion(right)
+	if err != nil {
+		return 0, err
+	}
+	for i := range leftParts {
+		if leftParts[i] < rightParts[i] {
+			return -1, nil
+		}
+		if leftParts[i] > rightParts[i] {
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
+func parseSemanticVersion(version string) ([3]uint64, error) {
+	var parsed [3]uint64
+	parts := strings.Split(version, ".")
+	if len(parts) != len(parsed) {
+		return parsed, fmt.Errorf("invalid semantic version %q", version)
+	}
+	for i, part := range parts {
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return parsed, fmt.Errorf("invalid semantic version %q: %w", version, err)
+		}
+		parsed[i] = value
+	}
+	return parsed, nil
+}
+
+func (c *controller) validateStoredBinding(init appserver.InitializeResponse) error {
 	state := c.state
 	if state.Peer != c.cfg.Name {
 		return fmt.Errorf("codex: state belongs to peer %q, not %q; use --new to replace the binding", state.Peer, c.cfg.Name)
@@ -1007,9 +1048,6 @@ func (c *controller) validateStoredIdentity(init appserver.InitializeResponse, v
 	}
 	if state.CodexHome != init.CodexHome {
 		return fmt.Errorf("codex: app-server CODEX_HOME changed from %q to %q; use --new to replace the binding", state.CodexHome, init.CodexHome)
-	}
-	if state.ServerUserAgent != init.UserAgent || state.CodexVersion != version {
-		return fmt.Errorf("codex: app-server identity changed from %q to %q; use --new to replace the binding", state.ServerUserAgent, init.UserAgent)
 	}
 	return nil
 }
@@ -1086,6 +1124,15 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 		if _, err := c.confirmMaterialized(ctx, false); err != nil {
 			return fmt.Errorf("codex: verify pending thread materialization: %w", err)
 		}
+	}
+	if c.state.ServerUserAgent != init.UserAgent || c.state.CodexVersion != version {
+		updated := *c.state
+		updated.ServerUserAgent = init.UserAgent
+		updated.CodexVersion = version
+		if err := c.store.Save(updated); err != nil {
+			return fmt.Errorf("codex: persist validated app-server diagnostics: %w", err)
+		}
+		c.state = &updated
 	}
 	return nil
 }

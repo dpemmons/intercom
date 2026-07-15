@@ -24,7 +24,7 @@ import (
 	"github.com/dpemmons/intercom/internal/wire"
 )
 
-// TestPinnedCodexAppServerLocalProviderE2E drives the installed pinned Codex
+// TestCompatibleCodexAppServerLocalProviderE2E drives the installed Codex
 // binary through a real model-backed turn without credentials or external
 // network access. A loopback Responses-compatible server deterministically
 // asks for Intercom's list_peers dynamic tool, observes its output, and finishes
@@ -32,9 +32,9 @@ import (
 // and proves that the persisted dynamic tool remains usable. Finally it kills
 // app-server while a reverse tool request is outstanding and verifies cold
 // resume normalizes that turn to interrupted without replaying the request.
-func TestPinnedCodexAppServerLocalProviderE2E(t *testing.T) {
+func TestCompatibleCodexAppServerLocalProviderE2E(t *testing.T) {
 	if os.Getenv("INTERCOM_CODEX_SMOKE") != "1" {
-		t.Skip("set INTERCOM_CODEX_SMOKE=1 to exercise the installed pinned Codex app-server")
+		t.Skip("set INTERCOM_CODEX_SMOKE=1 to exercise the installed Codex app-server")
 	}
 	codexBin := os.Getenv("CODEX_BIN")
 	if codexBin == "" {
@@ -161,15 +161,15 @@ func TestPinnedCodexAppServerLocalProviderE2E(t *testing.T) {
 	probe.assertNoFatal(t)
 }
 
-// TestPinnedCodexAppServerForkedSubagentDynamicToolE2E exercises the real
+// TestCompatibleCodexAppServerForkedSubagentDynamicToolE2E exercises the real
 // app-server's full-history subagent path while the adapter authorizes an
 // inherited dynamic tool by issuing thread/read on the same WebSocket that is
 // dispatching the reverse request. The loopback provider routes concurrent
 // parent and child requests by their call IDs, so no request ordering is
 // assumed and no external model request is made.
-func TestPinnedCodexAppServerForkedSubagentDynamicToolE2E(t *testing.T) {
+func TestCompatibleCodexAppServerForkedSubagentDynamicToolE2E(t *testing.T) {
 	if os.Getenv("INTERCOM_CODEX_SMOKE") != "1" {
-		t.Skip("set INTERCOM_CODEX_SMOKE=1 to exercise the installed pinned Codex app-server")
+		t.Skip("set INTERCOM_CODEX_SMOKE=1 to exercise the installed Codex app-server")
 	}
 	codexBin := os.Getenv("CODEX_BIN")
 	if codexBin == "" {
@@ -730,7 +730,7 @@ func callPinned[T any](t *testing.T, call func(context.Context) (T, error)) T {
 	result, err := call(ctx)
 	if err != nil {
 		var zero T
-		t.Fatalf("pinned app-server call: %v", err)
+		t.Fatalf("Codex app-server call: %v", err)
 		return zero
 	}
 	return result

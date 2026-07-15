@@ -1,5 +1,5 @@
 // Package appserver implements the small Codex app-server protocol surface
-// used by Intercom. The wire shapes in this file are pinned to codex-cli
+// used by Intercom. The wire shapes in this file originate from codex-cli
 // 0.144.1's experimental generated schema.
 //
 // Codex app-server uses JSON-RPC-shaped messages without the "jsonrpc":"2.0"
@@ -15,9 +15,10 @@ import (
 	"strconv"
 )
 
-// ProtocolVersion is the Codex CLI version whose experimental schema these
-// types implement.
-const ProtocolVersion = "0.144.1"
+// MinimumSupportedVersion is the oldest Codex CLI version whose experimental
+// app-server contract Intercom supports. Later versions are accepted and
+// validated against the protocol surface Intercom consumes.
+const MinimumSupportedVersion = "0.144.1"
 
 // Method names used by the minimal managed-thread client.
 const (
@@ -31,7 +32,7 @@ const (
 	MethodTurnInterrupt     = "turn/interrupt"
 )
 
-// Reverse request methods emitted by app-server 0.144.1.
+// Reverse request methods consumed by Intercom.
 const (
 	MethodCommandExecutionApproval = "item/commandExecution/requestApproval"
 	MethodFileChangeApproval       = "item/fileChange/requestApproval"
@@ -215,8 +216,8 @@ const (
 	ApprovalsReviewerGuardian   ApprovalsReviewer = "guardian_subagent"
 )
 
-// SandboxPolicy is the superset of all four 0.144.1 sandbox-policy variants.
-// Fields that do not apply to Type are omitted.
+// SandboxPolicy is the superset of the sandbox-policy variants in the baseline
+// generated schema. Fields that do not apply to Type are omitted.
 type SandboxPolicy struct {
 	Type                string   `json:"type"`
 	NetworkAccess       any      `json:"networkAccess,omitempty"`
@@ -361,7 +362,7 @@ type ByteRange struct {
 }
 
 // UserInput is the flattened input union. Text inputs must carry a
-// text_elements array (snake case in the pinned schema).
+// text_elements array, whose generated wire name uses snake case.
 type UserInput struct {
 	Type         string        `json:"type"`
 	Text         string        `json:"text,omitempty"`

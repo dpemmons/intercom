@@ -106,7 +106,7 @@ The shim processes `initialize`, `notifications/initialized`, `tools/list`, `too
 
 The Codex adapter owns one app-server WebSocket connection, one non-ephemeral Codex thread, and an optional downstream TUI proxy. It acquires a lifetime lock for the selected peer before contacting the app-server.
 
-The adapter initializes the app-server with experimental API support and requires the app-server user agent to identify Codex CLI version `0.144.1`. It starts or resumes a thread with the following unattended baseline:
+The adapter initializes the app-server with experimental API support and requires the app-server user agent to identify Codex CLI version `0.144.1` or later. It starts or resumes a thread with the following unattended baseline:
 
 - the project directory is canonicalized to an existing directory with symbolic links resolved;
 - the runtime workspace-root list contains only that canonical project directory;
@@ -118,7 +118,7 @@ The adapter initializes the app-server with experimental API support and require
 - a new thread receives `send_message` and `list_peers` as dynamic function tools, and a resumed binding requires the matching tool-contract version;
 - the thread receives developer instructions that require explicit `send_message` use for an Intercom reply.
 
-An attached stock TUI can replace approval, reviewer, permission, model, reasoning, personality, and collaboration settings for TUI-originated turns. The proxy pins the managed directory and runtime workspace-root list, and preserves the remaining documented interactive fields. Every Intercom-delivered turn supplies the managed directory and runtime root, approval policy `never`, and the validated startup sandbox again. Thread developer instructions and collaboration-mode developer instructions occupy separate additive sections in Codex 0.144.1.
+An attached stock TUI can replace approval, reviewer, permission, model, reasoning, personality, and collaboration settings for TUI-originated turns. The proxy pins the managed directory and runtime workspace-root list, and preserves the remaining documented interactive fields. Every Intercom-delivered turn supplies the managed directory and runtime root, approval policy `never`, and the validated startup sandbox again. Thread developer instructions and collaboration-mode developer instructions occupy separate additive sections.
 
 The adapter registers with the broker only after app-server initialization, thread ownership checks, dynamic-tool startup checks, and persisted-state checks succeed. A peer therefore does not appear in broker discovery before its managed thread can accept a delivery.
 
@@ -179,7 +179,7 @@ The following invariants define a valid running system:
 5. A successful send acknowledgement means that the broker completed the destination-frame write. It does not mean that an agent observed, processed, or answered the message.
 6. A message has no durable Intercom copy. A process failure after acknowledgement can still prevent model processing.
 7. One Codex adapter process owns a managed peer lock, one app-server connection, and one managed thread.
-8. A Codex binding retains the same peer, canonical project directory, `CODEX_HOME`, app-server identity, Codex version, state schema, and dynamic-tool contract.
+8. A Codex binding retains the same peer, canonical project directory, `CODEX_HOME`, state schema, and dynamic-tool contract. Its app-server user agent and Codex version describe the last runtime that passed start or resume validation.
 9. A managed Codex thread is idle, non-ephemeral, approval-free, and workspace-write sandboxed when the adapter becomes discoverable.
 10. One controller admits at most one Codex turn, unresolved start response, or unfinished terminal-processing operation, whether initiated by an Intercom delivery or the attached TUI. Deliveries wait in FIFO order while that reservation remains owned.
 11. A Codex dynamic-tool call is accepted for the managed root thread only during its starting or active turn, or for a child whose bounded `thread/read` parent or fork ancestry leads to that root. Explicit lifecycle ancestry and successful reads are cached. Child authorization never replaces the controller's root turn ID.
@@ -229,7 +229,7 @@ The channel notification and send acknowledgement use independent connections. T
 5. The adapter sends `initialized`.
 6. The adapter starts a thread when no binding is loaded, or resumes the bound thread when a binding is loaded.
 7. The adapter verifies thread identity, directory, one-entry managed runtime-root list, idle status, non-ephemeral status, approval policy, and sandbox policy.
-8. A new binding is written after the app-server accepts the new thread.
+8. A new binding is written after the app-server accepts the new thread. A resumed binding refreshes its app-server user-agent and Codex-version diagnostics only after resume and managed-thread validation succeed.
 9. The adapter rejects any dynamic-tool request observed before ownership is established.
 10. The adapter registers its peer name with the broker.
 11. The adapter changes from booting to idle and accepts deliveries.
@@ -241,7 +241,7 @@ The channel notification and send acknowledgement use independent connections. T
 ### Codex resume and materialization
 
 1. A saved binding supplies the thread ID and identity constraints.
-2. The adapter requires the same peer, canonical directory, `CODEX_HOME`, app-server user agent, Codex version, and tool-contract version.
+2. The adapter requires the same peer, canonical directory, `CODEX_HOME`, state schema, and tool-contract version. The saved app-server user agent and Codex version are diagnostics rather than identity constraints.
 3. The adapter resumes the thread with the required developer instructions, approval policy, sandbox mode, directory, and one-entry managed runtime-root list.
 4. An unmaterialized binding is checked with `thread/read`.
 5. A terminal first turn causes a successful `thread/read` and sets `materialized` in the binding.
@@ -256,7 +256,7 @@ Codex may not create a rollout record before a first user turn. If resume report
 4. Attach resolves the selected Codex executable and changes to the descriptor's managed directory.
 5. Attach replaces itself with `codex resume --remote` for the descriptor endpoint and thread ID.
 6. Codex upgrades `/rpc` over the downstream Unix socket and sends `initialize`.
-7. The proxy validates Codex 0.144.1 and returns the cached upstream initialize response.
+7. The proxy requires the TUI's Codex version to equal the currently running app-server version and returns the cached upstream initialize response.
 8. The proxy consumes `initialized` and forwards setup reads through the existing app-server connection with remapped request IDs.
 9. The proxy validates and rewrites `thread/resume` for the managed thread, directory, and runtime root.
 10. For an unmaterialized newly started thread, the controller returns the saved start snapshot with a null initial-turns page. Otherwise the proxy forwards resume upstream.
@@ -334,7 +334,7 @@ Volatile state is not recovered after process termination.
 
 | Entry | Content | Persistence rule |
 |---|---|---|
-| `$INTERCOM_DIR/codex/<peer>.json` | Schema version, peer, thread ID, canonical directory, `CODEX_HOME`, app-server identity, Codex version, tool-contract version, materialization flag | Atomically replaced after a valid new binding or materialization transition |
+| `$INTERCOM_DIR/codex/<peer>.json` | Schema version, peer, thread ID, canonical directory, `CODEX_HOME`, last validated app-server user agent and Codex version, tool-contract version, materialization flag | Atomically replaced after a valid new binding, successful resume with changed runtime diagnostics, or materialization transition |
 | `$INTERCOM_DIR/codex/<peer>.lock` | Lifetime ownership lock | File persists; advisory lock exists only while held |
 | `<broker-socket>.lock` | Broker singleton lock | File persists; advisory lock exists only while held |
 | Broker log | Structured broker lifecycle records | Appended when the broker does not run in foreground mode |
@@ -428,7 +428,7 @@ Cleanup terminates the adapter first and the app-server second. A child that exc
 | Codex turn reports `failed` or `interrupted` | The delivery is terminal; completion processing and the start response return the controller to idle | No automatic reply or retry occurs |
 | A root dynamic-tool call names another turn, or a foreign dynamic-tool thread has no observed parent or fork ancestry to the managed root | The tool call returns failure and the adapter enters a fatal path | No broker operation occurs; a recognized descendant may use inherited Intercom tools |
 | Unsupported app-server reverse request arrives | The adapter returns a denial, unavailable error, or method-not-found error according to request type | Dynamic tools remain Intercom-owned; eligible human requests reach a ready TUI and otherwise use headless policy |
-| Persisted Codex identity is incompatible | Startup fails with an instruction to select `--new` where replacement is valid | The saved binding remains unchanged |
+| Persisted Codex binding identity or contract is incompatible | Startup fails with an instruction to select `--new` where replacement is valid | The saved binding remains unchanged |
 | Materialized Codex rollout is missing | Resume fails | The adapter does not replace the thread implicitly |
 
 Send acknowledgement is a transport event. It is not an end-to-end processing receipt. Neither adapter sends acknowledgements back to the originating agent after model observation.
@@ -459,9 +459,11 @@ The broker protocol has no negotiated protocol version. JSON decoders ignore unk
 
 The Claude shim implements a bounded MCP subset. It echoes a client-supplied MCP protocol version during initialization and uses `2025-11-25` when the client omits one. Claude channel delivery depends on support for the advertised `claude/channel` experimental capability.
 
-The Codex adapter requires the experimental app-server schema from Codex CLI `0.144.1`. Startup rejects a different semantic version in the app-server user agent. The downstream proxy also requires client version `0.144.1` during initialize. Unknown fields in recognized app-server objects are ignored, but message envelopes, request correlation, lifecycle status, thread policy, sandbox policy, and downstream ownership constraints are validated.
+Codex app-server exposes no feature or schema-version negotiation. The adapter's wire types originate from the experimental schema generated by Codex CLI `0.144.1`, which is the known minimum supported version. Startup accepts a semantic version at least `0.144.1`, then executes and validates the consumed initialize, thread-control, lifecycle, sandbox, and dynamic-tool contracts. Unknown additive fields in recognized objects are ignored. Missing fields, incompatible field values, malformed envelopes, invalid request correlation, invalid lifecycle state, and managed-thread invariant violations fail at the affected operation. A newer version number does not override runtime validation.
 
-Codex binding schema version `1` and dynamic-tool contract version `1` are exact compatibility gates. An incompatible saved binding is not migrated in place. `--new` establishes a replacement binding after a replacement thread starts successfully.
+The downstream proxy requires the TUI client version to equal the currently running app-server version. Restarting the launcher after a Codex upgrade establishes a service and TUI endpoint for the upgraded version.
+
+Codex binding schema version `1`, dynamic-tool contract version `1`, peer name, canonical directory, and `CODEX_HOME` are exact compatibility gates. The saved app-server user agent and Codex version record the last successfully validated runtime and are refreshed atomically after successful resume validation. They do not require binding replacement when Codex changes. An incompatible exact binding field is not migrated in place. `--new` establishes a replacement binding after a replacement thread starts successfully.
 
 ## SOURCE MAP
 

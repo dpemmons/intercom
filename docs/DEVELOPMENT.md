@@ -31,8 +31,8 @@ from the repository root.
 | Host utilities | `chmod`, `mktemp`, `rm`, and `sleep` | Launcher execution and its tests |
 | C toolchain | A compiler supported by the Go race detector | Race-enabled tests |
 | Nix | A Nix installation with flake support | Nix package verification |
-| Codex CLI | `codex-cli 0.144.1` | Opt-in real app-server tests and stock-TUI verification |
-| Codex authentication and model access | A working Codex 0.144.1 interactive configuration | Opt-in stock-TUI verification only |
+| Codex CLI | `codex-cli` 0.144.1 or later | Opt-in real app-server tests and stock-TUI verification |
+| Codex authentication and model access | A working interactive configuration for the selected compatible Codex CLI | Opt-in stock-TUI verification only |
 
 The Go toolchain downloads the modules declared by [`go.mod`](../go.mod) and
 [`go.sum`](../go.sum) when they are absent from the module cache. Nix downloads
@@ -383,8 +383,9 @@ The command exits with status 0 after evaluation and package construction.
 
 #### Purpose
 
-Tier 7 verifies the app-server contract against the installed Codex CLI pinned
-by [`protocol.go`](../internal/appserver/protocol.go).
+Tier 7 verifies the consumed app-server contract against an installed Codex CLI
+at or above the known minimum declared by
+[`protocol.go`](../internal/appserver/protocol.go).
 
 #### Procedure
 
@@ -392,11 +393,12 @@ by [`protocol.go`](../internal/appserver/protocol.go).
 codex --version
 INTERCOM_CODEX_SMOKE=1 \
   go test -count=1 -v \
-  -run '^TestPinnedCodexAppServer(Smoke|LocalProviderE2E)$' \
+  -run '^TestCompatibleCodexAppServer(Schema|Smoke|LocalProviderE2E|ForkedSubagentDynamicToolE2E)$' \
   ./internal/codex
 ```
 
-The version command must print:
+The version command must print `codex-cli VERSION`, where `VERSION` is 0.144.1
+or later. For example:
 
 ```text
 codex-cli 0.144.1
@@ -407,25 +409,33 @@ codex-cli 0.144.1
 ```sh
 CODEX_BIN=./codex INTERCOM_CODEX_SMOKE=1 \
   go test -count=1 -v \
-  -run '^TestPinnedCodexAppServer(Smoke|LocalProviderE2E)$' \
+  -run '^TestCompatibleCodexAppServer(Schema|Smoke|LocalProviderE2E|ForkedSubagentDynamicToolE2E)$' \
   ./internal/codex
 ```
 
 #### Coverage
 
-`TestPinnedCodexAppServerSmoke` performs the following operations against the
+`TestCompatibleCodexAppServerSchema` generates every experimental app-server
+JSON schema, removes documentation-only schema annotations, canonicalizes the
+complete schema set, and compares its structural fingerprint with the reviewed
+baseline. Formatting and descriptions do not affect the fingerprint. Any
+added, removed, or changed schema file, method, property, type, enum, union,
+required field, nested definition, request, response, or notification fails the
+test and requires contract review before the baseline changes.
+
+`TestCompatibleCodexAppServerSmoke` performs the following operations against the
 real executable:
 
 1. Starts `codex app-server` on an isolated Unix socket with an isolated
    `CODEX_HOME`.
-2. Negotiates the experimental app-server capability and validates the server
-   version.
+2. Enables the experimental app-server API, validates the minimum server
+   version, and exercises the consumed initialize and managed-thread contract.
 3. Starts a non-ephemeral thread with `approvalPolicy: never`, workspace-write
    sandboxing, developer instructions, and the Intercom dynamic tools.
 4. Verifies the pre-materialization `thread/read` and `thread/resume` error
    contracts without starting a model turn.
 
-`TestPinnedCodexAppServerLocalProviderE2E` performs the following operations
+`TestCompatibleCodexAppServerLocalProviderE2E` performs the following operations
 against the real executable and a loopback Responses-compatible model server:
 
 1. Starts and materializes a managed thread.
@@ -437,6 +447,11 @@ against the real executable and a loopback Responses-compatible model server:
 5. Starts app-server again, resumes the thread, verifies the interrupted turn,
    and verifies that the outstanding request is not replayed.
 
+`TestCompatibleCodexAppServerForkedSubagentDynamicToolE2E` materializes a root
+thread, starts a full-history child thread through the real app-server, verifies
+the child's root ancestry through `thread/read`, and executes an inherited
+Intercom dynamic tool from the child.
+
 Tier 7 does not start the stock Codex TUI through the downstream proxy. The
 proxy's initialization, remapping, reverse routing, turn arbitration,
 disconnect, and exclusion contracts use simulated app-server and TUI peers in
@@ -445,19 +460,21 @@ client boundary.
 
 #### Success
 
-Both tests pass. Neither test reports a skip. All Codex homes, sockets, model
-server state, and project directories remain confined to test temporary
-directories and are removed by the test harness.
+All four tests pass. No test reports a skip. All generated schemas, Codex
+homes, sockets, model-server state, and project directories remain confined to
+test temporary directories and are removed by the test harness.
 
 #### Errors
 
 - The tests fail when `codex` is absent from `PATH` and `CODEX_BIN` is unset.
 - The tests fail when `CODEX_BIN` names an executable that cannot start.
-- The tests fail when the app-server user agent does not contain version
-  `0.144.1`.
+- The tests fail when schema generation fails or the canonical structural
+  fingerprint differs from the reviewed baseline.
+- The tests fail when the app-server user agent does not identify a semantic
+  version of 0.144.1 or later.
 - The tests fail when app-server does not accept its Unix-WebSocket connection
   within five seconds.
-- The tests fail when any pinned request, response, sandbox, lifecycle,
+- The tests fail when any consumed request, response, sandbox, lifecycle,
   persistence, dynamic-tool, or crash-recovery invariant differs.
 
 ### Tier 8 — stock Codex TUI attachment
@@ -470,9 +487,10 @@ one interactive service.
 
 #### Prerequisites
 
-`intercom`, `intercom-codex-project`, and Codex CLI 0.144.1 must be available in
-`PATH`. The normal Codex home must contain working authentication and model
-configuration. Two interactive terminals are required.
+`intercom`, `intercom-codex-project`, and Codex CLI 0.144.1 or later must be
+available in `PATH`. The launcher and attachment terminal must select the same
+Codex CLI version. The normal Codex home must contain working authentication
+and model configuration. Two interactive terminals are required.
 
 #### Procedure
 
@@ -491,9 +509,10 @@ rm -rf "$smoke_root"
 test "$launcher_status" -eq 130
 ```
 
-The version output must be `codex-cli 0.144.1`. After readiness, the attachment
-terminal executes the complete command printed beneath `Attach from another
-terminal:`. The TUI submits this prompt:
+The version output must identify version 0.144.1 or later. After readiness, the
+attachment terminal executes the complete command printed beneath `Attach from
+another terminal:`. That command preserves the launcher's `CODEX_BIN`
+selection. The TUI submits this prompt:
 
 ```text
 Reply with exactly TUI_SMOKE_OK. Do not call tools.
@@ -523,7 +542,9 @@ turn. Launcher interruption returns status 130 and removes its private sockets.
 
 #### Errors
 
-- A version other than `codex-cli 0.144.1` invalidates the verification.
+- An app-server version earlier than 0.144.1 invalidates the verification.
+- A TUI version different from the running app-server version fails proxy
+  initialization and invalidates the verification.
 - Missing Codex authentication or model access prevents the model turn.
 - Missing readiness output identifies launcher, app-server, adapter, broker,
   proxy, descriptor, or output failure.

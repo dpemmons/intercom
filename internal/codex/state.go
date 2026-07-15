@@ -18,7 +18,8 @@ const (
 
 // ManagedState binds an Intercom peer to the Codex thread it exclusively
 // manages. Conversation data remains in CODEX_HOME; this record contains only
-// identity and compatibility metadata.
+// binding identity, compatibility metadata, and last-validated runtime
+// diagnostics.
 type ManagedState struct {
 	SchemaVersion       int    `json:"schemaVersion"`
 	Peer                string `json:"peer"`

@@ -36,7 +36,7 @@ The broker stores no messages. A successful send means that the broker completed
 - Linux or macOS.
 - Nix with flakes, or Go 1.25.5 and Bash.
 - Claude Code 2.1.80 or later for Claude peers.
-- `codex-cli` 0.144.1 for Codex peers.
+- `codex-cli` 0.144.1 or later for Codex peers.
 - A Claude authentication method supported by Claude Code Channels.
 - A Codex authentication method supported by `codex app-server`.
 
@@ -119,7 +119,9 @@ intercom-codex-project --name planner --cwd project-b
 
 The launcher adapter joins the broker selected by its inherited `INTERCOM_SOCKET`. The value must match the value inherited by existing Claude peers; leaving it unset joins the default broker group. Attachment uses the same broker identity and `INTERCOM_DIR` as the launcher.
 
-The process remains in the foreground. A subsequent invocation with the same peer name, canonical working directory, Codex home, and compatible Codex server attempts to resume the saved managed thread. Before the first turn is materialized, a missing Codex rollout causes the adapter to start a replacement thread. A materialized binding is never replaced implicitly. `--new` creates another thread and replaces the Intercom binding.
+The process remains in the foreground. A subsequent invocation with the same peer name, canonical working directory, Codex home, state schema, and dynamic-tool contract attempts to resume the saved managed thread. The saved app-server user agent and Codex version are diagnostics, not binding identity; a successful resume refreshes them. A Codex upgrade therefore does not require `--new`. Before the first turn is materialized, a missing Codex rollout causes the adapter to start a replacement thread. A materialized binding is never replaced implicitly. `--new` creates another thread and replaces the Intercom binding.
+
+The app-server protocol provides no feature or schema-version negotiation. Intercom accepts an app-server user-agent version of 0.144.1 or later, then executes and validates the request, response, lifecycle, managed-thread, sandbox, and dynamic-tool contract it consumes. Unknown additive object fields are ignored. A newer version that changes a consumed contract fails at the affected startup or runtime validation. An attached TUI must use the same Codex version as the currently running app-server. A launcher that was already running when Codex was upgraded must restart before the upgraded TUI attaches; the binding does not require `--new`.
 
 The durable binding at `$INTERCOM_DIR/codex/NAME.json` survives service shutdown and identifies the resumable thread. The live descriptor under `$INTERCOM_DIR/codex/live` is published while an attachable service owns that name and broker identity. The two private sockets and their runtime directory belong to the launcher lifetime. TUI disconnect does not remove the live descriptor; clean service shutdown removes the descriptor, sockets, and runtime directory. Process or host failure can leave stale entries, which do not represent a usable service.
 

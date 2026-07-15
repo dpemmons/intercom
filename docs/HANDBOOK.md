@@ -151,7 +151,7 @@ This procedure starts an interactive managed Codex service and attaches one Code
 
 ### Prerequisites
 
-- `codex-cli` 0.144.1 available as `codex`.
+- `codex-cli` 0.144.1 or later available as `codex`.
 - `intercom-codex-project` and `intercom` available on `PATH`.
 - Codex authentication available to the child `codex app-server` process.
 - A project directory writable under the selected Codex sandbox policy.
@@ -312,7 +312,7 @@ The binding is durable service state. It contains the managed thread identity an
 
 The live descriptor is stored under `$INTERCOM_DIR/codex/live` after readiness. It selects one running service by broker identity and peer name and contains the current client endpoint, thread ID, process ID, instance nonce, project directory, and Codex version. A normal TUI disconnect leaves the descriptor in place. Clean service shutdown removes it. A hard process or host failure can leave a stale descriptor, which attachment detects and a later service publication replaces.
 
-Resume requires the same peer name, canonical working directory, `CODEX_HOME`, app-server identity, Codex version, state schema, and tool-contract version. The app-server must return the saved thread as idle and non-ephemeral, approval policy `never`, runtime workspace roots containing only the canonical managed directory, and workspace-write sandbox without additional writable roots.
+Resume requires the same peer name, canonical working directory, `CODEX_HOME`, state schema, and tool-contract version. The saved app-server user agent and Codex version identify the last successfully validated runtime; they do not constrain resume. A successful resume refreshes both diagnostic values. The app-server must return the saved thread as idle and non-ephemeral, approval policy `never`, runtime workspace roots containing only the canonical managed directory, and workspace-write sandbox without additional writable roots.
 
 The binding becomes materialized after a terminal result for the first managed turn, whether TUI-originated or Intercom-delivered, is confirmed through `thread/read`. A restart before materialization attempts resume; when Codex reports that no rollout exists for the pending thread, Intercom replaces that unmaterialized binding with a new thread.
 
@@ -373,6 +373,8 @@ The binding changes only after the replacement thread starts and passes managed-
 A failure after Codex creates the replacement can leave an unbound thread in Codex storage. Intercom does not delete Codex threads.
 
 A changed project symlink that resolves to the same canonical directory remains compatible. A different canonical directory requires `--new`.
+
+The app-server protocol has no feature or schema-version negotiation. The adapter accepts a user-agent version of 0.144.1 or later and validates its consumed request, response, lifecycle, managed-thread, sandbox, and dynamic-tool contract during startup and operation. Unknown additive object fields are ignored. A Codex upgrade does not require `--new`; a changed consumed contract fails at the affected validation. A TUI attached to a running service must use the same Codex version as that service's app-server. The launcher must restart after a Codex upgrade before the upgraded TUI attaches.
 
 ### See also
 
@@ -596,15 +598,15 @@ The following table maps diagnostics to binding conditions.
 | `no_such_peer` | The destination is absent when the broker handles the send. | A retry is appropriate only after `list_peers` reports the reconnected peer. |
 | `no_self_send` | The destination equals the sender. | Another destination peer is required. |
 | `broker did not start within retry budget` | Broker spawning succeeded but the socket never accepted the client within the fixed dial sequence. | The broker log, socket directory, and `INTERCOM_BROKER_BIN` identify the startup failure. |
-| `unsupported app-server version` | The app-server user agent does not report `0.144.1`. | Codex CLI 0.144.1 is required. |
-| `Codex client version ... is incompatible` | The attaching TUI version differs from the running app-server version. | The same Codex CLI version used by the service is required in the attachment terminal. |
+| `unsupported app-server version` | The app-server user agent reports a version earlier than `0.144.1`. | Codex CLI 0.144.1 or later is required. |
+| `Codex client version ... is incompatible` | The attaching TUI version differs from the currently running app-server version. | The attachment terminal must select the Codex CLI used to start the service, or the launcher must restart with the upgraded CLI. |
 | `peer is already managed` | Another `intercom codex` process holds the peer state lock. | The other service group must stop, or another peer name and state binding must be selected. |
 | `Codex instance is already live` | Another service owns the same broker-and-peer live descriptor. | The existing service must stop, or another peer name must be selected. |
 | `no live Codex instance named ...` | The service is stopped, has not reached readiness, uses another broker identity, uses another `INTERCOM_DIR`, or has another peer name. | The launcher readiness block and matching environment identify the attachable instance. |
 | `descriptor is stale` | A prior service ended without removing a descriptor and its recorded process no longer exists. | A new launcher for the same broker and peer replaces the stale descriptor after successful startup. |
 | `a TUI is already connected` or HTTP conflict | One TUI already owns the instance attachment slot. | The existing TUI must disconnect before another attachment starts. The service does not require restart. |
 | `... is unavailable while attached to an Intercom-managed thread` | The TUI requested `/new`, `/fork`, archive, unarchive, deletion, `/review`, manual compact, rollback, shell escape, or realtime control. | Current-thread prompts and supported current-thread operations remain available; unsupported session-management operations require a separate unmanaged Codex session. |
-| `use --new to replace the binding` | Saved identity or tool state differs from the selected runtime. | The matching runtime must be restored, or `--new` must select a deliberate replacement. |
+| `use --new to replace the binding` | The saved peer, canonical directory, `CODEX_HOME`, state schema, or tool contract differs from the selected runtime. | The matching exact binding values must be restored, or `--new` must select a deliberate replacement. App-server user-agent and Codex-version changes do not produce this diagnostic. |
 | `managed thread is ... want idle` | The dedicated thread is active or in an error state during startup. | The service group must stop until Codex settles before restart. |
 | `active turn had no app-server activity` | An active managed turn emits no app-server activity for 15 minutes. | App-server diagnostics determine whether the service group requires restart. |
 

@@ -504,9 +504,10 @@ func TestThreadUnsubscribeIsVirtualized(t *testing.T) {
 }
 
 func TestInitializeRejectsIncompatibleCodexClientVersion(t *testing.T) {
+	const runningCodexVersion = "0.144.4"
 	endpoint, _ := proxyEndpoint(t)
 	listenTestProxy(t, Options{
-		Endpoint: endpoint, Upstream: newUnusedUpstream(), ExpectedClientVersion: appserver.ProtocolVersion,
+		Endpoint: endpoint, Upstream: newUnusedUpstream(), ExpectedClientVersion: runningCodexVersion,
 	})
 	conn := mustDialProxy(t, endpoint, "/rpc")
 	writeJSON(t, conn, map[string]any{
@@ -518,14 +519,14 @@ func TestInitializeRejectsIncompatibleCodexClientVersion(t *testing.T) {
 	})
 	response := readJSON(t, conn)
 	rpcErr := requireRPCError(t, response, appserver.ErrorCodeInvalidRequest)
-	if !strings.Contains(rpcErr.Message, appserver.ProtocolVersion) {
+	if !strings.Contains(rpcErr.Message, runningCodexVersion) {
 		t.Fatalf("initialize error = %q", rpcErr.Message)
 	}
 
 	writeJSON(t, conn, map[string]any{
 		"id": "initialize-retry", "method": appserver.MethodInitialize,
 		"params": appserver.InitializeParams{
-			ClientInfo:   appserver.ClientInfo{Name: "codex-tui", Version: appserver.ProtocolVersion},
+			ClientInfo:   appserver.ClientInfo{Name: "codex-tui", Version: runningCodexVersion},
 			Capabilities: &appserver.InitializeCapabilities{ExperimentalAPI: true},
 		},
 	})

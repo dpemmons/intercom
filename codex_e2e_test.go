@@ -342,7 +342,7 @@ func TestEndToEndClaudeAndCodexAdapters(t *testing.T) {
 		t.Fatalf("initialize params = %+v", initializeParams)
 	}
 	server.respond(t, initialize, appserver.InitializeResponse{
-		UserAgent:      "codex_cli_rs/" + appserver.ProtocolVersion,
+		UserAgent:      "codex_cli_rs/" + appserver.MinimumSupportedVersion,
 		CodexHome:      filepath.Join(project, "codex-home"),
 		PlatformFamily: "unix",
 		PlatformOS:     "linux",

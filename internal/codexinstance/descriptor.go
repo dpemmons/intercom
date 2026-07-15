@@ -27,7 +27,14 @@ import (
 )
 
 // SchemaVersion is the only descriptor schema this package currently accepts.
-const SchemaVersion = 1
+const SchemaVersion = 2
+
+type ExecutionPolicy string
+
+const (
+	ExecutionWorkspaceWrite   ExecutionPolicy = "workspace-write"
+	ExecutionDangerFullAccess ExecutionPolicy = "danger-full-access"
+)
 
 const (
 	minNonceLength    = 16
@@ -39,15 +46,16 @@ const (
 // CWD and BrokerSocketIdentity are canonical absolute filesystem paths.
 // DownstreamUnixEndpoint is the canonical unix:///absolute/path form.
 type Descriptor struct {
-	SchemaVersion          int    `json:"schemaVersion"`
-	Peer                   string `json:"peer"`
-	CWD                    string `json:"cwd"`
-	BrokerSocketIdentity   string `json:"brokerSocketIdentity"`
-	DownstreamUnixEndpoint string `json:"downstreamUnixEndpoint"`
-	ThreadID               string `json:"threadId"`
-	PID                    int    `json:"pid"`
-	InstanceNonce          string `json:"instanceNonce"`
-	CodexVersion           string `json:"codexVersion"`
+	SchemaVersion          int             `json:"schemaVersion"`
+	Peer                   string          `json:"peer"`
+	CWD                    string          `json:"cwd"`
+	BrokerSocketIdentity   string          `json:"brokerSocketIdentity"`
+	DownstreamUnixEndpoint string          `json:"downstreamUnixEndpoint"`
+	ThreadID               string          `json:"threadId"`
+	PID                    int             `json:"pid"`
+	InstanceNonce          string          `json:"instanceNonce"`
+	CodexVersion           string          `json:"codexVersion"`
+	ExecutionPolicy        ExecutionPolicy `json:"executionPolicy"`
 }
 
 // Validate checks descriptor compatibility, identity fields, and canonical
@@ -96,6 +104,11 @@ func (d Descriptor) Validate() error {
 	}
 	if err := validateText("Codex version", d.CodexVersion, maxIdentityLength); err != nil {
 		return err
+	}
+	switch d.ExecutionPolicy {
+	case ExecutionWorkspaceWrite, ExecutionDangerFullAccess:
+	default:
+		return fmt.Errorf("codex instance descriptor: invalid execution policy %q", d.ExecutionPolicy)
 	}
 	return nil
 }

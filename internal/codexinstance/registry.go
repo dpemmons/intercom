@@ -337,6 +337,13 @@ func decodeDescriptor(b []byte) (Descriptor, error) {
 	if err := requireJSONEOF(dec); err != nil {
 		return Descriptor{}, fmt.Errorf("codex instance registry: decode descriptor: %w", err)
 	}
+	// A schema-1 live descriptor predates explicit execution policy and always
+	// represents workspace-write. Normalize it in memory so an upgrade can
+	// inspect, attach to, or replace a still-live/stale prior descriptor.
+	if d.SchemaVersion == 1 && d.ExecutionPolicy == "" {
+		d.SchemaVersion = SchemaVersion
+		d.ExecutionPolicy = ExecutionWorkspaceWrite
+	}
 	return d, nil
 }
 
@@ -351,6 +358,7 @@ func validateJSONKeys(b []byte) error {
 		"pid":                    {},
 		"instanceNonce":          {},
 		"codexVersion":           {},
+		"executionPolicy":        {},
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()

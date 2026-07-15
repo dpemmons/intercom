@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,55 @@ func TestDynamicToolSpecsShareContracts(t *testing.T) {
 	}
 	if !reflect.DeepEqual(specs[0].InputSchema, intercomtools.SendMessageInputSchema) {
 		t.Fatal("send_message schema is not shared")
+	}
+}
+
+func TestMCPMetadataAuthorizationIsFailClosed(t *testing.T) {
+	t.Parallel()
+	valid := json.RawMessage(`{
+		"threadId":"thread-1",
+		"x-codex-turn-metadata":{
+			"session_id":"thread-1",
+			"thread_id":"thread-1",
+			"turn_id":"turn-1"
+		}
+	}`)
+	newController := func() *controller {
+		return &controller{ready: true, phase: phaseActive, threadID: "thread-1", turnID: "turn-1"}
+	}
+	if err := newController().authorizeMCPMetadata(t.Context(), valid); err != nil {
+		t.Fatalf("valid metadata rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+		want string
+	}{
+		{name: "absent", raw: nil, want: "missing Codex routing metadata"},
+		{name: "null", raw: json.RawMessage(`null`), want: "missing Codex routing metadata"},
+		{name: "malformed", raw: json.RawMessage(`{`), want: "decode Codex MCP routing metadata"},
+		{name: "missing session", raw: json.RawMessage(`{"threadId":"thread-1","x-codex-turn-metadata":{"thread_id":"thread-1","turn_id":"turn-1"}}`), want: "missing threadId, session_id, thread_id, or turn_id"},
+		{name: "metadata disagreement", raw: json.RawMessage(`{"threadId":"thread-1","x-codex-turn-metadata":{"session_id":"thread-1","thread_id":"other","turn_id":"turn-1"}}`), want: "disagrees on thread id"},
+		{name: "wrong session", raw: json.RawMessage(`{"threadId":"thread-1","x-codex-turn-metadata":{"session_id":"other","thread_id":"thread-1","turn_id":"turn-1"}}`), want: "does not match managed root"},
+		{name: "wrong root", raw: json.RawMessage(`{"threadId":"other","x-codex-turn-metadata":{"session_id":"other","thread_id":"other","turn_id":"turn-1"}}`), want: "does not match"},
+		{name: "wrong turn", raw: json.RawMessage(`{"threadId":"thread-1","x-codex-turn-metadata":{"session_id":"thread-1","thread_id":"thread-1","turn_id":"other"}}`), want: "does not match"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if err := newController().authorizeMCPMetadata(t.Context(), tt.raw); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("authorizeMCPMetadata() error = %v, want fragment %q", err, tt.want)
+			}
+		})
+	}
+
+	preReady := &controller{phase: phaseBooting, threadID: "thread-1"}
+	if err := preReady.authorizeMCPMetadata(t.Context(), valid); err == nil || !strings.Contains(err.Error(), "ownership is not established") {
+		t.Fatalf("pre-ready metadata error = %v", err)
+	}
+	if !preReady.startupViolation {
+		t.Fatal("pre-ready MCP call did not latch a startup violation")
 	}
 }
 

@@ -1,5 +1,5 @@
-// Package mcp implements the slice of the Model Context Protocol that the
-// intercom shim needs:
+// Package mcp implements the slice of the Model Context Protocol used by the
+// Intercom agent adapters:
 //
 //   - Stdio transport (newline-delimited JSON-RPC 2.0)
 //   - The initialize / notifications/initialized handshake
@@ -9,8 +9,8 @@
 // The package keeps non-standard outbound notifications explicit because the
 // shim emits notifications/claude/channel events.
 //
-// This is not a full MCP implementation. It serves one well-defined client
-// (Claude Code) over one transport (stdio).
+// This is not a full MCP implementation. It serves the local Claude Code and
+// Codex integrations over one transport (stdio).
 package mcp
 
 import (
@@ -55,7 +55,14 @@ type Tool struct {
 	// JSON Schema. Stored raw so callers can author it inline without paying
 	// a reflective inference dependency.
 	InputSchema json.RawMessage
-	Handler     ToolHandler
+	// Handler receives the tool arguments. Existing callers that do not need
+	// MCP request metadata should use this field.
+	Handler ToolHandler
+	// HandlerWithMeta receives the tool arguments and the tools/call params
+	// _meta object exactly as JSON. It is intended for transports that need to
+	// preserve client routing metadata. Exactly one of Handler and
+	// HandlerWithMeta must be set.
+	HandlerWithMeta ToolHandlerWithMeta
 }
 
 // ToolResult is what a tool handler returns: a text payload and whether to
@@ -74,6 +81,11 @@ type ToolResult struct {
 // IsError=true; that surfaces in Claude's context as part of the tool output
 // rather than as an MCP error response.
 type ToolHandler func(ctx context.Context, args json.RawMessage) (ToolResult, error)
+
+// ToolHandlerWithMeta is a ToolHandler that also receives the tools/call
+// params _meta value. meta is nil when _meta is absent and contains the JSON
+// literal "null" when the caller explicitly supplied null.
+type ToolHandlerWithMeta func(ctx context.Context, args, meta json.RawMessage) (ToolResult, error)
 
 // Server is a stdio-based MCP server. Construct with NewServer, register tools
 // with RegisterTool, then run with Run.
@@ -112,8 +124,11 @@ func (s *Server) RegisterTool(t Tool) {
 	if t.Name == "" {
 		panic("mcp: tool name required")
 	}
-	if t.Handler == nil {
+	if t.Handler == nil && t.HandlerWithMeta == nil {
 		panic("mcp: tool handler required for " + t.Name)
+	}
+	if t.Handler != nil && t.HandlerWithMeta != nil {
+		panic("mcp: tool must not set both Handler and HandlerWithMeta: " + t.Name)
 	}
 	s.toolsMu.Lock()
 	s.tools[t.Name] = t
@@ -321,6 +336,7 @@ func (s *Server) handleListTools(id json.RawMessage) {
 type callToolParams struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+	Meta      json.RawMessage `json:"_meta,omitempty"`
 }
 
 type callToolResult struct {
@@ -354,7 +370,7 @@ func (s *Server) handleCallTool(ctx context.Context, id json.RawMessage, paramsR
 		args = json.RawMessage("{}")
 	}
 
-	res, err := s.invokeHandler(ctx, tool, args)
+	res, err := s.invokeHandler(ctx, tool, args, params.Meta)
 	if err != nil {
 		s.replyError(id, codeInternal, fmt.Sprintf("tool %q: %v", tool.Name, err))
 		return
@@ -367,12 +383,15 @@ func (s *Server) handleCallTool(ctx context.Context, id json.RawMessage, paramsR
 
 // invokeHandler runs a tool handler with a panic guard so a buggy handler
 // can't take down the whole shim.
-func (s *Server) invokeHandler(ctx context.Context, tool Tool, args json.RawMessage) (res ToolResult, err error) {
+func (s *Server) invokeHandler(ctx context.Context, tool Tool, args, meta json.RawMessage) (res ToolResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
+	if tool.HandlerWithMeta != nil {
+		return tool.HandlerWithMeta(ctx, args, meta)
+	}
 	return tool.Handler(ctx, args)
 }
 

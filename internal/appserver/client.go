@@ -266,9 +266,27 @@ func (c *Client) ThreadResume(ctx context.Context, params ThreadResumeParams) (T
 	return response, err
 }
 
+func (c *Client) ThreadFork(ctx context.Context, params ThreadForkParams) (ThreadForkResponse, error) {
+	var response ThreadForkResponse
+	err := c.Call(ctx, MethodThreadFork, params, &response)
+	return response, err
+}
+
+func (c *Client) ThreadList(ctx context.Context, params ThreadListParams) (ThreadListResponse, error) {
+	var response ThreadListResponse
+	err := c.Call(ctx, MethodThreadList, params, &response)
+	return response, err
+}
+
 func (c *Client) ThreadRead(ctx context.Context, params ThreadReadParams) (ThreadReadResponse, error) {
 	var response ThreadReadResponse
 	err := c.Call(ctx, MethodThreadRead, params, &response)
+	return response, err
+}
+
+func (c *Client) MCPServerStatusList(ctx context.Context, params MCPServerStatusListParams) (MCPServerStatusListResponse, error) {
+	var response MCPServerStatusListResponse
+	err := c.Call(ctx, MethodMCPServerStatusList, params, &response)
 	return response, err
 }
 

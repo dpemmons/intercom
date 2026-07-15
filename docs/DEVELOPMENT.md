@@ -167,21 +167,23 @@ go test -count=1 ./...
 | Package | Boundary exercised by `go test ./...` |
 |---|---|
 | `.` | Broker-to-shim end-to-end delivery and combined Claude/Codex adapter behavior with a simulated app-server |
-| `./cmd/intercom` | Command registration, option precedence, endpoint validation, live-descriptor publication, attach process replacement, readiness output, and signal handling |
+| `./cmd/intercom` | Command registration, option precedence, endpoint validation, session listing and selection, live-descriptor publication, execution-policy inheritance, attach process replacement, readiness output, and signal handling |
 | `./docs/examples` | Compilation of the standalone manual broker-framing example |
 | `./internal/appserver` | Unix-WebSocket transport, request correlation, reverse requests, limits, cancellation, and protocol shapes |
 | `./internal/appserverproxy` | Downstream Unix-WebSocket service, TUI initialization, request-ID remapping, notification forwarding, reverse-request relay, connection exclusion, queue limits, and disconnect recovery |
 | `./internal/broker` | Registration, routing, ordering, shutdown, idle exit, locking, deadlines, and concurrent delivery |
 | `./internal/brokerclient` | Connection, broker auto-start, request handling, reconnection, cancellation, and concurrent callers |
-| `./internal/codex` | Managed-thread state, lifecycle control, Intercom/TUI turn arbitration, reverse routing, delivery serialization, dynamic tools, recovery, and simulated app-server integration |
+| `./internal/codex` | Managed-thread state, adoption, fork, transactional replacement, thread locking, lifecycle control, Intercom/TUI turn arbitration, execution-policy pinning, reverse routing, delivery serialization, dynamic and MCP tools, recovery, and simulated app-server integration |
+| `./internal/codexbridge` | Private Unix listener and MCP helper authentication, framing, metadata preservation, limits, deadlines, concurrency, and cleanup |
 | `./internal/codexinstance` | Live-descriptor validation, broker-scoped keys, atomic publication, cross-process exclusion, stale-PID handling, and nonce-checked cleanup |
+| `./internal/codexsession` | Paged session discovery, eligibility filtering, explicit-ID resolution, deterministic ordering, terminal selection, and display sanitization |
 | `./internal/intercomtools` | Shared tool schemas, strict argument decoding, size limits, result formatting, and fuzz seeds |
 | `./internal/mcp` | MCP initialization, tool dispatch, notifications, errors, concurrency, and ping |
 | `./internal/paths` | Environment overrides and derived runtime paths |
 | `./internal/peername` | Peer-name precedence and validation |
 | `./internal/shim` | Claude shim name resolution |
 | `./internal/wire` | Broker framing, compatibility, limits, deadlines, concurrent writes, and peer-name grammar |
-| `./scripts` | Two-socket launcher setup, readiness output preservation, supervision, signals, exit propagation, timeout validation, and cleanup |
+| `./scripts` | Per-instance app-server, client, and MCP-bridge path setup; explicit and interactive session selection; list mode; readiness-output preservation; supervision; signals; exit propagation; timeout validation; and cleanup |
 
 #### Success
 
@@ -604,7 +606,7 @@ checkout. The local dirty-checkout equivalent is:
 nix flake check path:. --print-build-logs
 ```
 
-The workflow does not set `INTERCOM_CODEX_SMOKE`. The two real Codex tests skip
+The workflow does not set `INTERCOM_CODEX_SMOKE`. The real Codex tests skip
 in continuous integration. The workflow establishes simulated app-server
 coverage but does not establish compatibility with an installed Codex release.
 
@@ -617,10 +619,10 @@ The package test suite creates isolated broker sockets, state directories,
 Codex homes, and launcher runtime directories. It does not use the default user
 broker socket or default Intercom state directory.
 
-The Codex protocol pin and the real Codex test requirement refer to the same
-version constant in [`protocol.go`](../internal/appserver/protocol.go). A version
-change requires schema review, simulated protocol tests, and Tier 7
-verification.
+The Codex minimum protocol version and the real Codex test requirement refer to
+the same version constant in [`protocol.go`](../internal/appserver/protocol.go).
+A minimum-version change requires schema review, simulated protocol tests, and
+Tier 7 verification.
 
 The Nix flake check verifies package construction only. A successful flake
 check does not imply successful Go tests, race detection, fuzzing, or real

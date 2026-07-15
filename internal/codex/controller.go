@@ -18,6 +18,8 @@ import (
 	"github.com/dpemmons/intercom/internal/appserver"
 	"github.com/dpemmons/intercom/internal/appserverproxy"
 	"github.com/dpemmons/intercom/internal/brokerclient"
+	"github.com/dpemmons/intercom/internal/codexbridge"
+	"github.com/dpemmons/intercom/internal/codexsession"
 	"github.com/dpemmons/intercom/internal/paths"
 	"github.com/dpemmons/intercom/internal/wire"
 )
@@ -29,6 +31,8 @@ const (
 	defaultActivityTimeout = 15 * time.Minute
 	maxDescendantAncestry  = 64
 	proxyEventQueueSize    = 256
+	managedMCPServerName   = "intercom_managed"
+	bridgeTokenEnvironment = "INTERCOM_CODEX_BRIDGE_TOKEN"
 )
 
 var errTurnAlreadyReserved = errors.New("codex: managed thread turn is already reserved")
@@ -39,9 +43,15 @@ type Config struct {
 	CWD               string
 	AppServerEndpoint string
 	ClientEndpoint    string
+	MCPBridgeSocket   string
+	IntercomBin       string
 	BrokerSocket      string
 	BrokerBin         string
 	New               bool
+	AdoptThreadID     string
+	ForkThreadID      string
+	ReplaceBinding    bool
+	ExecutionPolicy   ExecutionPolicy
 	Logger            *slog.Logger
 
 	QueueSize       int
@@ -54,20 +64,22 @@ type Config struct {
 	OnReady         func(ReadyInfo) error
 	OnStopping      func() error
 
-	dialAppServer func(context.Context, string, appserver.Options) (appServerClient, error)
-	newBroker     func(brokerclient.ClientOptions) brokerConnection
-	onTurnActive  func()
+	dialAppServer  func(context.Context, string, appserver.Options) (appServerClient, error)
+	newBroker      func(brokerclient.ClientOptions) brokerConnection
+	onTurnActive   func()
+	threadLockPath func(string, string) (string, error)
 }
 
 // ReadyInfo describes the live managed thread after the broker and optional
 // TUI proxy are ready. OnReady runs synchronously before Run enters its main
 // service loop.
 type ReadyInfo struct {
-	Name           string
-	CWD            string
-	ThreadID       string
-	ClientEndpoint string
-	CodexVersion   string
+	Name            string
+	CWD             string
+	ThreadID        string
+	ClientEndpoint  string
+	CodexVersion    string
+	ExecutionPolicy ExecutionPolicy
 }
 
 type appServerClient interface {
@@ -75,7 +87,10 @@ type appServerClient interface {
 	Initialized(context.Context) error
 	ThreadStart(context.Context, appserver.ThreadStartParams) (appserver.ThreadStartResponse, error)
 	ThreadResume(context.Context, appserver.ThreadResumeParams) (appserver.ThreadResumeResponse, error)
+	ThreadFork(context.Context, appserver.ThreadForkParams) (appserver.ThreadForkResponse, error)
+	ThreadList(context.Context, appserver.ThreadListParams) (appserver.ThreadListResponse, error)
 	ThreadRead(context.Context, appserver.ThreadReadParams) (appserver.ThreadReadResponse, error)
+	MCPServerStatusList(context.Context, appserver.MCPServerStatusListParams) (appserver.MCPServerStatusListResponse, error)
 	StartTurn(context.Context, appserver.TurnStartParams) (appserver.TurnStartAwait, error)
 	TurnInterrupt(context.Context, appserver.TurnInterruptParams) error
 	WaitHandlers(context.Context) error
@@ -158,13 +173,17 @@ func (o turnOwner) String() string {
 }
 
 type controller struct {
-	cfg    Config
-	ctx    context.Context
-	logger *slog.Logger
-	store  *StateStore
-	state  *ManagedState
-	app    appServerClient
-	broker brokerConnection
+	cfg          Config
+	ctx          context.Context
+	logger       *slog.Logger
+	store        *StateStore
+	state        *ManagedState
+	pendingState *ManagedState
+	threadLock   *ThreadLock
+	app          appServerClient
+	broker       brokerConnection
+	bridge       *codexbridge.Controller
+	bridgeToken  string
 
 	deliveries    chan wire.Deliver
 	notifications chan queuedNotification
@@ -239,10 +258,24 @@ func Run(parent context.Context, cfg Config) error {
 	}
 	c.store = store
 	defer store.Close()
+	defer func() {
+		if err := c.releaseThreadLock(); err != nil {
+			c.logger.Warn("release Codex thread lock", "err", err)
+		}
+	}()
 	if !cfg.New {
 		c.state, err = store.Load()
 		if err != nil {
 			return err
+		}
+	}
+	if c.state != nil && (cfg.AdoptThreadID != "" || cfg.ForkThreadID != "") {
+		if cfg.AdoptThreadID == c.state.ThreadID {
+			// Re-selecting the current binding is an idempotent resume. Preserve
+			// its established tool transport instead of layering a second one.
+			c.cfg.AdoptThreadID = ""
+		} else if !cfg.ReplaceBinding {
+			return fmt.Errorf("codex: peer %q already binds thread %s; use --replace-binding to replace it", cfg.Name, c.state.ThreadID)
 		}
 	}
 
@@ -258,6 +291,35 @@ func Run(parent context.Context, cfg Config) error {
 		c.broker = cfg.newBroker(brokerOptions)
 	} else {
 		c.broker = brokerclient.NewClient(brokerOptions)
+	}
+	needsBridge := c.cfg.AdoptThreadID != "" || c.cfg.ForkThreadID != "" ||
+		(c.state != nil && c.state.ToolTransport == ToolTransportMCPBridge)
+	if needsBridge {
+		if c.cfg.MCPBridgeSocket == "" || c.cfg.IntercomBin == "" {
+			return errors.New("codex: MCP bridge socket and Intercom executable are required for this binding")
+		}
+		token, err := codexbridge.GenerateToken()
+		if err != nil {
+			return err
+		}
+		c.bridgeToken = token
+		c.bridge, err = codexbridge.Listen(ctx, codexbridge.Options{
+			SocketPath: c.cfg.MCPBridgeSocket,
+			Token:      token,
+			Handler: codexbridge.HandlerFuncs{
+				SendMessageFunc: c.bridgeSendMessage,
+				ListPeersFunc:   c.bridgeListPeers,
+			},
+			RequestTimeout: c.cfg.ReverseTimeout,
+		})
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := c.bridge.Close(); err != nil {
+				c.logger.Warn("close Codex MCP bridge", "err", err)
+			}
+		}()
 	}
 	shutdownOwnsBroker := false
 	defer func() {
@@ -299,13 +361,21 @@ func Run(parent context.Context, cfg Config) error {
 			}
 		}()
 	}
+	if c.pendingState != nil {
+		if err := c.store.Save(*c.pendingState); err != nil {
+			return fmt.Errorf("codex: commit replacement thread binding: %w", err)
+		}
+		c.state = c.pendingState
+		c.pendingState = nil
+	}
 	if cfg.OnReady != nil {
 		if err := cfg.OnReady(ReadyInfo{
-			Name:           cfg.Name,
-			CWD:            cfg.CWD,
-			ThreadID:       c.threadID,
-			ClientEndpoint: cfg.ClientEndpoint,
-			CodexVersion:   c.codexVersion,
+			Name:            cfg.Name,
+			CWD:             cfg.CWD,
+			ThreadID:        c.threadID,
+			ClientEndpoint:  cfg.ClientEndpoint,
+			CodexVersion:    c.codexVersion,
+			ExecutionPolicy: cfg.ExecutionPolicy,
 		}); err != nil {
 			return fmt.Errorf("codex: publish readiness: %w", err)
 		}
@@ -333,8 +403,45 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, errors.New("codex: client endpoint must differ from app-server endpoint")
 		}
 	}
+	if cfg.MCPBridgeSocket != "" {
+		if !filepath.IsAbs(cfg.MCPBridgeSocket) {
+			return Config{}, errors.New("codex: MCP bridge socket path must be absolute")
+		}
+		cfg.MCPBridgeSocket = filepath.Clean(cfg.MCPBridgeSocket)
+	}
+	if cfg.IntercomBin != "" {
+		if !filepath.IsAbs(cfg.IntercomBin) {
+			return Config{}, errors.New("codex: Intercom executable path must be absolute")
+		}
+		cfg.IntercomBin = filepath.Clean(cfg.IntercomBin)
+	}
 	if cfg.BrokerSocket == "" {
 		return Config{}, errors.New("codex: broker socket is required")
+	}
+	if cfg.ExecutionPolicy == "" {
+		cfg.ExecutionPolicy = ExecutionWorkspaceWrite
+	}
+	if err := cfg.ExecutionPolicy.validate(); err != nil {
+		return Config{}, err
+	}
+	selectionModes := 0
+	if cfg.New {
+		selectionModes++
+	}
+	if cfg.AdoptThreadID != "" {
+		selectionModes++
+	}
+	if cfg.ForkThreadID != "" {
+		selectionModes++
+	}
+	if selectionModes > 1 {
+		return Config{}, errors.New("codex: --new, --adopt-session, and --fork-session are mutually exclusive")
+	}
+	if cfg.ReplaceBinding && cfg.AdoptThreadID == "" && cfg.ForkThreadID == "" {
+		return Config{}, errors.New("codex: --replace-binding requires --adopt-session or --fork-session")
+	}
+	if (cfg.AdoptThreadID != "" || cfg.ForkThreadID != "") && (cfg.MCPBridgeSocket == "" || cfg.IntercomBin == "") {
+		return Config{}, errors.New("codex: adopted and forked threads require the managed MCP bridge")
 	}
 	cwd, err := canonicalDirectory(cfg.CWD)
 	if err != nil {
@@ -375,6 +482,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 		cfg.dialAppServer = func(ctx context.Context, endpoint string, opts appserver.Options) (appServerClient, error) {
 			return appserver.DialUnix(ctx, endpoint, opts)
 		}
+	}
+	if cfg.threadLockPath == nil {
+		cfg.threadLockPath = paths.CodexThreadLock
 	}
 	return cfg, nil
 }
@@ -465,7 +575,15 @@ func (c *controller) startup(ctx context.Context) error {
 		return fmt.Errorf("codex: send initialized: %w", err)
 	}
 
-	if c.state != nil {
+	if c.cfg.AdoptThreadID != "" {
+		if err := c.adoptThread(ctx, init, version); err != nil {
+			return err
+		}
+	} else if c.cfg.ForkThreadID != "" {
+		if err := c.forkThread(ctx, init, version); err != nil {
+			return err
+		}
+	} else if c.state != nil {
 		if err := c.validateStoredBinding(init); err != nil {
 			return err
 		}
@@ -610,6 +728,16 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		if err := setTUIField(object, "runtimeWorkspaceRoots", []string{c.cfg.CWD}); err != nil {
 			return nil, nil, invalidTUIParams(method, err)
 		}
+		if err := setTUIField(object, "approvalPolicy", string(appserver.ApprovalNever)); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "approvalsReviewer", string(appserver.ApprovalsReviewerUser)); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "sandbox", c.cfg.ExecutionPolicy.sandboxMode()); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		delete(object, "permissions")
 		if err := setTUIField(object, "developerInstructions", developer); err != nil {
 			return nil, nil, invalidTUIParams(method, err)
 		}
@@ -639,6 +767,19 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		if err := setTUIField(object, "runtimeWorkspaceRoots", []string{c.cfg.CWD}); err != nil {
 			return nil, nil, invalidTUIParams(method, err)
 		}
+		if err := setTUIField(object, "approvalPolicy", string(appserver.ApprovalNever)); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(object, "approvalsReviewer", string(appserver.ApprovalsReviewerUser)); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		c.mu.Lock()
+		sandbox := c.sandbox
+		c.mu.Unlock()
+		if err := setTUIField(object, "sandboxPolicy", sandbox); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		delete(object, "permissions")
 		encoded, err := json.Marshal(object)
 		if err != nil {
 			return nil, nil, invalidTUIParams(method, err)
@@ -649,6 +790,12 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		}
 		return encoded, reservation, nil
 	case "thread/settings/update":
+		c.mu.Lock()
+		phase := c.phase
+		c.mu.Unlock()
+		if phase != phaseIdle {
+			return nil, nil, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "thread/settings/update is allowed only while the managed thread is idle"}
+		}
 		object, err := tuiRequestObject(params)
 		if err != nil {
 			return nil, nil, invalidTUIParams(method, err)
@@ -660,12 +807,34 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		if threadID != c.threadID {
 			return nil, nil, wrongTUIThread(method, threadID, c.threadID)
 		}
-		if raw, ok := object["cwd"]; ok && strings.TrimSpace(string(raw)) != "null" {
-			if err := setTUIField(object, "cwd", c.cfg.CWD); err != nil {
-				return nil, nil, invalidTUIParams(method, err)
+		// Rebuild the request from the documented interactive settings. Unknown
+		// future fields are dropped so a protocol extension cannot silently add
+		// a permission escape to this allowlisted method.
+		filtered := make(map[string]json.RawMessage, 12)
+		for _, field := range []string{
+			"threadId", "model", "serviceTier", "effort", "summary",
+			"collaborationMode", "multiAgentMode", "personality",
+		} {
+			if raw, ok := object[field]; ok {
+				filtered[field] = raw
 			}
 		}
-		encoded, err := json.Marshal(object)
+		if err := setTUIField(filtered, "cwd", c.cfg.CWD); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(filtered, "approvalPolicy", string(appserver.ApprovalNever)); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		if err := setTUIField(filtered, "approvalsReviewer", string(appserver.ApprovalsReviewerUser)); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		c.mu.Lock()
+		sandbox := c.sandbox
+		c.mu.Unlock()
+		if err := setTUIField(filtered, "sandboxPolicy", sandbox); err != nil {
+			return nil, nil, invalidTUIParams(method, err)
+		}
+		encoded, err := json.Marshal(filtered)
 		if err != nil {
 			return nil, nil, invalidTUIParams(method, err)
 		}
@@ -1052,16 +1221,71 @@ func (c *controller) validateStoredBinding(init appserver.InitializeResponse) er
 	return nil
 }
 
+func (c *controller) acquireThreadLock(codexHome, threadID string) error {
+	if c.threadLock != nil {
+		return errors.New("codex: managed thread lock is already held")
+	}
+	resolve := c.cfg.threadLockPath
+	if resolve == nil {
+		resolve = paths.CodexThreadLock
+	}
+	lockPath, err := resolve(codexHome, threadID)
+	if err != nil {
+		return err
+	}
+	lock, err := AcquireThreadLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("codex: lock thread %s: %w", threadID, err)
+	}
+	c.threadLock = lock
+	return nil
+}
+
+func (c *controller) managedMCPConfig() map[string]any {
+	startupSeconds := int(c.cfg.ControlTimeout.Round(time.Second) / time.Second)
+	if startupSeconds < 1 {
+		startupSeconds = 1
+	}
+	toolSeconds := int(c.cfg.ReverseTimeout.Round(time.Second) / time.Second)
+	if toolSeconds < 1 {
+		toolSeconds = 1
+	}
+	return map[string]any{
+		"mcp_servers." + managedMCPServerName: map[string]any{
+			"command":                      c.cfg.IntercomBin,
+			"args":                         []string{"codex-mcp-bridge", "--socket", c.cfg.MCPBridgeSocket, "--timeout", c.cfg.ReverseTimeout.String()},
+			"env":                          map[string]string{bridgeTokenEnvironment: c.bridgeToken},
+			"required":                     true,
+			"supports_parallel_tool_calls": true,
+			"startup_timeout_sec":          startupSeconds,
+			"tool_timeout_sec":             toolSeconds,
+			"default_tools_approval_mode":  "approve",
+			"enabled_tools":                []string{"send_message", "list_peers"},
+		},
+	}
+}
+
+func (c *controller) releaseThreadLock() error {
+	lock := c.threadLock
+	c.threadLock = nil
+	if lock == nil {
+		return nil
+	}
+	return lock.Close()
+}
+
 func (c *controller) startNewThread(ctx context.Context, init appserver.InitializeResponse, version string) error {
 	cwd := c.cfg.CWD
 	developer := developerInstructions(c.cfg.Name)
 	ephemeral := false
-	sandbox := appserver.SandboxWorkspaceWrite
+	sandbox := c.cfg.ExecutionPolicy.sandboxMode()
+	reviewer := appserver.ApprovalsReviewerUser
 	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	response, err := c.app.ThreadStart(control, appserver.ThreadStartParams{
 		CWD:                   &cwd,
 		RuntimeWorkspaceRoots: []string{cwd},
 		ApprovalPolicy:        string(appserver.ApprovalNever),
+		ApprovalsReviewer:     &reviewer,
 		Sandbox:               &sandbox,
 		DeveloperInstructions: &developer,
 		Ephemeral:             &ephemeral,
@@ -1071,7 +1295,10 @@ func (c *controller) startNewThread(ctx context.Context, init appserver.Initiali
 	if err != nil {
 		return fmt.Errorf("codex: start thread: %w", err)
 	}
-	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.Sandbox); err != nil {
+	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.ApprovalsReviewer, response.Sandbox); err != nil {
+		return err
+	}
+	if err := c.acquireThreadLock(init.CodexHome, response.Thread.ID); err != nil {
 		return err
 	}
 	c.state = &ManagedState{
@@ -1083,6 +1310,7 @@ func (c *controller) startNewThread(ctx context.Context, init appserver.Initiali
 		ServerUserAgent:     init.UserAgent,
 		CodexVersion:        version,
 		ToolContractVersion: ToolContractVersion,
+		ToolTransport:       ToolTransportDynamic,
 		Materialized:        false,
 	}
 	if err := c.store.Save(*c.state); err != nil {
@@ -1094,17 +1322,199 @@ func (c *controller) startNewThread(ctx context.Context, init appserver.Initiali
 	return nil
 }
 
-func (c *controller) resumeOrReplace(ctx context.Context, init appserver.InitializeResponse, version string) error {
+func (c *controller) adoptThread(ctx context.Context, init appserver.InitializeResponse, version string) error {
+	threadID := c.cfg.AdoptThreadID
+	if err := codexsession.ValidateID(threadID); err != nil {
+		return fmt.Errorf("codex: adopt session: %w", err)
+	}
+	if err := c.acquireThreadLock(init.CodexHome, threadID); err != nil {
+		return err
+	}
+	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
+	candidate, err := codexsession.Read(control, c.app, threadID, codexsession.Options{CWD: c.cfg.CWD})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("codex: adopt session %s: %w", threadID, err)
+	}
+	if candidate.Thread.ParentThreadID != nil {
+		return fmt.Errorf("codex: adopt session %s: subagent threads cannot be adopted as managed roots", threadID)
+	}
+	if candidate.Thread.Status.Type == appserver.ThreadStatusActive || candidate.Thread.Status.Type == appserver.ThreadStatusSystemError {
+		return fmt.Errorf("codex: adopt session %s: thread status is %s, want idle or notLoaded", threadID, candidate.Thread.Status.Type)
+	}
+
+	desired := c.managedState(init, version, threadID, ToolTransportMCPBridge, true)
+	c.state = desired
 	cwd := c.cfg.CWD
 	developer := developerInstructions(c.cfg.Name)
-	sandbox := appserver.SandboxWorkspaceWrite
+	sandbox := c.cfg.ExecutionPolicy.sandboxMode()
+	reviewer := appserver.ApprovalsReviewerUser
+	control, cancel = context.WithTimeout(ctx, c.cfg.ControlTimeout)
+	response, err := c.app.ThreadResume(control, appserver.ThreadResumeParams{
+		ThreadID:              threadID,
+		CWD:                   &cwd,
+		RuntimeWorkspaceRoots: []string{cwd},
+		ApprovalPolicy:        string(appserver.ApprovalNever),
+		ApprovalsReviewer:     &reviewer,
+		Sandbox:               &sandbox,
+		Config:                c.managedMCPConfig(),
+		DeveloperInstructions: &developer,
+		ExcludeTurns:          true,
+	})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("codex: adopt session %s: resume: %w", threadID, err)
+	}
+	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.ApprovalsReviewer, response.Sandbox); err != nil {
+		return err
+	}
+	if err := c.verifyManagedMCP(ctx); err != nil {
+		return err
+	}
+	c.pendingState = desired
+	return nil
+}
+
+func (c *controller) forkThread(ctx context.Context, init appserver.InitializeResponse, version string) error {
+	sourceID := c.cfg.ForkThreadID
+	if err := codexsession.ValidateID(sourceID); err != nil {
+		return fmt.Errorf("codex: fork session: %w", err)
+	}
+	if err := c.acquireThreadLock(init.CodexHome, sourceID); err != nil {
+		return err
+	}
+	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
+	candidate, err := codexsession.Read(control, c.app, sourceID, codexsession.Options{CWD: c.cfg.CWD})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("codex: fork session %s: %w", sourceID, err)
+	}
+	if candidate.Thread.ParentThreadID != nil {
+		return fmt.Errorf("codex: fork session %s: subagent threads cannot be selected as managed roots", sourceID)
+	}
+	if candidate.Thread.Status.Type == appserver.ThreadStatusActive || candidate.Thread.Status.Type == appserver.ThreadStatusSystemError {
+		return fmt.Errorf("codex: fork session %s: thread status is %s, want idle or notLoaded", sourceID, candidate.Thread.Status.Type)
+	}
+	cwd := c.cfg.CWD
+	developer := developerInstructions(c.cfg.Name)
+	sandbox := c.cfg.ExecutionPolicy.sandboxMode()
+	reviewer := appserver.ApprovalsReviewerUser
+	control, cancel = context.WithTimeout(ctx, c.cfg.ControlTimeout)
+	response, err := c.app.ThreadFork(control, appserver.ThreadForkParams{
+		ThreadID:              sourceID,
+		CWD:                   &cwd,
+		RuntimeWorkspaceRoots: []string{cwd},
+		ApprovalPolicy:        string(appserver.ApprovalNever),
+		ApprovalsReviewer:     &reviewer,
+		Sandbox:               &sandbox,
+		Config:                c.managedMCPConfig(),
+		DeveloperInstructions: &developer,
+		Ephemeral:             false,
+		ExcludeTurns:          true,
+	})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("codex: fork session %s: %w", sourceID, err)
+	}
+	if response.Thread.ID == "" || response.Thread.ID == sourceID {
+		return fmt.Errorf("codex: fork session %s: app-server returned invalid fork id %q", sourceID, response.Thread.ID)
+	}
+	if response.Thread.ForkedFromID == nil || *response.Thread.ForkedFromID != sourceID {
+		return fmt.Errorf("codex: fork session %s: app-server returned forkedFromId %#v", sourceID, response.Thread.ForkedFromID)
+	}
+	if err := c.releaseThreadLock(); err != nil {
+		return fmt.Errorf("codex: release source session lock: %w", err)
+	}
+	if err := c.acquireThreadLock(init.CodexHome, response.Thread.ID); err != nil {
+		return err
+	}
+	desired := c.managedState(init, version, response.Thread.ID, ToolTransportMCPBridge, true)
+	c.state = desired
+	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.ApprovalsReviewer, response.Sandbox); err != nil {
+		return err
+	}
+	if err := c.verifyManagedMCP(ctx); err != nil {
+		return err
+	}
+	c.pendingState = desired
+	return nil
+}
+
+func (c *controller) managedState(init appserver.InitializeResponse, version, threadID string, transport ToolTransport, materialized bool) *ManagedState {
+	return &ManagedState{
+		SchemaVersion:       StateSchemaVersion,
+		Peer:                c.cfg.Name,
+		ThreadID:            threadID,
+		CWD:                 c.cfg.CWD,
+		CodexHome:           init.CodexHome,
+		ServerUserAgent:     init.UserAgent,
+		CodexVersion:        version,
+		ToolContractVersion: ToolContractVersion,
+		ToolTransport:       transport,
+		Materialized:        materialized,
+	}
+}
+
+func (c *controller) verifyManagedMCP(ctx context.Context) error {
+	threadID := c.threadID
+	detail := appserver.MCPServerStatusToolsAndAuthOnly
+	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
+	defer cancel()
+	var cursor *string
+	seen := make(map[string]struct{})
+	for {
+		response, err := c.app.MCPServerStatusList(control, appserver.MCPServerStatusListParams{
+			Cursor: cursor, Detail: &detail, ThreadID: &threadID,
+		})
+		if err != nil {
+			return fmt.Errorf("codex: verify managed MCP server: %w", err)
+		}
+		for _, server := range response.Data {
+			if server.Name != managedMCPServerName {
+				continue
+			}
+			for _, tool := range []string{"send_message", "list_peers"} {
+				if _, ok := server.Tools[tool]; !ok {
+					return fmt.Errorf("codex: managed MCP server is missing required tool %q", tool)
+				}
+			}
+			return nil
+		}
+		if response.NextCursor == nil {
+			return fmt.Errorf("codex: managed MCP server %q is not active for thread %s", managedMCPServerName, threadID)
+		}
+		if *response.NextCursor == "" {
+			return errors.New("codex: managed MCP status pagination returned an invalid cursor")
+		}
+		if _, duplicate := seen[*response.NextCursor]; duplicate {
+			return errors.New("codex: managed MCP status pagination repeated a cursor")
+		}
+		seen[*response.NextCursor] = struct{}{}
+		cursor = response.NextCursor
+	}
+}
+
+func (c *controller) resumeOrReplace(ctx context.Context, init appserver.InitializeResponse, version string) error {
+	if err := c.acquireThreadLock(init.CodexHome, c.state.ThreadID); err != nil {
+		return err
+	}
+	cwd := c.cfg.CWD
+	developer := developerInstructions(c.cfg.Name)
+	sandbox := c.cfg.ExecutionPolicy.sandboxMode()
+	reviewer := appserver.ApprovalsReviewerUser
+	var requestConfig map[string]any
+	if c.state.ToolTransport == ToolTransportMCPBridge {
+		requestConfig = c.managedMCPConfig()
+	}
 	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	response, err := c.app.ThreadResume(control, appserver.ThreadResumeParams{
 		ThreadID:              c.state.ThreadID,
 		CWD:                   &cwd,
 		RuntimeWorkspaceRoots: []string{cwd},
 		ApprovalPolicy:        string(appserver.ApprovalNever),
+		ApprovalsReviewer:     &reviewer,
 		Sandbox:               &sandbox,
+		Config:                requestConfig,
 		DeveloperInstructions: &developer,
 		ExcludeTurns:          true,
 	})
@@ -1112,13 +1522,21 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 	if err != nil {
 		if !c.state.Materialized && isMissingRollout(err, c.state.ThreadID) {
 			c.logger.Info("replace unmaterialized Codex thread", "old_thread", c.state.ThreadID)
+			if lockErr := c.releaseThreadLock(); lockErr != nil {
+				return errors.Join(fmt.Errorf("codex: release missing thread lock: %w", lockErr), err)
+			}
 			c.state = nil
 			return c.startNewThread(ctx, init, version)
 		}
 		return fmt.Errorf("codex: resume thread %s: %w", c.state.ThreadID, err)
 	}
-	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.Sandbox); err != nil {
+	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.ApprovalsReviewer, response.Sandbox); err != nil {
 		return err
+	}
+	if c.state.ToolTransport == ToolTransportMCPBridge {
+		if err := c.verifyManagedMCP(ctx); err != nil {
+			return err
+		}
 	}
 	if !c.state.Materialized {
 		if _, err := c.confirmMaterialized(ctx, false); err != nil {
@@ -1143,7 +1561,7 @@ func isMissingRollout(err error, threadID string) bool {
 		rpcErr.Message == "no rollout found for thread id "+threadID
 }
 
-func (c *controller) acceptThread(thread appserver.Thread, cwd string, runtimeWorkspaceRoots []string, approval any, sandbox appserver.SandboxPolicy) error {
+func (c *controller) acceptThread(thread appserver.Thread, cwd string, runtimeWorkspaceRoots []string, approval any, reviewer appserver.ApprovalsReviewer, sandbox appserver.SandboxPolicy) error {
 	if thread.ID == "" || thread.ID != c.stateThreadIDOr(thread.ID) {
 		return fmt.Errorf("codex: app-server returned unexpected thread id %q", thread.ID)
 	}
@@ -1163,14 +1581,22 @@ func (c *controller) acceptThread(thread appserver.Thread, cwd string, runtimeWo
 	if !ok || policy != string(appserver.ApprovalNever) {
 		return fmt.Errorf("codex: app-server approval policy is %#v, want never", approval)
 	}
-	if sandbox.Type != "workspaceWrite" {
-		return fmt.Errorf("codex: app-server sandbox is %q, want workspaceWrite", sandbox.Type)
+	if reviewer != appserver.ApprovalsReviewerUser {
+		return fmt.Errorf("codex: app-server approvals reviewer is %q, want user", reviewer)
+	}
+	wantSandbox := c.cfg.ExecutionPolicy.sandboxType()
+	if sandbox.Type != wantSandbox {
+		return fmt.Errorf("codex: app-server sandbox is %q, want %s", sandbox.Type, wantSandbox)
 	}
 	if len(sandbox.WritableRoots) != 0 {
 		return fmt.Errorf("codex: app-server sandbox grants additional writable roots: %v", sandbox.WritableRoots)
 	}
-	if _, ok := sandbox.NetworkAccess.(bool); !ok {
-		return fmt.Errorf("codex: app-server workspace-write networkAccess has type %T, want bool", sandbox.NetworkAccess)
+	if wantSandbox == "workspaceWrite" {
+		if _, ok := sandbox.NetworkAccess.(bool); !ok {
+			return fmt.Errorf("codex: app-server workspace-write networkAccess has type %T, want bool", sandbox.NetworkAccess)
+		}
+	} else if sandbox.NetworkAccess != nil {
+		return fmt.Errorf("codex: app-server danger-full-access returned unexpected networkAccess %#v", sandbox.NetworkAccess)
 	}
 	c.mu.Lock()
 	c.threadID = thread.ID
@@ -1370,6 +1796,7 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 	c.turnStartResponseSeen = false
 	sandbox := c.sandbox
 	threadID := c.threadID
+	reviewer := appserver.ApprovalsReviewerUser
 	c.mu.Unlock()
 
 	clientID := delivery.ID
@@ -1382,6 +1809,7 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 		CWD:                   &cwd,
 		RuntimeWorkspaceRoots: []string{cwd},
 		ApprovalPolicy:        string(appserver.ApprovalNever),
+		ApprovalsReviewer:     &reviewer,
 		SandboxPolicy:         &sandbox,
 	})
 	cancelWrite()

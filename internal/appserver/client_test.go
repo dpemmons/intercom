@@ -286,6 +286,96 @@ func TestInitializeAndInitialized(t *testing.T) {
 	server.await(t)
 }
 
+func TestSessionDiscoveryForkAndMCPStatusMethods(t *testing.T) {
+	expected := []string{MethodThreadList, MethodThreadRead, MethodThreadFork, MethodMCPServerStatusList}
+	server := startUnixTestServer(t, func(ctx context.Context, conn *websocket.Conn) error {
+		for index, wantMethod := range expected {
+			request, err := readObject(ctx, conn)
+			if err != nil {
+				return err
+			}
+			method, err := objectMethod(request)
+			if err != nil {
+				return err
+			}
+			if method != wantMethod {
+				return fmt.Errorf("request %d method = %q, want %q", index, method, wantMethod)
+			}
+			id, err := objectID(request)
+			if err != nil {
+				return err
+			}
+			var result any
+			switch method {
+			case MethodThreadList:
+				var params ThreadListParams
+				if err := json.Unmarshal(request["params"], &params); err != nil {
+					return err
+				}
+				if params.CWD != "/project" {
+					return fmt.Errorf("thread/list cwd = %#v", params.CWD)
+				}
+				result = map[string]any{"data": []any{map[string]any{"id": "listed"}}, "nextCursor": "next", "backwardsCursor": nil}
+			case MethodThreadRead:
+				var params ThreadReadParams
+				if err := json.Unmarshal(request["params"], &params); err != nil || params.ThreadID != "listed" {
+					return fmt.Errorf("thread/read params = %+v, err = %v", params, err)
+				}
+				result = map[string]any{"thread": map[string]any{"id": "listed"}}
+			case MethodThreadFork:
+				var params ThreadForkParams
+				if err := json.Unmarshal(request["params"], &params); err != nil || params.ThreadID != "listed" {
+					return fmt.Errorf("thread/fork params = %+v, err = %v", params, err)
+				}
+				result = map[string]any{"thread": map[string]any{"id": "forked"}}
+			case MethodMCPServerStatusList:
+				var params MCPServerStatusListParams
+				if err := json.Unmarshal(request["params"], &params); err != nil || params.ThreadID == nil || *params.ThreadID != "forked" {
+					return fmt.Errorf("mcp status params = %+v, err = %v", params, err)
+				}
+				result = map[string]any{
+					"data": []any{map[string]any{
+						"name": "intercom", "serverInfo": nil,
+						"tools":     map[string]any{"send_message": map[string]any{"name": "send_message", "inputSchema": map[string]any{"type": "object"}}},
+						"resources": []any{}, "resourceTemplates": []any{}, "authStatus": "unsupported",
+					}},
+					"nextCursor": nil,
+				}
+			}
+			if err := writeObject(ctx, conn, map[string]any{"id": id, "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	client, err := DialUnix(context.Background(), server.endpoint, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	list, err := client.ThreadList(context.Background(), ThreadListParams{CWD: "/project"})
+	if err != nil || len(list.Data) != 1 || list.Data[0].ID != "listed" || list.NextCursor == nil || *list.NextCursor != "next" {
+		t.Fatalf("ThreadList = (%+v, %v)", list, err)
+	}
+	read, err := client.ThreadRead(context.Background(), ThreadReadParams{ThreadID: "listed"})
+	if err != nil || read.Thread.ID != "listed" {
+		t.Fatalf("ThreadRead = (%+v, %v)", read, err)
+	}
+	forked, err := client.ThreadFork(context.Background(), ThreadForkParams{ThreadID: "listed"})
+	if err != nil || forked.Thread.ID != "forked" {
+		t.Fatalf("ThreadFork = (%+v, %v)", forked, err)
+	}
+	status, err := client.MCPServerStatusList(context.Background(), MCPServerStatusListParams{ThreadID: strPointer("forked")})
+	if err != nil || len(status.Data) != 1 || status.Data[0].Tools["send_message"].Name != "send_message" {
+		t.Fatalf("MCPServerStatusList = (%+v, %v)", status, err)
+	}
+	server.await(t)
+}
+
+func strPointer(value string) *string { return &value }
+
 func TestRPCErrorResponse(t *testing.T) {
 	server := startUnixTestServer(t, func(ctx context.Context, conn *websocket.Conn) error {
 		request, err := readObject(ctx, conn)

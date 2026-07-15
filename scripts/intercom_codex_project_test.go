@@ -38,13 +38,15 @@ func TestLauncherAdapterExitStopsServer(t *testing.T) {
 	adapterArgs := recordedAdapterArgs(t, result.events)
 	appServerEndpoint := requiredFlagValue(t, adapterArgs, "--app-server")
 	clientEndpoint := requiredFlagValue(t, adapterArgs, "--client-endpoint")
+	mcpBridgePath := requiredFlagValue(t, adapterArgs, "--mcp-bridge")
 	appServerPath := unixEndpointPath(t, appServerEndpoint)
 	clientPath := unixEndpointPath(t, clientEndpoint)
-	if filepath.Base(appServerPath) != "app-server.sock" || filepath.Base(clientPath) != "client.sock" {
-		t.Fatalf("launcher socket paths = %q, %q", appServerPath, clientPath)
+	if filepath.Base(appServerPath) != "app-server.sock" || filepath.Base(clientPath) != "client.sock" || filepath.Base(mcpBridgePath) != "mcp-bridge.sock" {
+		t.Fatalf("launcher socket paths = %q, %q, %q", appServerPath, clientPath, mcpBridgePath)
 	}
-	if filepath.Dir(appServerPath) != filepath.Dir(clientPath) || appServerPath == clientPath {
-		t.Fatalf("launcher endpoints are not distinct siblings: %q, %q", appServerPath, clientPath)
+	if filepath.Dir(appServerPath) != filepath.Dir(clientPath) || filepath.Dir(appServerPath) != filepath.Dir(mcpBridgePath) ||
+		appServerPath == clientPath || appServerPath == mcpBridgePath || clientPath == mcpBridgePath {
+		t.Fatalf("launcher endpoints are not distinct private siblings: %q, %q, %q", appServerPath, clientPath, mcpBridgePath)
 	}
 	if !strings.Contains(result.events, "\x1f--name\x1freviewer\x1f--cwd\x1f/tmp/project") {
 		t.Fatalf("adapter arguments not forwarded as expected:\n%s", result.events)
@@ -246,8 +248,11 @@ func TestLauncherCanonicalizesRelativeRuntimeBase(t *testing.T) {
 		t.Fatalf("exit code = %d, want 17; stderr:\n%s", code, stderr.String())
 	}
 	args := recordedAdapterArgs(t, readEvents(t, eventPath))
-	for _, flag := range []string{"--app-server", "--client-endpoint"} {
-		path := unixEndpointPath(t, requiredFlagValue(t, args, flag))
+	for _, flag := range []string{"--app-server", "--client-endpoint", "--mcp-bridge"} {
+		path := requiredFlagValue(t, args, flag)
+		if flag != "--mcp-bridge" {
+			path = unixEndpointPath(t, path)
+		}
 		if filepath.Dir(filepath.Dir(path)) != absBase {
 			t.Fatalf("%s path = %q, want child of %q", flag, path, absBase)
 		}
@@ -405,6 +410,9 @@ func TestLauncherRejectsEndpointOverridesBeforeStartingChildren(t *testing.T) {
 		{option: "--client-endpoint", args: []string{"--help", "--client-endpoint", "unix:///tmp/other.sock"}},
 		{option: "--client-endpoint", args: []string{"--client-endpoint", "unix:///tmp/other.sock", "--help"}},
 		{option: "--client-endpoint", args: []string{"--help", "--client-endpoint=unix:///tmp/other.sock"}},
+		{option: "--mcp-bridge", args: []string{"--mcp-bridge", "/tmp/other.sock"}},
+		{option: "--mcp-bridge", args: []string{"--mcp-bridge=/tmp/other.sock"}},
+		{option: "--mcp-bridge", args: []string{"--help", "--mcp-bridge=/tmp/other.sock"}},
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal", tt.args...)
@@ -423,6 +431,230 @@ func TestLauncherRejectsEndpointOverridesBeforeStartingChildren(t *testing.T) {
 	}
 }
 
+func TestLauncherRejectsInternalSessionFlagsBeforeStartingChildren(t *testing.T) {
+	for _, args := range [][]string{
+		{"--adopt-session", "019f-internal"},
+		{"--adopt-session=019f-internal"},
+		{"--fork-session", "019f-internal"},
+		{"--fork-session=019f-internal", "--help"},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal", args...)
+		err := cmd.Run()
+		cancel()
+		if code := processExitCode(err); code != 2 {
+			t.Fatalf("args %v exit code = %d, want 2; stderr:\n%s", args, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "is internal; use --adopt or --fork-from") {
+			t.Fatalf("args %v missing internal-option error; stderr:\n%s", args, stderr.String())
+		}
+		if events := readEvents(t, eventPath); events != "" {
+			t.Fatalf("args %v started children:\n%s", args, events)
+		}
+		assertRuntimeClean(t, runtimeDir)
+	}
+}
+
+func TestLauncherForwardsExplicitSessionSelectionExactly(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		args     []string
+		wantFlag string
+		wantID   string
+	}{
+		{
+			name:     "adopt separate argument",
+			args:     []string{"--adopt", "019F-Adopt=Exact.Case", "--replace-binding", "--name", "reviewer"},
+			wantFlag: "--adopt-session",
+			wantID:   "019F-Adopt=Exact.Case",
+		},
+		{
+			name:     "fork equals argument",
+			args:     []string{"--fork-from=019F-Fork=Exact.Case", "--name", "reviewer"},
+			wantFlag: "--fork-session",
+			wantID:   "019F-Fork=Exact.Case",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := runLauncher(t, "adapter-first", tt.args...)
+			if result.exitCode != 17 {
+				t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", result.exitCode, result.stderr)
+			}
+			if strings.Contains(result.events, "sessions-start") {
+				t.Fatalf("explicit session id invoked selector:\n%s", result.events)
+			}
+			adapterArgs := recordedAdapterArgs(t, result.events)
+			if got := requiredFlagValue(t, adapterArgs, tt.wantFlag); got != tt.wantID {
+				t.Fatalf("%s value = %q, want exact %q", tt.wantFlag, got, tt.wantID)
+			}
+			if !filepath.IsAbs(requiredFlagValue(t, adapterArgs, "--mcp-bridge")) {
+				t.Fatalf("managed MCP bridge path is not absolute: %q", adapterArgs)
+			}
+		})
+	}
+}
+
+func TestLauncherSelectsAdoptionSessionBeforeAdapter(t *testing.T) {
+	result := runLauncher(t, "picker-adopt", "--adopt", "--cwd", "/tmp/project", "--name", "reviewer")
+	if result.exitCode != 17 {
+		t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "server-start", "sessions-start", "adapter-start", "server-term")
+	sessionArgs := recordedSessionsArgs(t, result.events)
+	if got := requiredFlagValue(t, sessionArgs, "--cwd"); got != "/tmp/project" {
+		t.Fatalf("selector cwd = %q, want /tmp/project", got)
+	}
+	if containsArg(sessionArgs, "--all") || containsArg(sessionArgs, "--list") {
+		t.Fatalf("adoption selector received unexpected mode: %q", sessionArgs)
+	}
+	adapterArgs := recordedAdapterArgs(t, result.events)
+	if got := requiredFlagValue(t, adapterArgs, "--adopt-session"); got != "019f-adopt-Exact" {
+		t.Fatalf("selected adoption id = %q", got)
+	}
+	if got, want := requiredFlagValue(t, sessionArgs, "--app-server"), requiredFlagValue(t, adapterArgs, "--app-server"); got != want {
+		t.Fatalf("selector app-server = %q, adapter app-server = %q", got, want)
+	}
+}
+
+func TestLauncherSelectsForkSessionAcrossWorkingDirectories(t *testing.T) {
+	result := runLauncher(t, "picker-fork", "--fork-from", "--all-sessions", "--cwd=/tmp/project")
+	if result.exitCode != 17 {
+		t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "sessions-start", "adapter-start")
+	sessionArgs := recordedSessionsArgs(t, result.events)
+	if !containsArg(sessionArgs, "--all") {
+		t.Fatalf("fork selector did not receive --all: %q", sessionArgs)
+	}
+	if got := requiredFlagValue(t, sessionArgs, "--cwd"); got != "/tmp/project" {
+		t.Fatalf("selector cwd = %q, want /tmp/project", got)
+	}
+	adapterArgs := recordedAdapterArgs(t, result.events)
+	if got := requiredFlagValue(t, adapterArgs, "--fork-session"); got != "019f-fork-Exact" {
+		t.Fatalf("selected fork id = %q", got)
+	}
+}
+
+func TestLauncherListsSessionsWithoutStartingAdapter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "list-sessions", "--list-sessions", "--all-sessions", "--cwd", "/tmp/project")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	if code := processExitCode(err); code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr:\n%s", code, stderr.String())
+	}
+	events := readEvents(t, eventPath)
+	wantEventsInOrder(t, events, "server-start", "sessions-start", "server-term")
+	if strings.Contains(events, "adapter-start") {
+		t.Fatalf("adapter started in list mode:\n%s", events)
+	}
+	if got, want := stdout.String(), "019f-list\t2026-07-14T00:00:00Z\t/tmp/project\tExample\n"; got != want {
+		t.Fatalf("list output = %q, want %q", got, want)
+	}
+	sessionArgs := recordedSessionsArgs(t, events)
+	if !containsArg(sessionArgs, "--all") || !containsArg(sessionArgs, "--list") {
+		t.Fatalf("list selector arguments = %q", sessionArgs)
+	}
+	assertRuntimeClean(t, runtimeDir)
+}
+
+func TestLauncherListSessionsRejectsAdapterArguments(t *testing.T) {
+	for _, args := range [][]string{
+		{"--list-sessions", "--name", "ignored"},
+		{"--list-sessions", "--yolo"},
+		{"--list-sessions", "positional"},
+		{"--list-sessions", "--unknown"},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal", args...)
+		err := cmd.Run()
+		cancel()
+		if code := processExitCode(err); code != 2 {
+			t.Fatalf("args %v exit code = %d, want 2; stderr:\n%s", args, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "--list-sessions does not accept adapter argument") {
+			t.Fatalf("args %v missing list-mode validation; stderr:\n%s", args, stderr.String())
+		}
+		if events := readEvents(t, eventPath); events != "" {
+			t.Fatalf("args %v started children:\n%s", args, events)
+		}
+		assertRuntimeClean(t, runtimeDir)
+	}
+}
+
+func TestLauncherSelectorFailureStopsServerWithoutAdapter(t *testing.T) {
+	result := runLauncher(t, "session-failure", "--adopt")
+	if result.exitCode != 29 {
+		t.Fatalf("exit code = %d, want selector code 29; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "sessions-start", "server-term")
+	if strings.Contains(result.events, "adapter-start") {
+		t.Fatalf("adapter started after selector failure:\n%s", result.events)
+	}
+	if !strings.Contains(result.stderr, "selector failed") {
+		t.Fatalf("selector diagnostic was not retained; stderr:\n%s", result.stderr)
+	}
+}
+
+func TestLauncherRejectsInvalidSelectorOutput(t *testing.T) {
+	for _, mode := range []string{"selector-empty", "selector-multiline"} {
+		t.Run(mode, func(t *testing.T) {
+			result := runLauncher(t, mode, "--adopt")
+			if result.exitCode != 1 {
+				t.Fatalf("exit code = %d, want 1; stderr:\n%s", result.exitCode, result.stderr)
+			}
+			if !strings.Contains(result.stderr, "session selector returned an invalid session id") {
+				t.Fatalf("missing invalid-selector diagnostic; stderr:\n%s", result.stderr)
+			}
+			wantEventsInOrder(t, result.events, "sessions-start", "server-term")
+			if strings.Contains(result.events, "adapter-start") {
+				t.Fatalf("adapter started after invalid selector output:\n%s", result.events)
+			}
+		})
+	}
+}
+
+func TestLauncherForwardsExecutionPolicyAliases(t *testing.T) {
+	for _, flag := range []string{"--yolo", "--dangerously-bypass-approvals-and-sandbox"} {
+		t.Run(flag, func(t *testing.T) {
+			result := runLauncher(t, "adapter-first", flag)
+			if result.exitCode != 17 {
+				t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", result.exitCode, result.stderr)
+			}
+			if !containsArg(recordedAdapterArgs(t, result.events), flag) {
+				t.Fatalf("execution policy flag %s not forwarded:\n%s", flag, result.events)
+			}
+		})
+	}
+}
+
+func TestLauncherRejectsConflictingSessionModesBeforeStartingChildren(t *testing.T) {
+	for _, args := range [][]string{
+		{"--new", "--adopt", "019f-one"},
+		{"--adopt", "019f-one", "--fork-from", "019f-two"},
+		{"--list-sessions", "--fork-from", "019f-two"},
+		{"--adopt", "019f-one", "--adopt", "019f-two"},
+		{"--all-sessions"},
+		{"--all-sessions", "--adopt", "019f-one"},
+		{"--replace-binding"},
+		{"--adopt="},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal", args...)
+		err := cmd.Run()
+		cancel()
+		if code := processExitCode(err); code != 2 {
+			t.Fatalf("args %v exit code = %d, want 2; stderr:\n%s", args, code, stderr.String())
+		}
+		if events := readEvents(t, eventPath); events != "" {
+			t.Fatalf("args %v started children:\n%s", args, events)
+		}
+		assertRuntimeClean(t, runtimeDir)
+	}
+}
+
 func TestLauncherHelpStartsNoChildren(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -433,8 +665,10 @@ func TestLauncherHelpStartsNoChildren(t *testing.T) {
 	if code := processExitCode(err); code != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr:\n%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Usage:") || !strings.Contains(stdout.String(), "--new") {
-		t.Fatalf("incomplete help output:\n%s", stdout.String())
+	for _, want := range []string{"Usage:", "--new", "--adopt [ID]", "--fork-from [ID]", "--list-sessions", "--all-sessions", "--yolo"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("help output does not document %q:\n%s", want, stdout.String())
+		}
 	}
 	if events := readEvents(t, eventPath); events != "" {
 		t.Fatalf("children started while printing help:\n%s", events)
@@ -624,9 +858,40 @@ func runLauncherHelper() int {
 	case "app-server":
 		return runServerHelper(args)
 	case "codex":
+		if len(args) > 1 && args[1] == "sessions" {
+			return runSessionsHelper(args)
+		}
 		return runAdapterHelper(args)
 	default:
 		return 91
+	}
+}
+
+func runSessionsHelper(args []string) int {
+	mode := os.Getenv(helperMode)
+	recordEvent("sessions-start")
+	recordEvent("sessions-args=" + strings.Join(args, "\x1f"))
+	switch mode {
+	case "picker-adopt":
+		_, _ = fmt.Fprintln(os.Stdout, "019f-adopt-Exact")
+		return 0
+	case "picker-fork":
+		_, _ = fmt.Fprintln(os.Stdout, "019f-fork-Exact")
+		return 0
+	case "list-sessions":
+		_, _ = fmt.Fprintln(os.Stdout, "019f-list\t2026-07-14T00:00:00Z\t/tmp/project\tExample")
+		return 0
+	case "session-failure":
+		_, _ = fmt.Fprintln(os.Stderr, "selector failed")
+		return 29
+	case "selector-empty":
+		return 0
+	case "selector-multiline":
+		_, _ = fmt.Fprintln(os.Stdout, "019f-one")
+		_, _ = fmt.Fprintln(os.Stdout, "019f-two")
+		return 0
+	default:
+		return 97
 	}
 }
 
@@ -675,7 +940,7 @@ func runAdapterHelper(args []string) int {
 	}
 	recordEvent("adapter-start")
 	recordEvent("adapter-args=" + strings.Join(args, "\x1f"))
-	if mode == "adapter-first" || mode == "stream-routing" {
+	if mode == "adapter-first" || mode == "stream-routing" || mode == "picker-adopt" || mode == "picker-fork" {
 		if mode == "stream-routing" {
 			_, _ = fmt.Fprintln(os.Stdout, "service-ready")
 		}
@@ -749,6 +1014,26 @@ func recordedAdapterArgs(t *testing.T, events string) []string {
 	}
 	t.Fatalf("adapter arguments not found in events:\n%s", events)
 	return nil
+}
+
+func recordedSessionsArgs(t *testing.T, events string) []string {
+	t.Helper()
+	for _, line := range strings.Split(events, "\n") {
+		if strings.HasPrefix(line, "sessions-args=") {
+			return strings.Split(strings.TrimPrefix(line, "sessions-args="), "\x1f")
+		}
+	}
+	t.Fatalf("session-selector arguments not found in events:\n%s", events)
+	return nil
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
 }
 
 func requiredFlagValue(t *testing.T, args []string, name string) string {

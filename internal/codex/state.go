@@ -16,20 +16,32 @@ const (
 	ToolContractVersion = 1
 )
 
+// ToolTransport identifies how a managed Codex thread reaches Intercom's
+// tools. Threads created by Intercom persist app-server dynamic tools in their
+// rollout. Adopted and forked interactive threads receive an ephemeral MCP
+// bridge configuration on every cold resume.
+type ToolTransport string
+
+const (
+	ToolTransportDynamic   ToolTransport = "dynamic"
+	ToolTransportMCPBridge ToolTransport = "mcpBridge"
+)
+
 // ManagedState binds an Intercom peer to the Codex thread it exclusively
 // manages. Conversation data remains in CODEX_HOME; this record contains only
 // binding identity, compatibility metadata, and last-validated runtime
 // diagnostics.
 type ManagedState struct {
-	SchemaVersion       int    `json:"schemaVersion"`
-	Peer                string `json:"peer"`
-	ThreadID            string `json:"threadId"`
-	CWD                 string `json:"cwd"`
-	CodexHome           string `json:"codexHome"`
-	ServerUserAgent     string `json:"serverUserAgent"`
-	CodexVersion        string `json:"codexVersion"`
-	ToolContractVersion int    `json:"toolContractVersion"`
-	Materialized        bool   `json:"materialized"`
+	SchemaVersion       int           `json:"schemaVersion"`
+	Peer                string        `json:"peer"`
+	ThreadID            string        `json:"threadId"`
+	CWD                 string        `json:"cwd"`
+	CodexHome           string        `json:"codexHome"`
+	ServerUserAgent     string        `json:"serverUserAgent"`
+	CodexVersion        string        `json:"codexVersion"`
+	ToolContractVersion int           `json:"toolContractVersion"`
+	ToolTransport       ToolTransport `json:"toolTransport"`
+	Materialized        bool          `json:"materialized"`
 }
 
 func (s ManagedState) Validate() error {
@@ -42,6 +54,11 @@ func (s ManagedState) Validate() error {
 	if s.ToolContractVersion != ToolContractVersion {
 		return fmt.Errorf("codex state: tool contract version %d is incompatible with %d; start with --new", s.ToolContractVersion, ToolContractVersion)
 	}
+	switch s.ToolTransport {
+	case ToolTransportDynamic, ToolTransportMCPBridge:
+	default:
+		return fmt.Errorf("codex state: unsupported tool transport %q", s.ToolTransport)
+	}
 	return nil
 }
 
@@ -51,6 +68,42 @@ type StateStore struct {
 	statePath string
 	lockFile  *os.File
 	syncDir   func(string) error
+}
+
+// ThreadLock is a non-blocking process-lifetime advisory lock. It coordinates
+// Intercom controllers; ordinary Codex processes do not honor it.
+type ThreadLock struct {
+	lockFile *os.File
+}
+
+// AcquireThreadLock prevents two Intercom peers from managing the same Codex
+// thread concurrently.
+func AcquireThreadLock(lockPath string) (*ThreadLock, error) {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, fmt.Errorf("codex thread lock: create directory: %w", err)
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("codex thread lock: open: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("codex thread lock: thread is already managed by Intercom: %w", err)
+		}
+		return nil, fmt.Errorf("codex thread lock: acquire: %w", err)
+	}
+	return &ThreadLock{lockFile: f}, nil
+}
+
+// Close releases the thread lock.
+func (l *ThreadLock) Close() error {
+	if l == nil || l.lockFile == nil {
+		return nil
+	}
+	f := l.lockFile
+	l.lockFile = nil
+	return errors.Join(syscall.Flock(int(f.Fd()), syscall.LOCK_UN), f.Close())
 }
 
 // AcquireStateStore acquires lockPath without waiting. The returned store must
@@ -85,6 +138,12 @@ func (s *StateStore) Load() (*ManagedState, error) {
 	var state ManagedState
 	if err := json.Unmarshal(b, &state); err != nil {
 		return nil, fmt.Errorf("codex state: decode: %w", err)
+	}
+	// Schema-v1 bindings written before tool transports were explicit are all
+	// dynamic-tool threads. Normalize them in memory; the next successful
+	// resume writes the explicit value with the other runtime diagnostics.
+	if state.ToolTransport == "" {
+		state.ToolTransport = ToolTransportDynamic
 	}
 	if err := state.Validate(); err != nil {
 		return nil, err

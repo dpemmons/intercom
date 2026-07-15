@@ -32,6 +32,7 @@ func validDescriptor(t *testing.T, root string) Descriptor {
 		PID:                    os.Getpid(),
 		InstanceNonce:          "0123456789abcdef0123456789abcdef",
 		CodexVersion:           "0.144.1",
+		ExecutionPolicy:        ExecutionWorkspaceWrite,
 	}
 }
 
@@ -65,6 +66,7 @@ func TestDescriptorValidate(t *testing.T) {
 		{name: "nonce alphabet", mutate: func(d *Descriptor) { d.InstanceNonce = "0123456789abcde!" }, wantErr: "ASCII"},
 		{name: "version empty", mutate: func(d *Descriptor) { d.CodexVersion = "" }, wantErr: "Codex version is empty"},
 		{name: "version control", mutate: func(d *Descriptor) { d.CodexVersion = "0.1\n" }, wantErr: "control"},
+		{name: "execution policy", mutate: func(d *Descriptor) { d.ExecutionPolicy = "other" }, wantErr: "execution policy"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

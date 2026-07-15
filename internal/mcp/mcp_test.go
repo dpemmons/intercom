@@ -234,6 +234,97 @@ func TestToolsCallSuccess(t *testing.T) {
 	}
 }
 
+func TestToolsCallMetadataPreserved(t *testing.T) {
+	wantMeta := json.RawMessage(`{"threadId":"thread-1","x-codex-turn-metadata":{"turnId":"turn-2","nested":{"sequence":3}},"extension":[true,null]}`)
+	gotMeta := make(chan json.RawMessage, 1)
+	d := newDriver(t, Options{}, Tool{
+		Name:        "inspect",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		HandlerWithMeta: func(_ context.Context, _ json.RawMessage, meta json.RawMessage) (ToolResult, error) {
+			gotMeta <- append(json.RawMessage(nil), meta...)
+			return ToolResult{Text: "ok"}, nil
+		},
+	})
+
+	d.send(t, `{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"inspect","arguments":{},"_meta":`+string(wantMeta)+`}}`)
+	var resp struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	d.recv(t, &resp)
+	if len(resp.Result.Content) != 1 || resp.Result.Content[0].Text != "ok" {
+		t.Fatalf("response = %+v", resp)
+	}
+
+	var got, want any
+	if err := json.Unmarshal(<-gotMeta, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(wantMeta, &want); err != nil {
+		t.Fatal(err)
+	}
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("metadata = %s, want %s", gotJSON, wantJSON)
+	}
+}
+
+func TestToolsCallMetadataAbsentAndNullRemainDistinct(t *testing.T) {
+	got := make(chan json.RawMessage, 2)
+	d := newDriver(t, Options{}, Tool{
+		Name:        "inspect",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		HandlerWithMeta: func(_ context.Context, _ json.RawMessage, meta json.RawMessage) (ToolResult, error) {
+			got <- append(json.RawMessage(nil), meta...)
+			return ToolResult{Text: "ok"}, nil
+		},
+	})
+	d.send(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inspect","arguments":{}}}`)
+	d.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inspect","arguments":{},"_meta":null}}`)
+	var response struct{}
+	d.recv(t, &response)
+	d.recv(t, &response)
+
+	var absent, explicitNull bool
+	for range 2 {
+		meta := <-got
+		switch string(meta) {
+		case "":
+			absent = true
+		case "null":
+			explicitNull = true
+		default:
+			t.Fatalf("unexpected metadata %q", meta)
+		}
+	}
+	if !absent || !explicitNull {
+		t.Fatalf("absent=%v explicitNull=%v", absent, explicitNull)
+	}
+}
+
+func TestRegisterToolRejectsAmbiguousHandlers(t *testing.T) {
+	t.Parallel()
+	srv := NewServer(Implementation{}, Options{})
+	defer func() {
+		if recover() == nil {
+			t.Fatal("RegisterTool did not panic")
+		}
+	}()
+	srv.RegisterTool(Tool{
+		Name: "ambiguous",
+		Handler: func(context.Context, json.RawMessage) (ToolResult, error) {
+			return ToolResult{}, nil
+		},
+		HandlerWithMeta: func(context.Context, json.RawMessage, json.RawMessage) (ToolResult, error) {
+			return ToolResult{}, nil
+		},
+	})
+}
+
 func TestToolsCallIsErrorPropagates(t *testing.T) {
 	d := newDriver(t, Options{}, Tool{
 		Name:        "fail",

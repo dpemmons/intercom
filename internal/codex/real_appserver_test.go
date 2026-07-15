@@ -236,6 +236,24 @@ func TestCompatibleCodexAppServerSmoke(t *testing.T) {
 	if err == nil || !isMissingRollout(err, started.Thread.ID) {
 		t.Fatalf("unexpected pending-thread resume result: %v", err)
 	}
+
+	danger := appserver.SandboxDangerFullAccess
+	dangerStarted, err := client.ThreadStart(ctx, appserver.ThreadStartParams{
+		CWD:                   &cwd,
+		RuntimeWorkspaceRoots: []string{cwd},
+		ApprovalPolicy:        string(appserver.ApprovalNever),
+		Sandbox:               &danger,
+		DeveloperInstructions: &instructions,
+		Ephemeral:             &ephemeral,
+		DynamicTools:          dynamicToolSpecs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dangerStarted.Sandbox.Type != "dangerFullAccess" || dangerStarted.Sandbox.NetworkAccess != nil ||
+		len(dangerStarted.Sandbox.WritableRoots) != 0 || dangerStarted.ApprovalPolicy != string(appserver.ApprovalNever) {
+		t.Fatalf("danger-full-access response = approval %#v, sandbox %#v", dangerStarted.ApprovalPolicy, dangerStarted.Sandbox)
+	}
 }
 
 func generatedSchemaFingerprint(root string) (string, error) {

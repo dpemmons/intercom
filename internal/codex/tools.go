@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,15 @@ type reverseResponder interface {
 }
 
 type reverseAuthorizer func(context.Context, string, string) error
+
+type codexMCPMetadata struct {
+	ThreadID string `json:"threadId"`
+	Turn     struct {
+		SessionID string `json:"session_id"`
+		ThreadID  string `json:"thread_id"`
+		TurnID    string `json:"turn_id"`
+	} `json:"x-codex-turn-metadata"`
+}
 
 type reverseHandler struct {
 	broker     brokerTools
@@ -205,6 +215,54 @@ func (h *reverseHandler) handleDynamicTool(ctx context.Context, raw json.RawMess
 	default:
 		return responder.Respond(ctx, dynamicFailure("unknown Intercom tool: "+params.Tool))
 	}
+}
+
+func (c *controller) authorizeMCPMetadata(ctx context.Context, raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return errors.New("MCP tool call is missing Codex routing metadata")
+	}
+	var metadata codexMCPMetadata
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return fmt.Errorf("decode Codex MCP routing metadata: %w", err)
+	}
+	if metadata.ThreadID == "" || metadata.Turn.ThreadID == "" || metadata.Turn.TurnID == "" || metadata.Turn.SessionID == "" {
+		return errors.New("MCP tool call metadata is missing threadId, session_id, thread_id, or turn_id")
+	}
+	if metadata.ThreadID != metadata.Turn.ThreadID {
+		return fmt.Errorf("MCP tool call metadata disagrees on thread id %q/%q", metadata.ThreadID, metadata.Turn.ThreadID)
+	}
+	rootThreadID := c.managedThreadID()
+	if metadata.Turn.SessionID != rootThreadID {
+		return fmt.Errorf("MCP tool call session id %q does not match managed root %q", metadata.Turn.SessionID, rootThreadID)
+	}
+	return c.authorizeReverse(ctx, metadata.ThreadID, metadata.Turn.TurnID)
+}
+
+func (c *controller) bridgeSendMessage(ctx context.Context, metadata json.RawMessage, to, message string) (wire.SendAck, error) {
+	c.touchActivity()
+	if err := c.authorizeMCPMetadata(ctx, metadata); err != nil {
+		wrapped := fmt.Errorf("reject pre-ready or mismatched MCP send_message: %w", err)
+		c.signalFatal(wrapped)
+		return wire.SendAck{}, wrapped
+	}
+	ack, err := c.broker.Send(ctx, to, message)
+	if err != nil {
+		return wire.SendAck{}, err
+	}
+	if ack.OK {
+		c.noteOutbound()
+	}
+	return ack, nil
+}
+
+func (c *controller) bridgeListPeers(ctx context.Context, metadata json.RawMessage) ([]string, error) {
+	c.touchActivity()
+	if err := c.authorizeMCPMetadata(ctx, metadata); err != nil {
+		wrapped := fmt.Errorf("reject pre-ready or mismatched MCP list_peers: %w", err)
+		c.signalFatal(wrapped)
+		return nil, wrapped
+	}
+	return c.broker.ListPeers(ctx)
 }
 
 func respondDynamicViolation(ctx context.Context, responder reverseResponder, message string) error {

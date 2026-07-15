@@ -18,6 +18,7 @@ func validState() ManagedState {
 		ServerUserAgent:     "codex-cli/0.144.1",
 		CodexVersion:        "0.144.1",
 		ToolContractVersion: ToolContractVersion,
+		ToolTransport:       ToolTransportDynamic,
 	}
 }
 
@@ -128,6 +129,32 @@ func TestStateStoreRejectsSecondOwner(t *testing.T) {
 	}
 }
 
+func TestThreadLockRejectsSecondIntercomOwner(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "thread.lock")
+	first, err := AcquireThreadLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := AcquireThreadLock(path)
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("second AcquireThreadLock() unexpectedly succeeded")
+	}
+	if err == nil || !strings.Contains(err.Error(), "already managed") {
+		t.Fatalf("second AcquireThreadLock() error = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	third, err := AcquireThreadLock(path)
+	if err != nil {
+		t.Fatalf("AcquireThreadLock() after release: %v", err)
+	}
+	_ = third.Close()
+}
+
 func TestStateStoreRemove(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -158,6 +185,7 @@ func TestManagedStateValidation(t *testing.T) {
 		{name: "schema", mutate: func(s *ManagedState) { s.SchemaVersion++ }, wantErr: "unsupported schema"},
 		{name: "missing identity", mutate: func(s *ManagedState) { s.ThreadID = "" }, wantErr: "missing required"},
 		{name: "tool contract", mutate: func(s *ManagedState) { s.ToolContractVersion++ }, wantErr: "--new"},
+		{name: "tool transport", mutate: func(s *ManagedState) { s.ToolTransport = "other" }, wantErr: "tool transport"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -167,6 +195,28 @@ func TestManagedStateValidation(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestStateStoreLoadsLegacyBindingAsDynamicTransport(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "reviewer.json")
+	legacy := `{"schemaVersion":1,"peer":"reviewer","threadId":"019-test","cwd":"/tmp/project","codexHome":"/tmp/codex-home","serverUserAgent":"codex-cli/0.144.1","codexVersion":"0.144.1","toolContractVersion":1,"materialized":true}`
+	if err := os.WriteFile(statePath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := AcquireStateStore(statePath, filepath.Join(dir, "reviewer.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ToolTransport != ToolTransportDynamic {
+		t.Fatalf("legacy tool transport = %q, want %q", got.ToolTransport, ToolTransportDynamic)
 	}
 }
 

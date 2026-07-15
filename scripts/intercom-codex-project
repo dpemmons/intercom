@@ -3,8 +3,8 @@ set -u
 
 # Supported project supervisor for one dedicated Codex app-server and one Intercom
 # adapter/proxy. Configure binary locations with CODEX_BIN and INTERCOM_BIN.
-# Runtime arguments other than help and the launcher-owned endpoint options are
-# forwarded to `intercom codex`.
+# Runtime arguments other than help and the launcher-owned transport and session
+# selection options are forwarded to `intercom codex`.
 
 codex_bin=${CODEX_BIN:-codex}
 intercom_bin=${INTERCOM_BIN:-intercom}
@@ -15,6 +15,9 @@ usage() {
   printf '%s\n' \
     'Usage:' \
     '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]' \
+    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID]' \
+    '  intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID]' \
+    '  intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]' \
     '' \
     'Description:' \
     '  Starts one dedicated Codex app-server and one Intercom Codex adapter/proxy.' \
@@ -26,6 +29,14 @@ usage() {
     '  --name NAME       Sets the Intercom peer name.' \
     '  --cwd DIRECTORY   Sets the managed project directory.' \
     '  --new             Starts a new managed thread and replaces its binding.' \
+    '  --adopt [ID]      Adopts an interactive session. Omitting ID opens a picker.' \
+    '  --fork-from [ID]  Forks an interactive session. Omitting ID opens a picker.' \
+    '  --all-sessions    Includes sessions from every working directory in selection.' \
+    '  --list-sessions   Lists resumable sessions and exits.' \
+    '  --replace-binding Replaces an existing peer binding during adopt or fork.' \
+    '  --yolo            Disables approvals and the Codex sandbox for managed turns.' \
+    '  --dangerously-bypass-approvals-and-sandbox' \
+    '                    Alias for --yolo.' \
     '  -h, --help        Prints this help text and exits.' \
     '' \
     'Environment:' \
@@ -52,9 +63,14 @@ for arg in "$@"; do
     -h | --help)
       show_help=1
       ;;
-    --app-server | --app-server=* | --client-endpoint | --client-endpoint=*)
+    --app-server | --app-server=* | --client-endpoint | --client-endpoint=* | --mcp-bridge | --mcp-bridge=*)
       option=${arg%%=*}
       printf 'intercom-codex-project: %s is managed by the launcher and must not be supplied\n' "$option" >&2
+      exit 2
+      ;;
+    --adopt-session | --adopt-session=* | --fork-session | --fork-session=*)
+      option=${arg%%=*}
+      printf 'intercom-codex-project: %s is internal; use --adopt or --fork-from\n' "$option" >&2
       exit 2
       ;;
   esac
@@ -62,6 +78,113 @@ done
 if ((show_help)); then
   usage
   exit 0
+fi
+
+forwarded_args=()
+adapter_only_args=()
+selection_mode=
+selection_id=
+selection_needs_picker=0
+all_sessions=0
+list_sessions=0
+fresh=0
+replace_binding=0
+selector_cwd=
+
+selection_conflict() {
+  printf 'intercom-codex-project: --new, --adopt, --fork-from, and --list-sessions are mutually exclusive\n' >&2
+  exit 2
+}
+
+set_selection() {
+  local mode=$1
+  local id=$2
+  local needs_picker=$3
+  if [[ -n $selection_mode ]] || ((fresh)) || ((list_sessions)); then
+    selection_conflict
+  fi
+  selection_mode=$mode
+  selection_id=$id
+  selection_needs_picker=$needs_picker
+}
+
+while (($#)); do
+  arg=$1
+  shift
+  case $arg in
+    --adopt | --fork-from)
+      mode=adopt
+      [[ $arg == --fork-from ]] && mode=fork
+      id=
+      needs_picker=1
+      if (($#)) && [[ $1 != -* ]]; then
+        id=$1
+        shift
+        needs_picker=0
+      fi
+      set_selection "$mode" "$id" "$needs_picker"
+      ;;
+    --adopt=* | --fork-from=*)
+      mode=adopt
+      [[ $arg == --fork-from=* ]] && mode=fork
+      id=${arg#*=}
+      if [[ -z $id ]]; then
+        printf 'intercom-codex-project: %s requires a nonempty session id after =\n' "${arg%%=*}" >&2
+        exit 2
+      fi
+      set_selection "$mode" "$id" 0
+      ;;
+    --all-sessions)
+      all_sessions=1
+      ;;
+    --list-sessions)
+      if [[ -n $selection_mode ]] || ((fresh)) || ((list_sessions)); then
+        selection_conflict
+      fi
+      list_sessions=1
+      ;;
+    --new)
+      if [[ -n $selection_mode ]] || ((list_sessions)) || ((fresh)); then
+        selection_conflict
+      fi
+      fresh=1
+      forwarded_args+=("$arg")
+      ;;
+    --replace-binding)
+      replace_binding=1
+      forwarded_args+=("$arg")
+      ;;
+    --cwd)
+      if (($# == 0)); then
+        printf 'intercom-codex-project: --cwd requires a directory\n' >&2
+        exit 2
+      fi
+      selector_cwd=$1
+      forwarded_args+=("$arg" "$1")
+      shift
+      ;;
+    --cwd=*)
+      selector_cwd=${arg#*=}
+      forwarded_args+=("$arg")
+      ;;
+    *)
+      forwarded_args+=("$arg")
+      adapter_only_args+=("$arg")
+      ;;
+  esac
+done
+
+if ((all_sessions)) && ((!list_sessions && !selection_needs_picker)); then
+  printf 'intercom-codex-project: --all-sessions requires --list-sessions or an ID-less --adopt/--fork-from\n' >&2
+  exit 2
+fi
+if ((replace_binding)) && [[ -z $selection_mode ]]; then
+  printf 'intercom-codex-project: --replace-binding requires --adopt or --fork-from\n' >&2
+  exit 2
+fi
+if ((list_sessions)) && ((${#adapter_only_args[@]} != 0)); then
+  printf 'intercom-codex-project: --list-sessions does not accept adapter argument %s\n' "${adapter_only_args[0]}" >&2
+  exit 2
 fi
 
 # Timeout values are multiplied by ten for decisecond polling. Keep the
@@ -113,6 +236,7 @@ case $runtime_dir in
 esac
 app_server_socket_path=$runtime_dir/app-server.sock
 client_socket_path=$runtime_dir/client.sock
+mcp_bridge_socket_path=$runtime_dir/mcp-bridge.sock
 app_server_endpoint=unix://$app_server_socket_path
 client_endpoint=unix://$client_socket_path
 
@@ -210,10 +334,48 @@ if [[ ! -S $app_server_socket_path ]]; then
   exit 1
 fi
 
+if ((list_sessions)) || ((selection_needs_picker)); then
+  session_args=(codex sessions --app-server "$app_server_endpoint")
+  if [[ -n $selector_cwd ]]; then
+    session_args+=(--cwd "$selector_cwd")
+  fi
+  if ((all_sessions)); then
+    session_args+=(--all)
+  fi
+  if ((list_sessions)); then
+    session_args+=(--list)
+    "$intercom_bin" "${session_args[@]}"
+    status=$?
+    exit "$status"
+  fi
+
+  selection_id=$("$intercom_bin" "${session_args[@]}")
+  status=$?
+  if ((status != 0)); then
+    exit "$status"
+  fi
+  if [[ -z $selection_id ]] || [[ $selection_id == *$'\n'* ]]; then
+    printf 'intercom-codex-project: session selector returned an invalid session id\n' >&2
+    exit 1
+  fi
+fi
+
+selection_args=()
+case $selection_mode in
+  adopt)
+    selection_args=(--adopt-session "$selection_id")
+    ;;
+  fork)
+    selection_args=(--fork-session "$selection_id")
+    ;;
+esac
+
 "$intercom_bin" codex \
   --app-server "$app_server_endpoint" \
   --client-endpoint "$client_endpoint" \
-  "$@" &
+  --mcp-bridge "$mcp_bridge_socket_path" \
+  "${selection_args[@]}" \
+  "${forwarded_args[@]}" &
 adapter_pid=$!
 
 while :; do

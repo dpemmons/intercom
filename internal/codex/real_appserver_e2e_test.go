@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/dpemmons/intercom/internal/appserver"
+	"github.com/dpemmons/intercom/internal/brokerclient"
 	"github.com/dpemmons/intercom/internal/intercomtools"
 	"github.com/dpemmons/intercom/internal/wire"
 )
@@ -345,6 +346,548 @@ func TestCompatibleCodexAppServerForkedSubagentDynamicToolE2E(t *testing.T) {
 	rootThread := readPinnedThread(t, process.client, rootThreadID)
 	assertPinnedTurnStatus(t, rootThread, parentTurn.ID, appserver.TurnStatusCompleted)
 	process.stop(t, syscall.SIGTERM, true)
+}
+
+// TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E proves the
+// ordinary-session adoption boundary against an installed Codex app-server.
+// It materializes an ordinary remote-TUI thread without Intercom dynamic
+// tools, verifies its interactive VS Code source classification, adopts it
+// through the controller, and lets Codex invoke list_peers through the
+// request-scoped MCP helper built from this checkout. It then restarts both
+// controller and app-server and proves that a cold resume reinjects a fresh
+// helper instance from persisted rollout and Intercom binding state.
+// The loopback provider and in-process broker require no credentials or
+// external network access.
+func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) {
+	if os.Getenv("INTERCOM_CODEX_SMOKE") != "1" {
+		t.Skip("set INTERCOM_CODEX_SMOKE=1 to exercise the installed Codex app-server")
+	}
+	codexBin := os.Getenv("CODEX_BIN")
+	if codexBin == "" {
+		var err error
+		codexBin, err = exec.LookPath("codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex-home")
+	cwd := filepath.Join(root, "project")
+	bridgeDir := filepath.Join(root, "bridge")
+	for _, dir := range []string{codexHome, cwd, bridgeDir} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	intercomBin := filepath.Join(root, "intercom")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", intercomBin, "./cmd/intercom")
+	build.Dir = repoRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build Intercom MCP helper: %v\n%s", err, output)
+	}
+
+	const (
+		seedPrompt       = "materialize this ordinary interactive session"
+		firstPrompt      = "invoke the managed list_peers tool after adoption"
+		secondPrompt     = "invoke the managed list_peers tool after cold resume"
+		firstCallID      = "adopted-mcp-list-peers"
+		secondCallID     = "cold-resume-mcp-list-peers"
+		firstDeliveryID  = "adopted-delivery"
+		secondDeliveryID = "cold-resume-delivery"
+	)
+	responses := newPinnedResponsesRouter(t, func(request map[string]any) (string, error) {
+		switch {
+		case pinnedRequestContains(request, secondCallID):
+			return pinnedAssistantSSE("response-cold-final", "message-cold-final", "cold resume complete"), nil
+		case pinnedRequestContains(request, secondPrompt):
+			namespace, err := pinnedManagedListPeersNamespace(request)
+			if err != nil {
+				return "", err
+			}
+			return pinnedNamespacedFunctionCallSSE("response-cold-tool", secondCallID, namespace, intercomtools.ListPeersName, `{}`), nil
+		case pinnedRequestContains(request, firstCallID):
+			return pinnedAssistantSSE("response-adopt-final", "message-adopt-final", "adoption complete"), nil
+		case pinnedRequestContains(request, firstPrompt):
+			namespace, err := pinnedManagedListPeersNamespace(request)
+			if err != nil {
+				return "", err
+			}
+			return pinnedNamespacedFunctionCallSSE("response-adopt-tool", firstCallID, namespace, intercomtools.ListPeersName, `{}`), nil
+		case pinnedRequestContains(request, seedPrompt):
+			return pinnedAssistantSSE("response-seed", "message-seed", "ordinary session materialized"), nil
+		default:
+			encoded, _ := json.Marshal(request)
+			return "", fmt.Errorf("unmatched Responses request: %s", encoded)
+		}
+	})
+	writePinnedProviderConfig(t, codexHome, responses.URL())
+	process := startPinnedAppServer(t, codexBin, codexHome, root, "adopt-mcp", appserver.Options{})
+	initializePinnedClient(t, process.client)
+	endpoint := "unix://" + filepath.Join(root, "app-server-adopt-mcp.sock")
+	materializePinnedInteractiveSession(t, codexBin, codexHome, cwd, endpoint, seedPrompt, "ordinary session materialized")
+	ordinaryThread := readPinnedInteractiveSession(t, process.client, cwd)
+	if source := pinnedThreadSource(ordinaryThread.Source); source != string(appserver.ThreadSourceVSCode) {
+		t.Fatalf("remote Codex TUI thread source = %q, want vscode", source)
+	}
+	baselineTurns := len(ordinaryThread.Turns)
+	if baselineTurns == 0 {
+		t.Fatal("ordinary thread did not inherit the materialized seed turn")
+	}
+
+	recorder := newPinnedAdoptionBrokerRecorder([]string{"alice", "bob"})
+	statePath := filepath.Join(root, "state.json")
+	lockPath := filepath.Join(root, "state.lock")
+	bridgeSocket := filepath.Join(bridgeDir, "mcp.sock")
+	baseConfig := Config{
+		Name:              "adopted-e2e",
+		Version:           "test",
+		CWD:               cwd,
+		AppServerEndpoint: endpoint,
+		MCPBridgeSocket:   bridgeSocket,
+		IntercomBin:       intercomBin,
+		BrokerSocket:      filepath.Join(root, "unused-broker.sock"),
+		ExecutionPolicy:   ExecutionWorkspaceWrite,
+		StatePath:         statePath,
+		LockPath:          lockPath,
+		StartupTimeout:    5 * time.Second,
+		ControlTimeout:    10 * time.Second,
+		ReverseTimeout:    5 * time.Second,
+		ActivityTimeout:   10 * time.Second,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	baseConfig.newBroker = recorder.newConnection
+	baseConfig.threadLockPath = func(_, threadID string) (string, error) {
+		return filepath.Join(root, "thread-locks", threadID+".lock"), nil
+	}
+
+	firstConfig := baseConfig
+	firstConfig.AdoptThreadID = ordinaryThread.ID
+	first := startPinnedAdoptionController(t, firstConfig)
+	if first.info.ThreadID != ordinaryThread.ID {
+		first.stop(t)
+		t.Fatalf("adopted thread = %q, want %q", first.info.ThreadID, ordinaryThread.ID)
+	}
+	assertPinnedManagedMCPStatus(t, process.client, ordinaryThread.ID)
+	first.broker.deliver(wire.Deliver{
+		ID: firstDeliveryID, From: "alice", Message: firstPrompt, Timestamp: "2026-07-14T12:00:00Z",
+	})
+	recorder.waitForLists(t, 1, first.done)
+	waitPinnedCompletedTurnCount(t, process.client, ordinaryThread.ID, baselineTurns+1)
+	first.stop(t)
+	process.stop(t, syscall.SIGTERM, true)
+
+	state, err := readManagedState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ThreadID != ordinaryThread.ID || state.ToolTransport != ToolTransportMCPBridge || !state.Materialized {
+		t.Fatalf("adopted state = %#v", state)
+	}
+
+	resumedProcess := startPinnedAppServer(t, codexBin, codexHome, root, "r", appserver.Options{})
+	initializePinnedClient(t, resumedProcess.client)
+	resumedEndpoint := "unix://" + filepath.Join(root, "app-server-r.sock")
+	secondConfig := baseConfig
+	secondConfig.AppServerEndpoint = resumedEndpoint
+	second := startPinnedAdoptionController(t, secondConfig)
+	if second.info.ThreadID != ordinaryThread.ID {
+		second.stop(t)
+		t.Fatalf("cold-resumed thread = %q, want %q", second.info.ThreadID, ordinaryThread.ID)
+	}
+	assertPinnedManagedMCPStatus(t, resumedProcess.client, ordinaryThread.ID)
+	second.broker.deliver(wire.Deliver{
+		ID: secondDeliveryID, From: "bob", Message: secondPrompt, Timestamp: "2026-07-14T12:01:00Z",
+	})
+	recorder.waitForLists(t, 2, second.done)
+	waitPinnedCompletedTurnCount(t, resumedProcess.client, ordinaryThread.ID, baselineTurns+2)
+	second.stop(t)
+	resumedProcess.stop(t, syscall.SIGTERM, true)
+
+	requests := responses.snapshotRequests(t)
+	if len(requests) != 5 {
+		t.Fatalf("Responses requests = %d, want 5", len(requests))
+	}
+	if pinnedRequestAdvertisesTool(requests[0], intercomtools.ListPeersName) ||
+		pinnedRequestAdvertisesTool(requests[0], intercomtools.SendMessageName) {
+		t.Fatalf("ordinary seed request unexpectedly advertised Intercom tools: %#v", requests[0]["tools"])
+	}
+	firstInitial := pinnedFindRequest(t, requests, func(request map[string]any) bool {
+		return pinnedRequestContains(request, firstPrompt) && !pinnedRequestContains(request, firstCallID)
+	}, "adopted MCP initial request")
+	if _, err := pinnedManagedListPeersNamespace(firstInitial); err != nil {
+		t.Fatal(err)
+	}
+	firstFollowup := pinnedFindRequest(t, requests, func(request map[string]any) bool {
+		return pinnedRequestContains(request, firstCallID) && !pinnedRequestContains(request, secondPrompt)
+	}, "adopted MCP tool follow-up")
+	assertPinnedToolOutput(t, firstFollowup, firstCallID, "alice")
+	secondInitial := pinnedFindRequest(t, requests, func(request map[string]any) bool {
+		return pinnedRequestContains(request, secondPrompt) && !pinnedRequestContains(request, secondCallID)
+	}, "cold-resume MCP initial request")
+	if _, err := pinnedManagedListPeersNamespace(secondInitial); err != nil {
+		t.Fatal(err)
+	}
+	secondFollowup := pinnedFindRequest(t, requests, func(request map[string]any) bool {
+		return pinnedRequestContains(request, secondCallID)
+	}, "cold-resume MCP tool follow-up")
+	assertPinnedToolOutput(t, secondFollowup, secondCallID, "alice")
+	if got := recorder.listCount(); got != 2 {
+		t.Fatalf("validated MCP list_peers broker calls = %d, want 2", got)
+	}
+}
+
+func materializePinnedInteractiveSession(
+	t *testing.T,
+	codexBin, codexHome, cwd, endpoint, prompt, completionMarker string,
+) {
+	t.Helper()
+	scriptBin, err := exec.LookPath("script")
+	if err != nil {
+		t.Fatalf("locate script(1) for the Codex TUI smoke test: %v", err)
+	}
+	wrapper := filepath.Join(filepath.Dir(codexHome), "run-codex-tui.sh")
+	wrapperBody := `#!/bin/sh
+exec "$CODEX_SMOKE_BIN" --remote "$CODEX_SMOKE_ENDPOINT" --no-alt-screen --cd "$CODEX_SMOKE_CWD" "$CODEX_SMOKE_PROMPT"
+`
+	if err := os.WriteFile(wrapper, []byte(wrapperBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(scriptBin, "-qefc", wrapper, "/dev/null")
+	cmd.Env = pinnedProcessEnv(os.Environ(), map[string]string{
+		"CODEX_HOME":                           codexHome,
+		"CODEX_APP_SERVER_MANAGED_CONFIG_PATH": filepath.Join(codexHome, "managed_config.toml"),
+		"CODEX_SMOKE_BIN":                      codexBin,
+		"CODEX_SMOKE_ENDPOINT":                 endpoint,
+		"CODEX_SMOKE_CWD":                      cwd,
+		"CODEX_SMOKE_PROMPT":                   prompt,
+		"TERM":                                 "xterm-256color",
+		"NO_PROXY":                             "127.0.0.1,localhost",
+		"no_proxy":                             "127.0.0.1,localhost",
+	})
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start Codex TUI through script(1): %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	stopped := false
+	defer func() {
+		_ = stdin.Close()
+		if stopped || cmd.Process == nil {
+			return
+		}
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for !pinnedTreeContains(codexHome, completionMarker) {
+		select {
+		case processErr := <-done:
+			stopped = true
+			t.Fatalf("Codex TUI exited before materializing an interactive session: %v\n%s", processErr, output.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for Codex TUI to materialize an interactive session\n%s", output.String())
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// The rollout is complete at this point. Terminate the scripted frontend so
+	// adoption begins only after the ordinary TUI no longer owns the session.
+	_ = stdin.Close()
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	select {
+	case <-done:
+		stopped = true
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Codex TUI process group did not stop after SIGKILL\n%s", output.String())
+	}
+}
+
+func pinnedTreeContains(root, marker string) bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || found || entry.IsDir() {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && bytes.Contains(data, []byte(marker)) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func readPinnedInteractiveSession(t *testing.T, client *appserver.Client, cwd string) appserver.Thread {
+	t.Helper()
+	limit := uint32(10)
+	archived := false
+	listed := callPinned(t, func(ctx context.Context) (appserver.ThreadListResponse, error) {
+		return client.ThreadList(ctx, appserver.ThreadListParams{
+			Limit:       &limit,
+			CWD:         cwd,
+			SourceKinds: []appserver.ThreadSourceKind{appserver.ThreadSourceCLI, appserver.ThreadSourceVSCode},
+			Archived:    &archived,
+		})
+	})
+	for _, candidate := range listed.Data {
+		thread := readPinnedThread(t, client, candidate.ID)
+		if pinnedThreadHasCompletedTurn(thread) {
+			return thread
+		}
+	}
+	t.Fatalf("Codex TUI did not create a materialized interactive session: %#v", listed.Data)
+	return appserver.Thread{}
+}
+
+func pinnedThreadHasCompletedTurn(thread appserver.Thread) bool {
+	for _, turn := range thread.Turns {
+		if turn.Status == appserver.TurnStatusCompleted {
+			return true
+		}
+	}
+	return false
+}
+
+type pinnedAdoptionController struct {
+	cancel context.CancelFunc
+	done   <-chan error
+	broker *pinnedAdoptionBroker
+	info   ReadyInfo
+}
+
+func startPinnedAdoptionController(t *testing.T, cfg Config) pinnedAdoptionController {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	ready := make(chan ReadyInfo, 1)
+	brokers := make(chan *pinnedAdoptionBroker, 1)
+	newBroker := cfg.newBroker
+	cfg.newBroker = func(opts brokerclient.ClientOptions) brokerConnection {
+		broker := newBroker(opts).(*pinnedAdoptionBroker)
+		brokers <- broker
+		return broker
+	}
+	cfg.OnReady = func(info ReadyInfo) error {
+		ready <- info
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg) }()
+
+	var broker *pinnedAdoptionBroker
+	select {
+	case broker = <-brokers:
+	case err := <-done:
+		cancel()
+		t.Fatalf("adoption controller exited before broker creation: %v", err)
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("timeout waiting for adoption controller broker")
+	}
+	select {
+	case info := <-ready:
+		return pinnedAdoptionController{cancel: cancel, done: done, broker: broker, info: info}
+	case err := <-done:
+		cancel()
+		t.Fatalf("adoption controller exited before readiness: %v", err)
+	case <-time.After(15 * time.Second):
+		cancel()
+		t.Fatal("timeout waiting for adoption controller readiness")
+	}
+	return pinnedAdoptionController{}
+}
+
+func (c pinnedAdoptionController) stop(t *testing.T) {
+	t.Helper()
+	c.cancel()
+	select {
+	case err := <-c.done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("adoption controller shutdown = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout stopping adoption controller")
+	}
+}
+
+type pinnedAdoptionBrokerRecorder struct {
+	mu    sync.Mutex
+	peers []string
+	lists int
+	calls chan struct{}
+}
+
+func newPinnedAdoptionBrokerRecorder(peers []string) *pinnedAdoptionBrokerRecorder {
+	return &pinnedAdoptionBrokerRecorder{peers: append([]string(nil), peers...), calls: make(chan struct{}, 8)}
+}
+
+func (r *pinnedAdoptionBrokerRecorder) newConnection(opts brokerclient.ClientOptions) brokerConnection {
+	return &pinnedAdoptionBroker{opts: opts, recorder: r, events: make(chan brokerclient.ConnectionEvent)}
+}
+
+func (r *pinnedAdoptionBrokerRecorder) recordList() []string {
+	r.mu.Lock()
+	r.lists++
+	peers := append([]string(nil), r.peers...)
+	r.mu.Unlock()
+	r.calls <- struct{}{}
+	return peers
+}
+
+func (r *pinnedAdoptionBrokerRecorder) waitForLists(t *testing.T, want int, controllerDone <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for r.listCount() < want {
+		select {
+		case <-r.calls:
+		case err := <-controllerDone:
+			t.Fatalf("adoption controller exited while waiting for %d MCP list_peers calls: %v", want, err)
+		case <-deadline.C:
+			t.Fatalf("timeout waiting for %d MCP list_peers calls; got %d", want, r.listCount())
+		}
+	}
+}
+
+func (r *pinnedAdoptionBrokerRecorder) listCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lists
+}
+
+type pinnedAdoptionBroker struct {
+	opts     brokerclient.ClientOptions
+	recorder *pinnedAdoptionBrokerRecorder
+	events   chan brokerclient.ConnectionEvent
+}
+
+func (b *pinnedAdoptionBroker) Connect(context.Context) error { return nil }
+func (b *pinnedAdoptionBroker) Close() error                  { return nil }
+func (b *pinnedAdoptionBroker) Send(context.Context, string, string) (wire.SendAck, error) {
+	return wire.SendAck{}, errors.New("send_message is not used by the adoption E2E")
+}
+func (b *pinnedAdoptionBroker) ListPeers(context.Context) ([]string, error) {
+	return b.recorder.recordList(), nil
+}
+func (b *pinnedAdoptionBroker) ConnectionEvents() <-chan brokerclient.ConnectionEvent {
+	return b.events
+}
+func (b *pinnedAdoptionBroker) deliver(delivery wire.Deliver) { b.opts.OnDeliver(delivery) }
+
+func pinnedManagedListPeersNamespace(request map[string]any) (string, error) {
+	tools, ok := request["tools"].([]any)
+	if !ok {
+		return "", fmt.Errorf("Responses request tools = %#v", request["tools"])
+	}
+	for _, value := range tools {
+		tool, _ := value.(map[string]any)
+		namespace, _ := tool["name"].(string)
+		if tool["type"] != "namespace" || !strings.Contains(namespace, managedMCPServerName) {
+			continue
+		}
+		members, _ := tool["tools"].([]any)
+		for _, memberValue := range members {
+			member, _ := memberValue.(map[string]any)
+			if member["name"] == intercomtools.ListPeersName {
+				return namespace, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("Responses request did not advertise managed list_peers: %#v", tools)
+}
+
+func pinnedRequestAdvertisesTool(request map[string]any, name string) bool {
+	tools, _ := request["tools"].([]any)
+	for _, value := range tools {
+		tool, _ := value.(map[string]any)
+		if tool["name"] == name {
+			return true
+		}
+		members, _ := tool["tools"].([]any)
+		for _, memberValue := range members {
+			member, _ := memberValue.(map[string]any)
+			if member["name"] == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pinnedThreadSource(raw json.RawMessage) string {
+	var source string
+	_ = json.Unmarshal(raw, &source)
+	return source
+}
+
+func assertPinnedManagedMCPStatus(t *testing.T, client *appserver.Client, threadID string) {
+	t.Helper()
+	detail := appserver.MCPServerStatusToolsAndAuthOnly
+	status := callPinned(t, func(ctx context.Context) (appserver.MCPServerStatusListResponse, error) {
+		return client.MCPServerStatusList(ctx, appserver.MCPServerStatusListParams{
+			ThreadID: &threadID,
+			Detail:   &detail,
+		})
+	})
+	for _, server := range status.Data {
+		if server.Name != managedMCPServerName {
+			continue
+		}
+		if _, ok := server.Tools[intercomtools.SendMessageName]; !ok {
+			t.Fatalf("managed MCP status omits send_message: %#v", server)
+		}
+		if _, ok := server.Tools[intercomtools.ListPeersName]; !ok {
+			t.Fatalf("managed MCP status omits list_peers: %#v", server)
+		}
+		return
+	}
+	t.Fatalf("managed MCP status is absent for thread %s: %#v", threadID, status.Data)
+}
+
+func waitPinnedCompletedTurnCount(t *testing.T, client *appserver.Client, threadID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		thread := readPinnedThread(t, client, threadID)
+		completed := 0
+		for _, turn := range thread.Turns {
+			if turn.Status == appserver.TurnStatusCompleted {
+				completed++
+			}
+		}
+		if completed >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("thread %s has %d completed turns, want at least %d: %#v", threadID, completed, want, thread.Turns)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 type pinnedResponsesServer struct {

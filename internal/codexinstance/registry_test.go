@@ -179,6 +179,42 @@ func TestPublishLoadRemoveRoundTripAndModes(t *testing.T) {
 	}
 }
 
+func TestLoadNormalizesSchemaOneWorkspaceWriteDescriptor(t *testing.T) {
+	t.Parallel()
+	r, root := newTestRegistry(t)
+	r.processAlive = func(int) (bool, error) { return true, nil }
+	d := validDescriptor(t, root)
+	path, err := r.Path(d.BrokerSocketIdentity, d.Peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]any{
+		"schemaVersion":          1,
+		"peer":                   d.Peer,
+		"cwd":                    d.CWD,
+		"brokerSocketIdentity":   d.BrokerSocketIdentity,
+		"downstreamUnixEndpoint": d.DownstreamUnixEndpoint,
+		"threadId":               d.ThreadID,
+		"pid":                    d.PID,
+		"instanceNonce":          d.InstanceNonce,
+		"codexVersion":           d.CodexVersion,
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Load(d.BrokerSocketIdentity, d.Peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.SchemaVersion != SchemaVersion || got.ExecutionPolicy != ExecutionWorkspaceWrite {
+		t.Fatalf("normalized descriptor = %#v", got)
+	}
+}
+
 func TestPublishCleansDescriptorWhenDirectorySyncFailsAfterRename(t *testing.T) {
 	t.Parallel()
 	r, root := newTestRegistry(t)

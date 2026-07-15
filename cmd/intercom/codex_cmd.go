@@ -13,18 +13,28 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/dpemmons/intercom/internal/appserver"
 	"github.com/dpemmons/intercom/internal/codex"
 	"github.com/dpemmons/intercom/internal/codexinstance"
+	"github.com/dpemmons/intercom/internal/codexsession"
 	"github.com/dpemmons/intercom/internal/paths"
 	"github.com/dpemmons/intercom/internal/peername"
 )
 
 type codexRunner func(context.Context, codex.Config) error
 type processExec func(string, []string, []string) error
+type codexSessionDialer func(context.Context, string, appserver.Options) (codexSessionClient, error)
+
+type codexSessionClient interface {
+	codexsession.Client
+	Initialize(context.Context, appserver.InitializeParams) (appserver.InitializeResponse, error)
+	Initialized(context.Context) error
+	Close() error
+}
 
 const codexBinEnv = "CODEX_BIN"
 
@@ -40,9 +50,14 @@ func newCodexCmdWithDependencies(run codexRunner, replaceProcess processExec) *c
 	var (
 		appServer      string
 		clientEndpoint string
+		mcpBridge      string
 		name           string
 		cwd            string
 		fresh          bool
+		adoptSession   string
+		forkSession    string
+		replaceBinding bool
+		yolo           bool
 	)
 
 	cmd := &cobra.Command{
@@ -78,6 +93,18 @@ func newCodexCmdWithDependencies(run codexRunner, replaceProcess processExec) *c
 			if err != nil {
 				return fmt.Errorf("codex: %w", err)
 			}
+			intercomBin, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("codex: locate intercom executable: %w", err)
+			}
+			intercomBin, err = filepath.Abs(intercomBin)
+			if err != nil {
+				return fmt.Errorf("codex: resolve intercom executable: %w", err)
+			}
+			executionPolicy := codex.ExecutionWorkspaceWrite
+			if yolo {
+				executionPolicy = codex.ExecutionDangerFullAccess
+			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 			defer stop()
@@ -88,15 +115,21 @@ func newCodexCmdWithDependencies(run codexRunner, replaceProcess processExec) *c
 				CWD:               selectedCWD,
 				AppServerEndpoint: endpoint,
 				ClientEndpoint:    client,
+				MCPBridgeSocket:   mcpBridge,
+				IntercomBin:       intercomBin,
 				BrokerSocket:      brokerSocket,
 				BrokerBin:         brokerBin,
 				New:               fresh,
+				AdoptThreadID:     adoptSession,
+				ForkThreadID:      forkSession,
+				ReplaceBinding:    replaceBinding,
+				ExecutionPolicy:   executionPolicy,
 				Logger:            slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil)),
 			}
 
 			var publication *codexPublication
 			if client != "" {
-				publication, err = newCodexPublication(peer, selectedCWD, brokerSocket, client, cmd.OutOrStdout())
+				publication, err = newCodexPublication(peer, selectedCWD, brokerSocket, client, executionPolicy, cmd.OutOrStdout())
 				if err != nil {
 					return err
 				}
@@ -116,32 +149,39 @@ func newCodexCmdWithDependencies(run codexRunner, replaceProcess processExec) *c
 	}
 	cmd.Flags().StringVar(&appServer, "app-server", "", "absolute app-server Unix socket endpoint or path")
 	cmd.Flags().StringVar(&clientEndpoint, "client-endpoint", "", "absolute Unix socket endpoint or path exposed to Codex clients")
+	cmd.Flags().StringVar(&mcpBridge, "mcp-bridge", "", "absolute private Unix socket path for managed-session MCP tools")
 	cmd.Flags().StringVar(&name, "name", "", "peer name (default: INTERCOM_NAME, then cwd basename)")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "managed project directory (default: current directory)")
 	cmd.Flags().BoolVar(&fresh, "new", false, "start a new managed thread and replace the saved binding")
+	cmd.Flags().StringVar(&adoptSession, "adopt-session", "", "adopt an existing interactive Codex session by thread id")
+	cmd.Flags().StringVar(&forkSession, "fork-session", "", "fork an existing interactive Codex session by thread id")
+	cmd.Flags().BoolVar(&replaceBinding, "replace-binding", false, "replace an existing peer binding during adoption or fork")
+	cmd.Flags().BoolVar(&yolo, "yolo", false, "run all managed turns without approvals or a Codex sandbox")
+	cmd.Flags().BoolVar(&yolo, "dangerously-bypass-approvals-and-sandbox", false, "run all managed turns without approvals or a Codex sandbox")
 	if err := cmd.MarkFlagRequired("app-server"); err != nil {
 		panic(err)
 	}
-	cmd.AddCommand(newCodexAttachCmd(replaceProcess))
+	cmd.AddCommand(newCodexAttachCmd(replaceProcess), newCodexSessionsCmd())
 	return cmd
 }
 
 type codexPublication struct {
-	registry       *codexinstance.Registry
-	peer           string
-	cwd            string
-	intercomDir    string
-	intercomBin    string
-	brokerSocket   string
-	clientEndpoint string
-	codexBin       string
-	codexHome      string
-	nonce          string
-	output         io.Writer
-	published      bool
+	registry        *codexinstance.Registry
+	peer            string
+	cwd             string
+	intercomDir     string
+	intercomBin     string
+	brokerSocket    string
+	clientEndpoint  string
+	codexBin        string
+	codexHome       string
+	executionPolicy codex.ExecutionPolicy
+	nonce           string
+	output          io.Writer
+	published       bool
 }
 
-func newCodexPublication(peer, cwd, brokerSocket, clientEndpoint string, output io.Writer) (*codexPublication, error) {
+func newCodexPublication(peer, cwd, brokerSocket, clientEndpoint string, executionPolicy codex.ExecutionPolicy, output io.Writer) (*codexPublication, error) {
 	intercomDir, err := paths.Dir()
 	if err != nil {
 		return nil, fmt.Errorf("codex: resolve runtime directory: %w", err)
@@ -187,17 +227,18 @@ func newCodexPublication(peer, cwd, brokerSocket, clientEndpoint string, output 
 		return nil, err
 	}
 	return &codexPublication{
-		registry:       registry,
-		peer:           peer,
-		cwd:            cwd,
-		intercomDir:    intercomDir,
-		intercomBin:    intercomBin,
-		brokerSocket:   brokerSocket,
-		clientEndpoint: clientEndpoint,
-		codexBin:       codexBin,
-		codexHome:      codexHome,
-		nonce:          nonce,
-		output:         output,
+		registry:        registry,
+		peer:            peer,
+		cwd:             cwd,
+		intercomDir:     intercomDir,
+		intercomBin:     intercomBin,
+		brokerSocket:    brokerSocket,
+		clientEndpoint:  clientEndpoint,
+		codexBin:        codexBin,
+		codexHome:       codexHome,
+		executionPolicy: executionPolicy,
+		nonce:           nonce,
+		output:          output,
 	}, nil
 }
 
@@ -244,6 +285,9 @@ func (p *codexPublication) publish(info codex.ReadyInfo) error {
 	if readyEndpoint != p.clientEndpoint {
 		return fmt.Errorf("ready client endpoint %q does not match configured endpoint %q", readyEndpoint, p.clientEndpoint)
 	}
+	if info.ExecutionPolicy != p.executionPolicy {
+		return fmt.Errorf("ready execution policy %q does not match configured policy %q", info.ExecutionPolicy, p.executionPolicy)
+	}
 
 	descriptor := codexinstance.Descriptor{
 		SchemaVersion:          codexinstance.SchemaVersion,
@@ -255,6 +299,7 @@ func (p *codexPublication) publish(info codex.ReadyInfo) error {
 		PID:                    os.Getpid(),
 		InstanceNonce:          p.nonce,
 		CodexVersion:           info.CodexVersion,
+		ExecutionPolicy:        codexinstance.ExecutionPolicy(info.ExecutionPolicy),
 	}
 	if _, err := p.registry.Publish(descriptor); err != nil {
 		return fmt.Errorf("publish live instance: %w", err)
@@ -263,6 +308,7 @@ func (p *codexPublication) publish(info codex.ReadyInfo) error {
 
 	if _, err := fmt.Fprintf(p.output, readinessText,
 		p.peer,
+		p.executionPolicy,
 		p.attachCommand(),
 		p.directCommand(info.ThreadID),
 	); err != nil {
@@ -291,9 +337,12 @@ func (p *codexPublication) directCommand(threadID string) string {
 		parts = append(parts, "CODEX_HOME="+shellQuote(p.codexHome))
 	}
 	parts = append(parts,
-		shellCommandWord(p.codexBin),
-		"resume", "--remote", shellQuote(p.clientEndpoint), shellQuote(threadID),
+		shellCommandWord(p.codexBin), "resume",
 	)
+	if p.executionPolicy.IsYolo() {
+		parts = append(parts, "--dangerously-bypass-approvals-and-sandbox")
+	}
+	parts = append(parts, "--remote", shellQuote(p.clientEndpoint), shellQuote(threadID))
 	return strings.Join(parts, " ")
 }
 
@@ -331,6 +380,7 @@ func (p *codexPublication) remove() error {
 }
 
 const readinessText = `Intercom Codex peer %s is ready.
+Execution policy: %s
 
 Attach from another terminal:
   %s
@@ -338,6 +388,105 @@ Attach from another terminal:
 Direct Codex command:
   %s
 `
+
+func newCodexSessionsCmd() *cobra.Command {
+	return newCodexSessionsCmdWithDependencies(
+		func(ctx context.Context, endpoint string, opts appserver.Options) (codexSessionClient, error) {
+			return appserver.DialUnix(ctx, endpoint, opts)
+		},
+		isTerminalInput,
+	)
+}
+
+func newCodexSessionsCmdWithDependencies(dial codexSessionDialer, terminalInput func(io.Reader) bool) *cobra.Command {
+	var (
+		appServer string
+		cwd       string
+		all       bool
+		listOnly  bool
+	)
+	cmd := &cobra.Command{
+		Use:   "sessions",
+		Short: "Lists or selects resumable interactive Codex sessions",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			endpoint, err := normalizeAppServerEndpoint(appServer)
+			if err != nil {
+				return err
+			}
+			selectedCWD, err := absoluteCWD(cwd)
+			if err != nil {
+				return err
+			}
+			selectedCWD, err = canonicalExistingDirectory(selectedCWD)
+			if err != nil {
+				return fmt.Errorf("codex sessions: canonicalize project directory: %w", err)
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+			defer cancel()
+			client, err := dial(ctx, endpoint, appserver.Options{})
+			if err != nil {
+				return fmt.Errorf("codex sessions: connect app-server: %w", err)
+			}
+			defer client.Close()
+			if _, err := client.Initialize(ctx, appserver.InitializeParams{
+				ClientInfo:   appserver.ClientInfo{Name: "intercom_session_picker", Version: version},
+				Capabilities: &appserver.InitializeCapabilities{ExperimentalAPI: true},
+			}); err != nil {
+				return fmt.Errorf("codex sessions: initialize app-server: %w", err)
+			}
+			if err := client.Initialized(ctx); err != nil {
+				return fmt.Errorf("codex sessions: complete app-server initialization: %w", err)
+			}
+			candidates, err := codexsession.List(ctx, client, codexsession.Options{CWD: selectedCWD, AllCWDs: all})
+			if err != nil {
+				return err
+			}
+			if listOnly {
+				for _, candidate := range candidates {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n",
+						candidate.Thread.ID,
+						candidate.Recency().UTC().Format(time.RFC3339),
+						codexsession.SanitizeDisplay(candidate.Thread.CWD, 0),
+						codexsession.SanitizeDisplay(candidate.Title(), 100),
+					); err != nil {
+						return fmt.Errorf("codex sessions: write list: %w", err)
+					}
+				}
+				return nil
+			}
+			if !terminalInput(cmd.InOrStdin()) {
+				return errors.New("codex sessions: interactive selection requires a terminal; supply an explicit session id")
+			}
+			candidate, err := codexsession.Pick(cmd.InOrStdin(), cmd.ErrOrStderr(), candidates)
+			if err != nil {
+				return err
+			}
+			if candidate.Thread.CWD != selectedCWD {
+				return fmt.Errorf("codex sessions: selected session cwd is %q; rerun with --cwd %q", candidate.Thread.CWD, candidate.Thread.CWD)
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), candidate.Thread.ID)
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&appServer, "app-server", "", "absolute app-server Unix socket endpoint or path")
+	cmd.Flags().StringVar(&cwd, "cwd", "", "project directory used to filter sessions")
+	cmd.Flags().BoolVar(&all, "all", false, "include interactive sessions from every working directory")
+	cmd.Flags().BoolVar(&listOnly, "list", false, "write all matching sessions without prompting")
+	if err := cmd.MarkFlagRequired("app-server"); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+func isTerminalInput(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
 
 func newCodexAttachCmd(replaceProcess processExec) *cobra.Command {
 	var name string
@@ -389,10 +538,11 @@ func newCodexAttachCmd(replaceProcess processExec) *cobra.Command {
 			argv := []string{
 				codexBin,
 				"resume",
-				"--remote",
-				descriptor.DownstreamUnixEndpoint,
-				descriptor.ThreadID,
 			}
+			if descriptor.ExecutionPolicy == codexinstance.ExecutionDangerFullAccess {
+				argv = append(argv, "--dangerously-bypass-approvals-and-sandbox")
+			}
+			argv = append(argv, "--remote", descriptor.DownstreamUnixEndpoint, descriptor.ThreadID)
 			return replaceProcessInDirectory(descriptor.CWD, executable, argv, os.Environ(), replaceProcess)
 		},
 	}

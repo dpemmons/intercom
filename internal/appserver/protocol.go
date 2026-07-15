@@ -1,6 +1,5 @@
-// Package appserver implements the small Codex app-server protocol surface
-// used by Intercom. The wire shapes in this file originate from codex-cli
-// 0.144.1's experimental generated schema.
+// Package appserver implements the Codex app-server protocol surface used by
+// Intercom. Wire shapes track Codex's experimental generated schema.
 //
 // Codex app-server uses JSON-RPC-shaped messages without the "jsonrpc":"2.0"
 // member. Unknown object fields are intentionally ignored by encoding/json so
@@ -22,14 +21,17 @@ const MinimumSupportedVersion = "0.144.1"
 
 // Method names used by the minimal managed-thread client.
 const (
-	MethodInitialize        = "initialize"
-	MethodInitialized       = "initialized"
-	MethodThreadStart       = "thread/start"
-	MethodThreadResume      = "thread/resume"
-	MethodThreadRead        = "thread/read"
-	MethodThreadUnsubscribe = "thread/unsubscribe"
-	MethodTurnStart         = "turn/start"
-	MethodTurnInterrupt     = "turn/interrupt"
+	MethodInitialize          = "initialize"
+	MethodInitialized         = "initialized"
+	MethodThreadStart         = "thread/start"
+	MethodThreadResume        = "thread/resume"
+	MethodThreadFork          = "thread/fork"
+	MethodThreadList          = "thread/list"
+	MethodThreadRead          = "thread/read"
+	MethodThreadUnsubscribe   = "thread/unsubscribe"
+	MethodTurnStart           = "turn/start"
+	MethodTurnInterrupt       = "turn/interrupt"
+	MethodMCPServerStatusList = "mcpServerStatus/list"
 )
 
 // Reverse request methods consumed by Intercom.
@@ -50,12 +52,13 @@ const (
 // Lifecycle notifications used by the managed-thread controller. Other
 // notification methods remain available through Notification's raw payload.
 const (
-	NotificationError         = "error"
-	NotificationThreadStarted = "thread/started"
-	NotificationTurnStarted   = "turn/started"
-	NotificationTurnCompleted = "turn/completed"
-	NotificationItemStarted   = "item/started"
-	NotificationItemCompleted = "item/completed"
+	NotificationError                         = "error"
+	NotificationThreadStarted                 = "thread/started"
+	NotificationTurnStarted                   = "turn/started"
+	NotificationTurnCompleted                 = "turn/completed"
+	NotificationItemStarted                   = "item/started"
+	NotificationItemCompleted                 = "item/completed"
+	NotificationMCPServerStartupStatusUpdated = "mcpServer/startupStatus/updated"
 )
 
 const (
@@ -279,6 +282,77 @@ type ThreadResumeParams struct {
 	ExcludeTurns          bool               `json:"excludeTurns,omitempty"`
 }
 
+// ThreadForkParams describes a non-destructive copy of a materialized thread.
+// ThreadID is preferred over Path; a non-empty Path takes precedence when both
+// are present, as specified by app-server.
+type ThreadForkParams struct {
+	ThreadID              string             `json:"threadId"`
+	LastTurnID            *string            `json:"lastTurnId,omitempty"`
+	Path                  *string            `json:"path,omitempty"`
+	Model                 *string            `json:"model,omitempty"`
+	ModelProvider         *string            `json:"modelProvider,omitempty"`
+	ServiceTier           *string            `json:"serviceTier,omitempty"`
+	CWD                   *string            `json:"cwd,omitempty"`
+	RuntimeWorkspaceRoots []string           `json:"runtimeWorkspaceRoots,omitempty"`
+	ApprovalPolicy        any                `json:"approvalPolicy,omitempty"`
+	ApprovalsReviewer     *ApprovalsReviewer `json:"approvalsReviewer,omitempty"`
+	Sandbox               *SandboxMode       `json:"sandbox,omitempty"`
+	Permissions           *string            `json:"permissions,omitempty"`
+	Config                map[string]any     `json:"config,omitempty"`
+	BaseInstructions      *string            `json:"baseInstructions,omitempty"`
+	DeveloperInstructions *string            `json:"developerInstructions,omitempty"`
+	Ephemeral             bool               `json:"ephemeral,omitempty"`
+	ThreadSource          *string            `json:"threadSource,omitempty"`
+	ExcludeTurns          bool               `json:"excludeTurns,omitempty"`
+}
+
+type ThreadSortKey string
+
+const (
+	ThreadSortCreatedAt ThreadSortKey = "created_at"
+	ThreadSortUpdatedAt ThreadSortKey = "updated_at"
+	ThreadSortRecencyAt ThreadSortKey = "recency_at"
+)
+
+type SortDirection string
+
+const (
+	SortAscending  SortDirection = "asc"
+	SortDescending SortDirection = "desc"
+)
+
+type ThreadSourceKind string
+
+const (
+	ThreadSourceCLI                 ThreadSourceKind = "cli"
+	ThreadSourceVSCode              ThreadSourceKind = "vscode"
+	ThreadSourceExec                ThreadSourceKind = "exec"
+	ThreadSourceAppServer           ThreadSourceKind = "appServer"
+	ThreadSourceSubAgent            ThreadSourceKind = "subAgent"
+	ThreadSourceSubAgentReview      ThreadSourceKind = "subAgentReview"
+	ThreadSourceSubAgentCompact     ThreadSourceKind = "subAgentCompact"
+	ThreadSourceSubAgentThreadSpawn ThreadSourceKind = "subAgentThreadSpawn"
+	ThreadSourceSubAgentOther       ThreadSourceKind = "subAgentOther"
+	ThreadSourceUnknown             ThreadSourceKind = "unknown"
+)
+
+// ThreadListParams mirrors the app-server list filters. CWD accepts either a
+// string or []string, matching the protocol's ThreadListCwdFilter union.
+type ThreadListParams struct {
+	Cursor           *string            `json:"cursor,omitempty"`
+	Limit            *uint32            `json:"limit,omitempty"`
+	SortKey          *ThreadSortKey     `json:"sortKey,omitempty"`
+	SortDirection    *SortDirection     `json:"sortDirection,omitempty"`
+	ModelProviders   []string           `json:"modelProviders,omitempty"`
+	SourceKinds      []ThreadSourceKind `json:"sourceKinds,omitempty"`
+	Archived         *bool              `json:"archived,omitempty"`
+	CWD              any                `json:"cwd,omitempty"`
+	UseStateDBOnly   bool               `json:"useStateDbOnly,omitempty"`
+	SearchTerm       *string            `json:"searchTerm,omitempty"`
+	ParentThreadID   *string            `json:"parentThreadId,omitempty"`
+	AncestorThreadID *string            `json:"ancestorThreadId,omitempty"`
+}
+
 type ThreadReadParams struct {
 	ThreadID     string `json:"threadId"`
 	IncludeTurns bool   `json:"includeTurns,omitempty"`
@@ -347,8 +421,111 @@ type ThreadResumeResponse struct {
 	InitialTurnsPage json.RawMessage `json:"initialTurnsPage"`
 }
 
+type ThreadForkResponse struct{ ThreadResponse }
+
+type ThreadListResponse struct {
+	Data            []Thread `json:"data"`
+	NextCursor      *string  `json:"nextCursor"`
+	BackwardsCursor *string  `json:"backwardsCursor"`
+}
+
 type ThreadReadResponse struct {
 	Thread Thread `json:"thread"`
+}
+
+type MCPServerStatusDetail string
+
+const (
+	MCPServerStatusFull             MCPServerStatusDetail = "full"
+	MCPServerStatusToolsAndAuthOnly MCPServerStatusDetail = "toolsAndAuthOnly"
+)
+
+type MCPAuthStatus string
+
+const (
+	MCPAuthUnsupported MCPAuthStatus = "unsupported"
+	MCPAuthNotLoggedIn MCPAuthStatus = "notLoggedIn"
+	MCPAuthBearerToken MCPAuthStatus = "bearerToken"
+	MCPAuthOAuth       MCPAuthStatus = "oAuth"
+)
+
+type MCPServerStatusListParams struct {
+	Cursor   *string                `json:"cursor,omitempty"`
+	Limit    *uint32                `json:"limit,omitempty"`
+	Detail   *MCPServerStatusDetail `json:"detail,omitempty"`
+	ThreadID *string                `json:"threadId,omitempty"`
+}
+
+type MCPServerInfo struct {
+	Name        string            `json:"name"`
+	Title       *string           `json:"title"`
+	Version     string            `json:"version"`
+	Description *string           `json:"description"`
+	Icons       []json.RawMessage `json:"icons"`
+	WebsiteURL  *string           `json:"websiteUrl"`
+}
+
+type MCPTool struct {
+	Name         string            `json:"name"`
+	Title        *string           `json:"title,omitempty"`
+	Description  *string           `json:"description,omitempty"`
+	InputSchema  json.RawMessage   `json:"inputSchema"`
+	OutputSchema json.RawMessage   `json:"outputSchema,omitempty"`
+	Annotations  json.RawMessage   `json:"annotations,omitempty"`
+	Icons        []json.RawMessage `json:"icons,omitempty"`
+	Meta         json.RawMessage   `json:"_meta,omitempty"`
+}
+
+type MCPResource struct {
+	Annotations json.RawMessage   `json:"annotations,omitempty"`
+	Description *string           `json:"description,omitempty"`
+	MIMEType    *string           `json:"mimeType,omitempty"`
+	Name        string            `json:"name"`
+	Size        *int64            `json:"size,omitempty"`
+	Title       *string           `json:"title,omitempty"`
+	URI         string            `json:"uri"`
+	Icons       []json.RawMessage `json:"icons,omitempty"`
+	Meta        json.RawMessage   `json:"_meta,omitempty"`
+}
+
+type MCPResourceTemplate struct {
+	Annotations json.RawMessage `json:"annotations,omitempty"`
+	URITemplate string          `json:"uriTemplate"`
+	Name        string          `json:"name"`
+	Title       *string         `json:"title,omitempty"`
+	Description *string         `json:"description,omitempty"`
+	MIMEType    *string         `json:"mimeType,omitempty"`
+}
+
+type MCPServerStatus struct {
+	Name              string                `json:"name"`
+	ServerInfo        *MCPServerInfo        `json:"serverInfo"`
+	Tools             map[string]MCPTool    `json:"tools"`
+	Resources         []MCPResource         `json:"resources"`
+	ResourceTemplates []MCPResourceTemplate `json:"resourceTemplates"`
+	AuthStatus        MCPAuthStatus         `json:"authStatus"`
+}
+
+type MCPServerStatusListResponse struct {
+	Data       []MCPServerStatus `json:"data"`
+	NextCursor *string           `json:"nextCursor"`
+}
+
+type MCPServerStartupState string
+
+const (
+	MCPServerStarting  MCPServerStartupState = "starting"
+	MCPServerReady     MCPServerStartupState = "ready"
+	MCPServerFailed    MCPServerStartupState = "failed"
+	MCPServerCancelled MCPServerStartupState = "cancelled"
+)
+
+type MCPServerStatusUpdatedNotification struct {
+	ThreadID      *string               `json:"threadId"`
+	Name          string                `json:"name"`
+	Status        MCPServerStartupState `json:"status"`
+	Error         *string               `json:"error"`
+	FailureReason *string               `json:"failureReason"`
 }
 
 type TextElement struct {

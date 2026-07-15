@@ -3,6 +3,7 @@ package paths
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -99,5 +100,49 @@ func TestCodexPaths(t *testing.T) {
 	}
 	if want := filepath.Join(dir, "reviewer.lock"); lock != want {
 		t.Fatalf("CodexLock() = %q, want %q", lock, want)
+	}
+	codexHome := filepath.Join(t.TempDir(), "codex-home")
+	threadLock, err := CodexThreadLock(codexHome, "019-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := CodexThreadLock(codexHome, "019-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := CodexThreadLock(codexHome, "020-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if threadLock != again || threadLock == other || filepath.Dir(threadLock) != filepath.Join(codexHome, ".intercom", "thread-locks") {
+		t.Fatalf("CodexThreadLock() paths = %q, %q, %q", threadLock, again, other)
+	}
+
+	t.Setenv("INTERCOM_DIR", t.TempDir())
+	acrossIntercomDirs, err := CodexThreadLock(codexHome, "019-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acrossIntercomDirs != threadLock {
+		t.Fatalf("CodexThreadLock() changed with INTERCOM_DIR: %q, want %q", acrossIntercomDirs, threadLock)
+	}
+}
+
+func TestCodexThreadLockRejectsIncompleteIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		codexHome string
+		threadID  string
+		wantError string
+	}{
+		{name: "empty home", threadID: "thread", wantError: "requires CODEX_HOME"},
+		{name: "empty thread", codexHome: filepath.Join(t.TempDir(), "codex-home"), wantError: "requires CODEX_HOME"},
+		{name: "relative home", codexHome: "codex-home", threadID: "thread", wantError: "must be absolute"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := CodexThreadLock(test.codexHome, test.threadID); err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("CodexThreadLock() error = %v, want fragment %q", err, test.wantError)
+			}
+		})
 	}
 }

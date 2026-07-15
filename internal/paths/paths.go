@@ -3,6 +3,7 @@
 package paths
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -107,4 +108,24 @@ func CodexLock(peer string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(d, peer+".lock"), nil
+}
+
+// CodexThreadLock returns a process-lifetime lock path shared by every
+// Intercom peer that targets the same Codex thread. The lock lives below
+// CODEX_HOME so separate Intercom runtime directories use the same ownership
+// namespace. Codex itself does not honor this lock; it prevents only two
+// Intercom controllers from managing one thread concurrently.
+func CodexThreadLock(codexHome, threadID string) (string, error) {
+	if codexHome == "" || threadID == "" {
+		return "", fmt.Errorf("paths: Codex thread lock requires CODEX_HOME and thread id")
+	}
+	if !filepath.IsAbs(codexHome) {
+		return "", fmt.Errorf("paths: CODEX_HOME must be absolute")
+	}
+	d := filepath.Join(filepath.Clean(codexHome), ".intercom", "thread-locks")
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		return "", fmt.Errorf("paths: mkdir %s: %w", d, err)
+	}
+	digest := sha256.Sum256([]byte(threadID))
+	return filepath.Join(d, fmt.Sprintf("%x.lock", digest)), nil
 }

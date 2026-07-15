@@ -357,6 +357,10 @@ func TestEndToEndClaudeAndCodexAdapters(t *testing.T) {
 	if threadStartParams.CWD == nil || *threadStartParams.CWD != project || len(threadStartParams.DynamicTools) != 2 {
 		t.Fatalf("thread/start params = %+v", threadStartParams)
 	}
+	if threadStartParams.ApprovalPolicy != string(appserver.ApprovalNever) ||
+		threadStartParams.ApprovalsReviewer == nil || *threadStartParams.ApprovalsReviewer != appserver.ApprovalsReviewerUser {
+		t.Fatalf("thread/start policy = %+v", threadStartParams)
+	}
 	if len(threadStartParams.RuntimeWorkspaceRoots) != 1 || threadStartParams.RuntimeWorkspaceRoots[0] != project {
 		t.Fatalf("thread/start runtime workspace roots = %#v", threadStartParams.RuntimeWorkspaceRoots)
 	}
@@ -372,6 +376,7 @@ func TestEndToEndClaudeAndCodexAdapters(t *testing.T) {
 		CWD:                   project,
 		RuntimeWorkspaceRoots: []string{project},
 		ApprovalPolicy:        string(appserver.ApprovalNever),
+		ApprovalsReviewer:     appserver.ApprovalsReviewerUser,
 		Sandbox:               appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
 	}})
 	waitForShimPeer(t, alice, "reviewer", run)
@@ -455,7 +460,8 @@ func decodeTurnStart(t *testing.T, message codexAppMessage) appserver.TurnStartP
 
 func assertTurnPolicy(t *testing.T, params appserver.TurnStartParams, cwd string) {
 	t.Helper()
-	if params.CWD == nil || *params.CWD != cwd || params.ApprovalPolicy != string(appserver.ApprovalNever) {
+	if params.CWD == nil || *params.CWD != cwd || params.ApprovalPolicy != string(appserver.ApprovalNever) ||
+		params.ApprovalsReviewer == nil || *params.ApprovalsReviewer != appserver.ApprovalsReviewerUser {
 		t.Fatalf("turn/start policy = %+v", params)
 	}
 	if params.SandboxPolicy == nil || params.SandboxPolicy.Type != "workspaceWrite" || len(params.SandboxPolicy.WritableRoots) != 0 {

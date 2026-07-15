@@ -30,6 +30,13 @@ type fakeAppServer struct {
 	startErr            error
 	resume              appserver.ThreadResumeResponse
 	resumeErr           error
+	fork                appserver.ThreadForkResponse
+	forkErr             error
+	list                appserver.ThreadListResponse
+	listErr             error
+	mcpStatus           appserver.MCPServerStatusListResponse
+	mcpStatusResponses  []appserver.MCPServerStatusListResponse
+	mcpStatusErr        error
 	readErr             error
 	threadReadResponses map[string]appserver.ThreadReadResponse
 	threadReadErrors    map[string]error
@@ -42,6 +49,9 @@ type fakeAppServer struct {
 	initializeParams []appserver.InitializeParams
 	threadStarts     []appserver.ThreadStartParams
 	threadResumes    []appserver.ThreadResumeParams
+	threadForks      []appserver.ThreadForkParams
+	threadLists      []appserver.ThreadListParams
+	mcpStatusLists   []appserver.MCPServerStatusListParams
 	threadReads      []appserver.ThreadReadParams
 	turnStarts       []appserver.TurnStartParams
 	interrupts       []appserver.TurnInterruptParams
@@ -56,12 +66,14 @@ func newFakeApp(cwd string) *fakeAppServer {
 	start.CWD = cwd
 	start.RuntimeWorkspaceRoots = []string{cwd}
 	start.ApprovalPolicy = "never"
+	start.ApprovalsReviewer = appserver.ApprovalsReviewerUser
 	start.Sandbox = appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
 	var resume appserver.ThreadResumeResponse
 	resume.Thread = thread
 	resume.CWD = cwd
 	resume.RuntimeWorkspaceRoots = []string{cwd}
 	resume.ApprovalPolicy = "never"
+	resume.ApprovalsReviewer = appserver.ApprovalsReviewerUser
 	resume.Sandbox = appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
 	return &fakeAppServer{
 		init: appserver.InitializeResponse{
@@ -92,6 +104,29 @@ func (f *fakeAppServer) ThreadResume(_ context.Context, params appserver.ThreadR
 	f.threadResumes = append(f.threadResumes, params)
 	f.mu.Unlock()
 	return f.resume, f.resumeErr
+}
+func (f *fakeAppServer) ThreadFork(_ context.Context, params appserver.ThreadForkParams) (appserver.ThreadForkResponse, error) {
+	f.mu.Lock()
+	f.threadForks = append(f.threadForks, params)
+	f.mu.Unlock()
+	return f.fork, f.forkErr
+}
+func (f *fakeAppServer) ThreadList(_ context.Context, params appserver.ThreadListParams) (appserver.ThreadListResponse, error) {
+	f.mu.Lock()
+	f.threadLists = append(f.threadLists, params)
+	f.mu.Unlock()
+	return f.list, f.listErr
+}
+func (f *fakeAppServer) MCPServerStatusList(_ context.Context, params appserver.MCPServerStatusListParams) (appserver.MCPServerStatusListResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mcpStatusLists = append(f.mcpStatusLists, params)
+	if len(f.mcpStatusResponses) != 0 {
+		response := f.mcpStatusResponses[0]
+		f.mcpStatusResponses = f.mcpStatusResponses[1:]
+		return response, f.mcpStatusErr
+	}
+	return f.mcpStatus, f.mcpStatusErr
 }
 func (f *fakeAppServer) ThreadRead(_ context.Context, params appserver.ThreadReadParams) (appserver.ThreadReadResponse, error) {
 	f.mu.Lock()
@@ -175,6 +210,7 @@ type fakeBroker struct {
 	connected          chan struct{}
 	closed             chan struct{}
 	connects           int
+	connectErr         error
 	connectHook        func(int)
 	connectContextHook func(context.Context, int)
 	closeHook          func()
@@ -201,8 +237,13 @@ func (b *fakeBroker) Connect(ctx context.Context) error {
 	if contextHook != nil {
 		contextHook(ctx, connects)
 	}
-	b.connOnce.Do(func() { close(b.connected) })
-	return nil
+	b.mu.Lock()
+	err := b.connectErr
+	b.mu.Unlock()
+	if err == nil {
+		b.connOnce.Do(func() { close(b.connected) })
+	}
+	return err
 }
 func (b *fakeBroker) Close() error {
 	b.mu.Lock()
@@ -260,6 +301,9 @@ func newControllerHarness(t *testing.T) *controllerHarness {
 		return broker
 	}
 	h.cfg.onTurnActive = func() { h.activeOnce.Do(func() { close(h.turnActive) }) }
+	h.cfg.threadLockPath = func(_, threadID string) (string, error) {
+		return filepath.Join(dir, "thread-locks", threadID+".lock"), nil
+	}
 	return h
 }
 
@@ -700,7 +744,7 @@ func TestControllerRejectsExpandedOrMalformedWorkspaceSandbox(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &controller{cfg: Config{CWD: dir}}
-			if err := c.acceptThread(thread, dir, []string{dir}, string(appserver.ApprovalNever), tt.sandbox); err == nil {
+			if err := c.acceptThread(thread, dir, []string{dir}, string(appserver.ApprovalNever), appserver.ApprovalsReviewerUser, tt.sandbox); err == nil {
 				t.Fatalf("acceptThread() accepted %#v", tt.sandbox)
 			}
 		})
@@ -713,10 +757,21 @@ func TestControllerRejectsUnpinnedRuntimeWorkspaceRoots(t *testing.T) {
 	sandbox := appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
 	for _, roots := range [][]string{nil, {}, {dir, "/tmp"}, {"/tmp"}} {
 		if err := (&controller{cfg: Config{CWD: dir}}).acceptThread(
-			thread, dir, roots, string(appserver.ApprovalNever), sandbox,
+			thread, dir, roots, string(appserver.ApprovalNever), appserver.ApprovalsReviewerUser, sandbox,
 		); err == nil {
 			t.Fatalf("acceptThread() accepted runtime workspace roots %#v", roots)
 		}
+	}
+}
+
+func TestControllerRejectsUnpinnedApprovalsReviewer(t *testing.T) {
+	dir := t.TempDir()
+	thread := appserver.Thread{ID: "thread-1", CWD: dir, Status: appserver.ThreadStatus{Type: appserver.ThreadStatusIdle}}
+	sandbox := appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false}
+	if err := (&controller{cfg: Config{CWD: dir}}).acceptThread(
+		thread, dir, []string{dir}, string(appserver.ApprovalNever), appserver.ApprovalsReviewerGuardian, sandbox,
+	); err == nil || !strings.Contains(err.Error(), "approvals reviewer") {
+		t.Fatalf("acceptThread() error = %v", err)
 	}
 }
 
@@ -1839,7 +1894,7 @@ func TestTUIResumeRewritePreservesClientFields(t *testing.T) {
 	if err := json.Unmarshal(rewritten, &object); err != nil {
 		t.Fatal(err)
 	}
-	var cwd, developer, serviceTier, permissions string
+	var cwd, developer, serviceTier string
 	var exclude bool
 	if err := json.Unmarshal(object["cwd"], &cwd); err != nil {
 		t.Fatal(err)
@@ -1853,11 +1908,12 @@ func TestTUIResumeRewritePreservesClientFields(t *testing.T) {
 	if err := json.Unmarshal(object["serviceTier"], &serviceTier); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(object["permissions"], &permissions); err != nil {
-		t.Fatal(err)
-	}
-	if cwd != c.cfg.CWD || exclude || serviceTier != "fast" || permissions != "workspace-write" {
+	if cwd != c.cfg.CWD || exclude || serviceTier != "fast" {
 		t.Fatalf("rewritten thread/resume = %s", rewritten)
+	}
+	if _, ok := object["permissions"]; ok || string(object["approvalPolicy"]) != `"never"` ||
+		string(object["approvalsReviewer"]) != `"user"` || string(object["sandbox"]) != `"workspace-write"` {
+		t.Fatalf("thread/resume permission policy was not pinned: %s", rewritten)
 	}
 	if got := string(object["runtimeWorkspaceRoots"]); got != fmt.Sprintf(`[%q]`, c.cfg.CWD) {
 		t.Fatalf("runtimeWorkspaceRoots = %s", got)
@@ -1870,8 +1926,11 @@ func TestTUIResumeRewritePreservesClientFields(t *testing.T) {
 	}
 }
 
-func TestTUISettingsUpdatePinsManagedCWDAndPreservesFields(t *testing.T) {
-	c := &controller{cfg: Config{CWD: t.TempDir()}, threadID: "thread-1"}
+func TestTUISettingsUpdatePinsManagedPolicyAndFiltersFields(t *testing.T) {
+	c := &controller{
+		cfg: Config{CWD: t.TempDir()}, threadID: "thread-1", phase: phaseIdle,
+		sandbox: appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
+	}
 	params := json.RawMessage(`{
 		"threadId":"thread-1",
 		"cwd":"/wrong",
@@ -1899,15 +1958,18 @@ func TestTUISettingsUpdatePinsManagedCWDAndPreservesFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cwd != c.cfg.CWD || string(object["serviceTier"]) != "null" || string(object["model"]) != `"gpt-test"` ||
-		string(object["approvalPolicy"]) != `"on-request"` || string(object["approvalsReviewer"]) != `"user"` ||
-		string(object["permissions"]) != `"danger-full-access"` {
+		string(object["approvalPolicy"]) != `"never"` || string(object["approvalsReviewer"]) != `"user"` ||
+		string(object["sandboxPolicy"]) != `{"type":"workspaceWrite","networkAccess":false}` {
 		t.Fatalf("rewritten thread/settings/update = %s", rewritten)
+	}
+	if _, ok := object["permissions"]; ok {
+		t.Fatalf("permissions override survived: %s", rewritten)
 	}
 	if got := string(object["collaborationMode"]); got != `{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":null}}` {
 		t.Fatalf("collaborationMode = %s", got)
 	}
-	if got := string(object["futureField"]); got != `{"enabled":true}` {
-		t.Fatalf("futureField = %s", got)
+	if _, ok := object["futureField"]; ok {
+		t.Fatalf("unknown future field survived: %s", rewritten)
 	}
 
 	nullCWD := json.RawMessage(`{"threadId":"thread-1","cwd":null,"model":"gpt-test"}`)
@@ -1915,8 +1977,8 @@ func TestTUISettingsUpdatePinsManagedCWDAndPreservesFields(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("null cwd beforeTUIRequest() error = %v", rpcErr)
 	}
-	if !strings.Contains(string(rewritten), `"cwd":null`) {
-		t.Fatalf("null cwd was not preserved: %s", rewritten)
+	if !strings.Contains(string(rewritten), fmt.Sprintf(`"cwd":%q`, c.cfg.CWD)) {
+		t.Fatalf("null cwd was not pinned: %s", rewritten)
 	}
 }
 
@@ -1927,6 +1989,7 @@ func TestTUITurnReservationReconcilesEventBeforeResponse(t *testing.T) {
 		ready:         true,
 		phase:         phaseIdle,
 		threadID:      "thread-1",
+		sandbox:       appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
 		notifications: make(chan queuedNotification, 1),
 		activity:      make(chan struct{}, 1),
 		fatal:         make(chan error, 1),
@@ -1960,13 +2023,17 @@ func TestTUITurnReservationReconcilesEventBeforeResponse(t *testing.T) {
 	}
 	for field, want := range map[string]string{
 		"runtimeWorkspaceRoots": fmt.Sprintf(`[%q]`, c.cfg.CWD),
-		"approvalPolicy":        `"on-request"`,
-		"permissions":           `"danger-full-access"`,
+		"approvalPolicy":        `"never"`,
+		"approvalsReviewer":     `"user"`,
+		"sandboxPolicy":         `{"type":"workspaceWrite","networkAccess":false}`,
 		"collaborationMode":     `{"mode":"plan","settings":{"model":"gpt-test","reasoning_effort":"high","developer_instructions":null}}`,
 	} {
 		if got := string(object[field]); got != want {
 			t.Fatalf("turn/start %s = %s, want %s", field, got, want)
 		}
+	}
+	if _, ok := object["permissions"]; ok {
+		t.Fatalf("turn/start permissions override survived: %s", rewritten)
 	}
 	if c.phase != phaseStarting || c.turnOwner != turnOwnerTUI {
 		t.Fatalf("reservation = phase %s owner %s", c.phase, c.turnOwner)

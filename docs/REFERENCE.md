@@ -9,14 +9,15 @@
 ```text
 intercom [--help] [--version]
 intercom shim
-intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--name NAME] [--cwd DIRECTORY] [--new]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new | --adopt-session ID | --fork-session ID] [--replace-binding] [--yolo]
 intercom codex attach --name NAME
+intercom codex sessions --app-server ENDPOINT [--cwd DIRECTORY] [--all] [--list]
 intercom broker [--idle-after DURATION] [--foreground]
 intercom name
 intercom peers
 intercom completion {bash|fish|powershell|zsh} [--no-descriptions]
 intercom help [COMMAND ...]
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new | --adopt [ID] | --fork-from [ID]] [--all-sessions] [--list-sessions] [--replace-binding] [--yolo]
 
 send_message(to=NAME, message=TEXT)
 list_peers()
@@ -159,7 +160,7 @@ INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:
 #### Synopsis
 
 ```text
-intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--name NAME] [--cwd DIRECTORY] [--new]
+intercom codex --app-server ENDPOINT [--client-endpoint ENDPOINT] [--mcp-bridge PATH] [--name NAME] [--cwd DIRECTORY] [--new | --adopt-session ID | --fork-session ID] [--replace-binding] [--yolo]
 ```
 
 #### Arguments
@@ -172,18 +173,32 @@ No positional arguments are accepted.
 |---|---|---|---|---|
 | `--app-server ENDPOINT` | Unix endpoint or filesystem path | required | none | Selects the dedicated Codex app-server Unix socket. A bare value must be an absolute path. A URL value must use `unix`, contain an absolute path, and contain no host, query, fragment, or NUL byte. |
 | `--client-endpoint ENDPOINT` | Unix endpoint or filesystem path | optional | none | Creates a stock-Codex TUI proxy at the selected Unix socket. The syntax is identical to `--app-server`; the two normalized endpoints must differ. An absent option selects headless operation and suppresses live-instance publication and readiness output. |
+| `--mcp-bridge PATH` | absolute Unix socket path | conditional | none | Creates the authenticated controller bridge used by the required Intercom MCP server. Adoption, fork, and resume of a binding whose `toolTransport` is `mcpBridge` require it. The project launcher supplies this option. |
 | `--name NAME` | peer name | optional | `INTERCOM_NAME`, then selected-directory basename | Selects the Intercom peer and state filename. The flag takes precedence over the environment. Surrounding whitespace is removed. |
 | `--cwd DIRECTORY` | directory path | optional | current working directory | Selects the managed project directory. The adapter resolves the path to an absolute, symlink-canonical directory. |
 | `--new` | Boolean | optional | false | Starts a new thread and replaces the saved Intercom binding. It does not delete previous Codex history. |
+| `--adopt-session ID` | Codex thread ID | optional | none | Resumes and binds the existing eligible CLI or VS Code root thread without changing its ID. The value is 1 through 256 printable UTF-8 bytes with no whitespace. |
+| `--fork-session ID` | Codex thread ID | optional | none | Forks the existing eligible CLI or VS Code root thread and binds the new thread ID. The source remains unchanged. Value validation matches `--adopt-session`. |
+| `--replace-binding` | Boolean | optional | false | Authorizes adoption or fork to replace an existing binding for another thread. It requires `--adopt-session` or `--fork-session`. |
+| `--yolo` | Boolean | optional | false | Selects approval policy `never` and sandbox policy `danger-full-access` for the service. |
+| `--dangerously-bypass-approvals-and-sandbox` | Boolean | optional | false | Alias for `--yolo`. |
 | `-h`, `--help` | Boolean | optional | false | Prints command help and exits. |
 
 #### Semantics
 
 The command connects to an app-server that is already listening and is externally supervised. It does not start or stop app-server. `--client-endpoint` adds a private Unix-WebSocket proxy for a stock Codex TUI. The adapter remains the app-server's sole Intercom-owned subscriber and the proxy multiplexes TUI traffic through that connection.
 
-The adapter initializes the experimental app-server API and requires the app-server user agent to report semantic version 0.144.1 or later. The protocol provides no feature or schema-version negotiation. The adapter establishes compatibility by executing and validating the request, response, lifecycle, managed-thread, sandbox, and dynamic-tool contract it consumes. JSON decoding ignores unknown additive object fields; required fields, enumerated values, correlation, ownership, and behavioral invariants remain validated. It creates or resumes one non-ephemeral thread with approval policy `never`, workspace-write sandbox, no additional writable roots, a runtime workspace-root list containing only the canonical managed directory, Intercom developer instructions, and the two Intercom dynamic tools. These values establish the unattended startup baseline. It acquires a nonblocking lifetime lock for the selected peer before connecting.
+The adapter initializes the experimental app-server API and requires the app-server user agent to report semantic version 0.144.1 or later. The protocol provides no feature or schema-version negotiation. The adapter establishes compatibility by executing and validating the request, response, lifecycle, managed-thread, sandbox, tool-registration, and session-selection contracts it consumes. JSON decoding ignores unknown additive object fields; required fields, enumerated values, correlation, ownership, and behavioral invariants remain validated. It acquires a nonblocking lifetime lock for the selected peer before connecting and a separate nonblocking lock for the managed Codex thread before ownership begins.
 
-One broker delivery occupies one FIFO slot. The adapter starts a Codex root turn only while the managed thread is idle. A TUI `turn/start` reserves the same controller before it reaches app-server. An Intercom delivery and a TUI can therefore never start concurrent root turns. Deliveries that arrive during either kind of turn remain queued. A TUI turn may call the Intercom dynamic tools. Codex child threads whose reported parent or fork ancestry leads to the managed root may use inherited Intercom dynamic tools without replacing root lifecycle state. A normal final answer remains in Codex history. Only a successful `send_message` dynamic-tool call creates an outbound Intercom message.
+Without a saved binding or selection option, the adapter creates one non-ephemeral thread with the two Intercom app-server dynamic tools. `--adopt-session` and `--fork-session` resolve the explicit ID through non-archived `thread/list` results and require a non-ephemeral CLI or VS Code root in `idle` or `notLoaded` status with the exact managed `cwd`. Adoption resumes that thread under the same ID. Fork invokes app-server fork and manages the returned new ID.
+
+Adopted and forked threads receive a request-scoped MCP server named `intercom_managed`. Its command is the selected Intercom executable with arguments `codex-mcp-bridge --socket MCP_BRIDGE_PATH --timeout REVERSE_TIMEOUT`; its environment contains the random service-lifetime token as `INTERCOM_CODEX_BRIDGE_TOKEN`. It is required, permits parallel tool calls, enables only `send_message` and `list_peers`, sets default tool approval to `approve`, uses the adapter control timeout in whole seconds for startup, and uses the reverse-request timeout in whole seconds for app-server tool calls. The helper and private controller bridge use the exact reverse-request duration. Each app-server timeout rounded to whole seconds has a minimum of one second; command defaults produce 30-second startup and 10-second tool timeouts. The adapter validates that app-server reports the server and both tools before committing the binding. A cold resume of an MCP-bridge binding reinjects and revalidates the same per-service configuration.
+
+Selecting `--adopt-session` with the current binding's own thread ID is an idempotent normal resume and preserves its recorded tool transport. Any selection that would produce another bound thread requires `--replace-binding`. A failed adoption, fork, tool validation, broker registration, or proxy startup leaves the prior binding unchanged. A created fork can remain in Codex storage when later validation fails.
+
+The default execution policy is approval `never`, approvals reviewer `user`, workspace-write sandbox, no additional writable roots, and a runtime workspace-root list containing only the canonical managed directory. Yolo mode replaces the sandbox with `danger-full-access`; approval, reviewer, and runtime root remain pinned. The selected policy is a service configuration rather than persistent binding identity.
+
+One broker delivery occupies one FIFO slot. The adapter starts a Codex root turn only while the managed thread is idle. A TUI `turn/start` reserves the same controller before it reaches app-server. An Intercom delivery and a TUI can therefore never start concurrent root turns. Deliveries that arrive during either kind of turn remain queued. A TUI turn may call the Intercom tools through its binding transport. Codex child threads whose reported parent or fork ancestry leads to the managed root may use inherited Intercom tools without replacing root lifecycle state. A normal final answer remains in Codex history. Only a successful `send_message` tool call creates an outbound Intercom message.
 
 The `completed`, `failed`, and `interrupted` turn statuses are terminal. Each enters controller completion processing without retrying the delivered message. The controller returns to idle only after that processing and the corresponding `turn/start` response have both finished. Other completion statuses are fatal protocol violations for the managed thread. Codex app-server can publish lifecycle notifications for child threads created by the managed agent. The proxy still offers those notifications to the TUI, while the controller ignores their lifecycle state after decoding a nonempty foreign thread ID.
 
@@ -191,9 +206,9 @@ On broker disconnect, the adapter retries registration indefinitely while app-se
 
 The proxy accepts WebSocket upgrades at `/` and `/rpc` and accepts one downstream TUI session at a time, including a session that has not initialized. A concurrent upgrade receives HTTP status 409; another request path receives HTTP status 404. A session that does not complete initialize and managed-thread resume within 30 seconds closes with a policy-violation status and releases the slot. The TUI must report the same client version as the currently running app-server, a nonempty client name, and the experimental API capability. Request-attestation and OpenAI-form-elicitation capabilities are rejected. Proxy readiness requires a successful local or upstream `thread/resume` result for the managed thread.
 
-The proxy returns the adapter's cached initialize result, consumes the TUI's `initialized` notification, honors its `optOutNotificationMethods`, remaps TUI request IDs before upstream forwarding, remaps app-server reverse-request IDs before TUI forwarding, and restores each caller's original ID in the response. A rejected initialize attempt may be retried; a successful initialize makes every later initialize invalid for that session. A downstream request ID remains claimed until its terminal response is written and may then be reused. `thread/resume` is restricted to the managed thread and is rewritten with the managed directory, the one-entry managed runtime-root list, Intercom developer instructions, and full turn inclusion. `thread/settings/update` requires the managed thread, pins any non-null `cwd` to the managed directory, and preserves every other raw field. `turn/start` is rewritten with the managed directory and one-entry managed runtime-root list and preserves every other raw field. Pipelined `turn/start` requests enter controller admission in downstream wire order; a later request cannot reserve the controller before an earlier request finishes admission. The request allowlist below is closed; a method absent from it is not forwarded.
+The proxy returns the adapter's cached initialize result, consumes the TUI's `initialized` notification, honors its `optOutNotificationMethods`, remaps TUI request IDs before upstream forwarding, remaps app-server reverse-request IDs before TUI forwarding, and restores each caller's original ID in the response. A rejected initialize attempt may be retried; a successful initialize makes every later initialize invalid for that session. A downstream request ID remains claimed until its terminal response is written and may then be reused. `thread/resume` is restricted to the managed thread and is rewritten with the managed directory, one-entry managed runtime-root list, Intercom developer instructions, service policy, and full turn inclusion. `thread/settings/update` requires an idle managed thread, rebuilds a closed set of interactive settings, and pins service policy. `turn/start` is rewritten with the managed directory, one-entry managed runtime-root list, and service policy and preserves other raw fields. Pipelined `turn/start` requests enter controller admission in downstream wire order; a later request cannot reserve the controller before an earlier request finishes admission. The request allowlist below is closed; a method absent from it is not forwarded.
 
-Stock Codex uses the preserved fields to apply interactive policy. A TUI may update approval policy, approval reviewer, sandbox policy or named permissions, model, service tier, reasoning effort and summary, personality, and collaboration mode. A TUI `turn/start` may additionally supply an output schema. Any supplied runtime workspace roots are replaced by the one-entry managed list. The other selections govern TUI-originated turns and can update subsequent thread settings. They are not the unattended-policy boundary. Each Intercom-delivered turn separately supplies the managed directory and runtime root, approval policy `never`, and the validated startup workspace-write sandbox. The thread-level Intercom developer instructions remain a separate developer section when Codex adds collaboration-mode developer instructions.
+Stock Codex uses preserved non-policy fields to apply interactive model, service-tier, reasoning effort and summary, personality, output-schema, collaboration-mode, and multi-agent-mode selections. The proxy replaces TUI approval, approvals-reviewer, sandbox, permissions, working-directory, and runtime-root fields with the configured service policy during `thread/resume`, `thread/settings/update`, and `turn/start`. Settings update drops every field outside `threadId`, `model`, `serviceTier`, `effort`, `summary`, `collaborationMode`, `multiAgentMode`, and `personality` before adding pinned fields. Each Intercom-delivered turn supplies the same managed directory, runtime root, approval policy, approvals reviewer, and sandbox policy. The thread-level Intercom developer instructions remain a separate developer section when Codex adds collaboration-mode developer instructions.
 
 `turn/interrupt` and `turn/steer` are forwarded only when the attached TUI owns the named starting or active turn. They cannot control an Intercom-delivery turn. Every TUI `turn/start` holds app-server notifications behind its response. Controller lifecycle state is reconciled before the held notifications are exposed. Every managed terminal notification and each later notification remain held until controller completion processing and the corresponding start response have both finished. No later delivery or TUI turn can overtake either boundary.
 
@@ -201,9 +216,9 @@ Stock Codex uses the preserved fields to apply interactive policy. A TUI may upd
 |---|---|
 | `initialize` | Terminates locally, validates client identity, version, capabilities, and notification opt-outs, and returns the cached upstream result. |
 | `initialized` | Terminates locally after successful initialize. |
-| `thread/resume` | Validates the managed thread and rewrites directory, runtime workspace roots, developer instructions, and `excludeTurns`. A successful local or upstream result makes the session ready. The initial resume executes in downstream reader order. |
-| `thread/settings/update` | Validates the managed thread, pins non-null `cwd`, and forwards every other supplied field, including interactive policy and unknown fields. |
-| `turn/start` | Validates the managed thread, enters controller admission in downstream wire order, reserves the idle controller, pins `cwd` and `runtimeWorkspaceRoots`, preserves every other supplied field, and forwards with a 30-second deadline. |
+| `thread/resume` | Validates the managed thread and rewrites directory, runtime workspace roots, developer instructions, approval policy, approvals reviewer, sandbox policy, and `excludeTurns`; permission overrides are removed. A successful local or upstream result makes the session ready. The initial resume executes in downstream reader order. |
+| `thread/settings/update` | Requires the controller to be idle, validates the managed thread, retains only `threadId`, `model`, `serviceTier`, `effort`, `summary`, `collaborationMode`, `multiAgentMode`, and `personality`, then sets the managed `cwd`, approval policy `never`, approvals reviewer `user`, and service sandbox policy. Permissions and unknown fields are dropped. |
+| `turn/start` | Validates the managed thread, enters controller admission in downstream wire order, reserves the idle controller, pins `cwd`, `runtimeWorkspaceRoots`, approval policy, approvals reviewer, and sandbox policy, removes permission overrides, preserves every other supplied field, and forwards with a 30-second deadline. |
 | `turn/interrupt`, `turn/steer` | Validates TUI ownership of the named current turn and forwards. |
 | `thread/read`, `thread/turns/list`, `thread/items/list`, `thread/goal/get`, `thread/backgroundTerminals/list` | Requires the managed `threadId` and forwards the read. |
 | `thread/name/set`, `thread/metadata/update`, `thread/memoryMode/set` | Requires the managed `threadId` and forwards the bounded current-thread metadata operation. |
@@ -224,7 +239,7 @@ Stock Codex uses the preserved fields to apply interactive policy. A TUI may upd
 | Managed terminal notification, and each later notification while its controller gate remains active | Buffers at most 256 notifications until controller completion processing and the corresponding start response have both finished, then offers them to the downstream response barrier in source order. |
 | Other app-server notification after the session is ready and outside a response or controller barrier | Enqueues the notification for downstream delivery unless its method is opted out. Controller lifecycle handling remains independent. |
 
-For `thread/resume`, `cwd` is always the managed directory, `runtimeWorkspaceRoots` is always an array containing that directory, and `excludeTurns` is always false. Missing, null, empty, or whitespace-only client developer instructions become the Intercom binding instructions. Other client developer instructions are followed by two newline bytes and the Intercom binding instructions. An already-running thread can retain its configured developer instructions instead of applying a downstream resume override; Intercom's binding is already installed by the adapter's own thread start or cold resume. For `thread/settings/update`, a null `cwd` remains null and a non-null `cwd` becomes the managed directory.
+For `thread/resume`, `cwd` is always the managed directory, `runtimeWorkspaceRoots` is always an array containing that directory, `approvalPolicy` is always `never`, `approvalsReviewer` is always `user`, `sandbox` is the service policy, and `excludeTurns` is always false. Missing, null, empty, or whitespace-only client developer instructions become the Intercom binding instructions. Other client developer instructions are followed by two newline bytes and the Intercom binding instructions. An already-running thread can retain its configured developer instructions instead of applying a downstream resume override; Intercom's binding is already installed by the adapter's own thread start or cold resume. For `thread/settings/update`, `cwd` is always the managed directory and all policy fields are reconstructed by Intercom.
 
 A newly started managed thread can be attached before its first turn creates a Codex rollout. Before the first managed `turn/started` or terminal lifecycle event, the adapter terminates TUI `thread/resume` locally with the validated `thread/start` snapshot and `initialTurnsPage: null`; it does not send that resume upstream. The session becomes ready from this synthetic result and can start the first turn. The first managed turn lifecycle event clears the zero-turn snapshot so an attachment made during that turn resumes upstream and receives its current state. A successful materializing `thread/read` also clears the snapshot.
 
@@ -269,6 +284,7 @@ With `--client-endpoint`, readiness occurs after managed-thread validation, brok
 
 ```text
 Intercom Codex peer NAME is ready.
+Execution policy: POLICY
 
 Attach from another terminal:
   INTERCOM_DIR=STATE_DIRECTORY INTERCOM_SOCKET=BROKER_SOCKET CODEX_BIN=CODEX_EXECUTABLE CODEX_HOME=CODEX_DIRECTORY INTERCOM_EXECUTABLE codex attach --name NAME
@@ -277,7 +293,7 @@ Direct Codex command:
   CODEX_HOME=CODEX_DIRECTORY CODEX_EXECUTABLE resume --remote CLIENT_ENDPOINT THREAD_ID
 ```
 
-`STATE_DIRECTORY`, `BROKER_SOCKET`, and slash-containing relative `INTERCOM_BIN`, `CODEX_BIN`, or `CODEX_HOME` values are made absolute before display. `CODEX_HOME` assignments are omitted when that variable is unset. Every displayed value is shell-quoted when required. The name-based command therefore carries descriptor lookup and Intercom and Codex executable selection into another terminal; the direct command carries Codex home selection. The displayed executables must remain available, and neither command reproduces unnamed provider-authentication variables. The live descriptor remains published until shutdown begins. A readiness-output failure removes the descriptor and fails startup.
+`POLICY` is `workspace-write` or `danger-full-access`. The displayed direct command for danger-full-access inserts `--dangerously-bypass-approvals-and-sandbox` between `resume` and `--remote`; the block above shows workspace-write. `STATE_DIRECTORY`, `BROKER_SOCKET`, and slash-containing relative `INTERCOM_BIN`, `CODEX_BIN`, or `CODEX_HOME` values are made absolute before display. `CODEX_HOME` assignments are omitted when that variable is unset. Every displayed value is shell-quoted when required. The name-based command therefore carries descriptor lookup, execution policy, and Intercom and Codex executable selection into another terminal; the direct command carries Codex home and execution-policy selection. The displayed executables must remain available, and neither command reproduces unnamed provider-authentication variables. The live descriptor remains published until shutdown begins. A readiness-output failure removes the descriptor and fails startup.
 
 #### Errors
 
@@ -290,6 +306,11 @@ The following table enumerates externally visible adapter and proxy error classe
 | The endpoint is relative, malformed, non-`unix`, host-bearing, query-bearing, fragment-bearing, NUL-bearing, or not a usable Unix WebSocket endpoint. | `invalid --app-server`, app-server parse, dial, or upgrade error |
 | `--client-endpoint` is present and is relative, malformed, non-`unix`, host-bearing, query-bearing, fragment-bearing, or NUL-bearing. | `invalid --client-endpoint` |
 | The normalized client and app-server endpoints are equal. | `--client-endpoint must differ from --app-server` |
+| `--mcp-bridge` is relative. | `codex: MCP bridge socket path must be absolute` |
+| More than one of `--new`, `--adopt-session`, and `--fork-session` is selected. | `codex: --new, --adopt-session, and --fork-session are mutually exclusive` |
+| `--replace-binding` is selected without adoption or fork. | `codex: --replace-binding requires --adopt-session or --fork-session` |
+| Adoption or fork omits either `--mcp-bridge` or the selected Intercom executable. | `codex: adopted and forked threads require the managed MCP bridge` |
+| A session ID is empty, longer than 256 bytes, invalid UTF-8, contains whitespace or a control character, or has leading or trailing whitespace. | `codex: adopt session` or `codex: fork session` validation diagnostic |
 | `--cwd` is absent and the current working directory cannot be obtained. | `codex: get working directory` |
 | `--cwd` cannot be made absolute, resolved through symlinks, statted, or does not name a directory. | `codex: resolve cwd`, `resolve cwd symlinks`, `stat cwd`, or `cwd is not a directory` |
 | The selected peer name violates the peer-name grammar. | `invalid peer name` |
@@ -297,22 +318,29 @@ The following table enumerates externally visible adapter and proxy error classe
 | A slash-containing relative `INTERCOM_BIN` or `CODEX_BIN`, or a nonempty relative `CODEX_HOME`, cannot be made absolute for readiness output. | `resolve INTERCOM_BIN`, `resolve CODEX_BIN`, or `resolve CODEX_HOME` |
 | The state directory, state file, or lifetime lock cannot be opened, decoded, validated, written, synchronized, replaced, or removed. | `codex state` or `persist new thread binding` |
 | Another adapter holds the same peer lifetime lock. | `codex state: peer is already managed` |
+| Another Intercom adapter holds the selected thread lock. | `codex thread lock: thread is already managed by Intercom` |
+| Adoption or fork selects another thread while a binding exists and `--replace-binding` is absent. | Binding replacement diagnostic; the saved binding remains unchanged. |
 | The app-server cannot be reached within 30 seconds. | `codex: app-server unavailable after 30s` |
 | App-server initialization or the initialized notification fails. | `initialize app-server` or `send initialized` |
 | The app-server user agent does not have the required product/version form. | `cannot determine app-server version` |
 | The app-server user agent reports a semantic version earlier than 0.144.1. | `unsupported app-server version` |
-| App-server version 0.144.1 or later changes a consumed request, response, lifecycle, managed-thread, sandbox, or dynamic-tool contract incompatibly. | The affected RPC, protocol, or managed-thread invariant diagnostic. The binding remains unchanged when startup does not complete. |
+| App-server version 0.144.1 or later changes a consumed request, response, lifecycle, managed-thread, sandbox, dynamic-tool, MCP-status, listing, or fork contract incompatibly. | The affected RPC, protocol, or managed-thread invariant diagnostic. A replacement binding remains unchanged when the condition occurs before its commit. |
 | Saved peer, canonical directory, `CODEX_HOME`, state schema, or tool-contract version differs. | identity or contract diagnostic; exact binding changes require `--new` |
 | A resumed thread validates successfully but the refreshed app-server user-agent or Codex-version diagnostics cannot be persisted. | `persist validated app-server diagnostics` |
-| `thread/start`, `thread/resume`, `thread/read`, or state persistence fails. | operation-specific Codex RPC diagnostic |
+| `thread/start`, `thread/resume`, `thread/read`, `thread/fork`, MCP status, or state persistence fails. | operation-specific Codex RPC diagnostic |
+| An adoption source is archived, is not a CLI or VS Code session, is ephemeral, has another working directory, has a parent, or reports a status other than `idle` or `notLoaded`. | `codex: adopt session` eligibility diagnostic; the binding remains unchanged. |
+| A fork source is archived, is not a CLI or VS Code session, is ephemeral, has another working directory, has a parent, or reports a status other than `idle` or `notLoaded`. | `codex: fork session` eligibility diagnostic; the binding remains unchanged. |
+| App-server fork returns an empty or unchanged thread ID, or its `forkedFromId` does not equal the source. | `codex: fork session` invariant diagnostic; the binding remains unchanged. |
+| The managed MCP bridge token cannot be generated, its private parent or socket cannot be validated or created, or its listener stops. | `codex bridge` startup or listener diagnostic. A replacement binding remains unchanged when the condition occurs before its commit. |
+| App-server MCP status omits `intercom_managed`, omits `send_message` or `list_peers`, fails, or returns an empty or repeated cursor. | `verify managed MCP server` or managed-MCP invariant diagnostic; a replacement binding remains unchanged because validation precedes commit. |
 | A resumed unmaterialized thread has no rollout. | The adapter replaces the pending binding. This exact case is not fatal. |
-| App-server returns the wrong thread ID or directory, runtime workspace roots other than the managed directory alone, an ephemeral thread, a non-idle thread, another approval policy, another sandbox type, extra sandbox writable roots, or a non-Boolean workspace network setting. | managed-thread invariant diagnostic |
+| App-server returns the wrong thread ID or directory, runtime workspace roots other than the managed directory alone, an ephemeral thread, a non-idle thread, another approval policy, another approvals reviewer, another sandbox type, extra sandbox writable roots, or a non-Boolean workspace network setting. | managed-thread invariant diagnostic |
 | A dynamic tool request arrives before adapter ownership is established. | `dynamic tool request arrived before adapter ownership was established` |
 | Broker registration fails during startup, including a live peer-name collision. | `codex: register with broker` |
 | The client socket path exists, cannot be inspected, listened on, or changed to mode 0600. | `codex: start TUI proxy` |
 | The app-server client does not provide raw request forwarding. | `app-server client does not expose raw proxy calls` |
-| The live registry cannot be created or secured, a descriptor is malformed or insecure, another live process owns its broker-and-peer key, descriptor publication or synchronization fails, or the 128-bit instance nonce cannot be generated. | live-instance registry or `publish live instance` diagnostic |
-| Readiness instructions cannot be written to standard output. | `write readiness instructions`; the descriptor is removed before startup fails. |
+| The live registry cannot be created or secured, a descriptor is malformed or insecure, another live process owns its broker-and-peer key, descriptor publication or synchronization fails, or the 128-bit instance nonce cannot be generated. | Live-instance registry or `publish live instance` diagnostic. Adoption or fork commit precedes this publication and is not rolled back. |
+| Readiness instructions cannot be written to standard output. | `write readiness instructions`; the descriptor is removed before startup fails. Adoption or fork commit is not rolled back. |
 | Live-descriptor removal fails during shutdown and again after the controller returns. | `remove live instance descriptor`; status 1. The controller logs the first failure and the command retries once. |
 | The TUI proxy listener stops while the adapter context remains active. | `codex: TUI proxy listener stopped` |
 | A delivery arrives while 64 deliveries are already queued. | `inbound delivery queue is full (64)`; the attempted 65th queued delivery is not admitted. |
@@ -332,6 +360,8 @@ The following table enumerates externally visible adapter and proxy error classe
 | A dynamic tool call has invalid Intercom tool arguments or names an unknown tool. | The call returns `success: false`; the adapter continues. |
 | Parameters cannot be decoded for a dynamic-tool, command-approval, file-approval, permission-approval, user-input, MCP-elicitation, legacy apply-patch approval, or legacy command-execution approval request. | The call receives app-server error -32602; the adapter continues when the error response succeeds. |
 | A dynamic tool call carries a namespace, omits routing identity, arrives before ownership, names another root turn, or names a foreign thread whose `thread/read` ancestry fails, cycles without reaching the root, exceeds 64 distinct threads, returns another ID, or has no parent or fork path to the root. | The call receives a failure result when possible; the ownership violation then terminates the adapter. A verified or cached descendant is accepted. |
+| An MCP tool call has an invalid bridge token or frame, exceeds 1048576 bytes, exceeds the concurrency or request deadline, names an unsupported method, or carries invalid arguments. | The bridge returns its protocol error when possible; authentication and framing failures close that bridge connection. |
+| An MCP tool call omits top-level `threadId`, `x-codex-turn-metadata.session_id`, `thread_id`, or `turn_id`; carries unequal top-level and nested thread identities; carries a session identity other than the managed root; or names a thread or turn outside current managed ownership. | The tool call fails and the ownership violation terminates the adapter. No broker operation occurs. |
 | A reverse-request result or error response cannot be written. | The response-write failure terminates the adapter. |
 | A TUI request has malformed parameters or names another thread. | The TUI receives error -32602; the adapter continues. |
 | A TUI repeats `initialize`, sends a request before initialization, reports another client version, or requests attestation or OpenAI-form elicitation. | The TUI receives error -32600; it does not become ready. |
@@ -341,6 +371,7 @@ The following table enumerates externally visible adapter and proxy error classe
 | A TUI does not complete initialize and managed-thread resume within 30 seconds of connection. | The TUI connection closes with a policy-violation status, the sole-session slot is released, and the adapter remains active. |
 | A TUI repeats an in-flight request ID. | The TUI connection closes because exactly one terminal response can no longer be correlated to the duplicated ID. The adapter remains active. |
 | A TUI requests an unavailable thread operation. | The TUI receives error -32600; the adapter continues. |
+| A TUI requests `thread/settings/update` while the controller is not idle. | The TUI receives error -32600 with `thread/settings/update is allowed only while the managed thread is idle`; the current operation continues. |
 | A TUI `turn/interrupt` or `turn/steer` does not name the managed thread and TUI-owned turn, omits its required turn ID, or is attempted while an Intercom turn owns the controller. | The TUI receives error -32600 or -32602; the existing turn continues. |
 | A TUI starts a turn while another TUI or Intercom turn is starting or active. | The TUI receives error -32600 with `managed thread already has an active turn`; the existing turn continues. |
 | A forwarded TUI request other than `turn/start` exceeds its 30-second deadline. | The TUI receives error -32603, one late upstream response is discarded through bounded expired-ID tracking, and the adapter continues. |
@@ -407,11 +438,14 @@ No positional arguments are accepted.
 
 #### Semantics
 
-The command opens the live registry selected by the current `INTERCOM_DIR` and derives the descriptor key from the canonical current `INTERCOM_SOCKET` and explicit peer name. These environment selections must match the service. It loads and strictly validates the descriptor, verifies that its recorded adapter PID exists, resolves `CODEX_BIN` or `codex` through `PATH`, makes the located executable path absolute, changes to the descriptor's managed project directory, and replaces itself with this argument vector:
+The command opens the live registry selected by the current `INTERCOM_DIR` and derives the descriptor key from the canonical current `INTERCOM_SOCKET` and explicit peer name. These environment selections must match the service. It loads and strictly validates the descriptor, verifies that its recorded adapter PID exists, resolves `CODEX_BIN` or `codex` through `PATH`, makes the located executable path absolute, changes to the descriptor's managed project directory, and replaces itself with one of these argument vectors:
 
 ```text
 codex resume --remote CLIENT_ENDPOINT THREAD_ID
+codex resume --dangerously-bypass-approvals-and-sandbox --remote CLIENT_ENDPOINT THREAD_ID
 ```
+
+The second form is selected when the live descriptor records execution policy `danger-full-access`; the first form is selected for workspace-write.
 
 The replacement process inherits the attach command's environment and standard input, standard output, and standard error. Descriptor lookup validates the descriptor and recorded PID but does not probe the downstream socket. Codex performs the Unix-WebSocket connection, authentication-dependent client startup, and proxy initialization after process replacement. Successful process replacement does not return to `intercom`; later socket, authentication, version, and initialization diagnostics and exit status belong to Codex.
 
@@ -450,7 +484,80 @@ intercom codex attach --name reviewer
 
 #### See also
 
-[`intercom codex`](#intercom-codex), [`intercom-codex-project`](#intercom-codex-project), [live Codex instance descriptors](#live-codex-instance-descriptors)
+[`intercom codex`](#intercom-codex), [`intercom codex sessions`](#intercom-codex-sessions), [`intercom-codex-project`](#intercom-codex-project), [live Codex instance descriptors](#live-codex-instance-descriptors)
+
+### intercom codex sessions
+
+#### Synopsis
+
+```text
+intercom codex sessions --app-server ENDPOINT [--cwd DIRECTORY] [--all] [--list]
+```
+
+#### Arguments
+
+No positional arguments are accepted.
+
+#### Options
+
+| Option | Type | Mode | Default | Meaning |
+|---|---|---|---|---|
+| `--app-server ENDPOINT` | Unix endpoint or filesystem path | required | none | Selects the dedicated Codex app-server Unix socket. Syntax matches `intercom codex --app-server`. |
+| `--cwd DIRECTORY` | existing directory path | optional | current working directory | Supplies the working-directory filter and the directory required for the selected result. The command converts it to an absolute path, resolves symbolic links, and requires a directory. |
+| `--all` | Boolean | optional | false | Omits the working-directory filter from app-server listing. Source, archive, ephemeral, root-thread, and idle-or-not-loaded status eligibility rules remain active. |
+| `--list` | Boolean | optional | false | Writes every matching record without reading a terminal selection. |
+| `-h`, `--help` | Boolean | optional | false | Prints command help and exits. |
+
+#### Semantics
+
+The command connects to an already listening app-server, initializes its experimental API as `intercom_session_picker`, and requests all pages of non-archived CLI and VS Code threads in descending recency order. It defensively removes empty or invalid IDs, ephemeral threads, child threads, statuses other than `idle` or `notLoaded`, other sources, duplicate IDs, and, unless `--all` is set, records whose `cwd` does not exactly equal the selected absolute directory. It does not start or stop app-server and does not read or change an Intercom binding.
+
+Without `--list`, standard input must be a character device. The numbered picker is written to standard error. Each entry contains its UTC recency time, source, sanitized title, complete thread ID, and working directory. It accepts a number from 1 through the number of entries or `q`, case-insensitively. Invalid input prints the permitted range and prompts again. A valid selection writes only the complete thread ID and a newline to standard output.
+
+With `--list`, each output line contains four tab-separated fields in this order: complete thread ID, UTC RFC 3339 recency timestamp, sanitized working directory, and sanitized title. The title is the nonblank thread name, then preview, then `(untitled)`. Newlines and other whitespace in displayed metadata collapse to one ASCII space; nonprinting characters become `�`; picker source and title fields are bounded for display, while IDs and working directories are not truncated.
+
+`--all` does not authorize an implicit managed-directory change. An interactive selection whose returned `cwd` differs from the selected `--cwd` fails and identifies the required `--cwd`. List mode reports records from all directories without this final equality check.
+
+#### Errors
+
+| Condition | Result |
+|---|---|
+| An unknown option or positional argument is present. | Command parsing diagnostic; status 1. |
+| `--app-server` is absent, malformed, or cannot be reached. | Required-flag, endpoint, dial, or WebSocket-upgrade diagnostic; status 1. |
+| `--cwd` is absent and the current directory cannot be read, or its value cannot be made absolute, resolved through symbolic links, statted, or confirmed as a directory. | `codex: get working directory`, `codex: resolve cwd`, or `codex sessions: canonicalize project directory`; status 1. |
+| App-server initialization or the initialized notification fails. | `codex sessions: initialize app-server` or `complete app-server initialization`; status 1. |
+| Any `thread/list` page fails, returns an empty cursor, or repeats a cursor. | `codexsession: list sessions` or pagination diagnostic; status 1. |
+| Interactive mode receives no eligible records. | `codexsession: no resumable sessions`; status 1. |
+| Interactive mode's standard input is not a terminal. | `codex sessions: interactive selection requires a terminal; supply an explicit session id`; status 1. |
+| Interactive input ends, reads `q`, or fails. | `codexsession: selection canceled` or read diagnostic; status 1. |
+| An interactive all-directory selection has another working directory. | Diagnostic names the selected directory and required `--cwd`; status 1. |
+| Picker, list, or selected-ID output fails. | Write diagnostic; status 1. |
+
+#### Exit status
+
+Status is 0 after help, complete list output including an empty list, or one valid same-directory selection. Status is 1 after parsing, connection, protocol, discovery, terminal, selection, or output failure.
+
+#### Example
+
+The following transcript starts a temporary app-server and writes eligible current-project sessions:
+
+```sh
+runtime_dir=$(mktemp -d ./.intercom-sessions.XXXXXX)
+chmod 700 "$runtime_dir"
+socket=$(cd "$runtime_dir" && pwd -P)/app-server.sock
+codex app-server --listen "unix://$socket" &
+server_pid=$!
+trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -rf "$runtime_dir"' EXIT
+while [ ! -S "$socket" ]; do
+  kill -0 "$server_pid" 2>/dev/null || exit 1
+  sleep 0.1
+done
+intercom codex sessions --app-server "$socket" --cwd . --list
+```
+
+#### See also
+
+[`intercom codex`](#intercom-codex), [`intercom-codex-project`](#intercom-codex-project), [Handbook: resume, adopt, fork, or replace](HANDBOOK.md#5-resume-adopt-fork-or-replace-a-codex-thread)
 
 ### intercom broker
 
@@ -688,12 +795,15 @@ intercom help codex
 #### Synopsis
 
 ```text
-intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] [--new] [--yolo]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --adopt [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo]
+intercom-codex-project [--name NAME] [--cwd DIRECTORY] --fork-from [SESSION_ID] [--all-sessions] [--replace-binding] [--yolo]
+intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]
 ```
 
 #### Arguments
 
-The launcher scans every token for `--app-server` or `--client-endpoint` before any other action and rejects either token because the launcher owns both endpoints. When no prohibited token is present, any `-h` or `--help` token prints launcher help and suppresses timeout validation, child creation, and validation of other tokens. Without help, all tokens reach `intercom codex`; that command rejects unknown tokens.
+The launcher scans every token for launcher-owned transport options and internal selection options before any other action and rejects them. When no prohibited token is present, any `-h` or `--help` token prints launcher help and suppresses timeout validation, child creation, and validation of other tokens. It then consumes launcher session-selection options and forwards the remaining tokens to `intercom codex`; that command rejects unknown forwarded tokens. List-only mode accepts only `--cwd`, `--all-sessions`, `--list-sessions`, and help and rejects an adapter-only, unknown, or positional token before child creation. `--adopt` and `--fork-from` consume the immediately following token as an optional session ID only when that token does not begin with `-`. The `--adopt=SESSION_ID` and `--fork-from=SESSION_ID` forms always supply an explicit ID.
 
 #### Options
 
@@ -702,15 +812,29 @@ The launcher scans every token for `--app-server` or `--client-endpoint` before 
 | `--name NAME` | peer name | optional | adapter default | Forwards the peer name. |
 | `--cwd DIRECTORY` | directory path | optional | adapter default | Forwards the managed directory. |
 | `--new` | Boolean | optional | false | Forwards the new-binding selection. |
+| `--adopt [SESSION_ID]` | optional Codex thread ID | optional | interactive selection | Selects exact adoption. A separate ID token cannot begin with `-`; the `--adopt=SESSION_ID` form accepts any nonempty token for later ID validation. |
+| `--fork-from [SESSION_ID]` | optional Codex thread ID | optional | interactive selection | Selects safe fork. Optional-value parsing matches `--adopt`. |
+| `--all-sessions` | Boolean | optional | false | Removes the working-directory filter from list or ID-less interactive selection. It is invalid with an explicit session ID or without `--list-sessions`, ID-less `--adopt`, or ID-less `--fork-from`. |
+| `--list-sessions` | Boolean | optional | false | Lists matching resumable session records and exits after stopping app-server. It does not start the adapter, broker peer, TUI proxy, or MCP bridge. |
+| `--replace-binding` | Boolean | optional | false | Forwards explicit authorization to replace another saved binding. It requires `--adopt` or `--fork-from`. |
+| `--yolo` | Boolean | optional | false | Forwards service-wide approval `never` and `danger-full-access` selection. |
+| `--dangerously-bypass-approvals-and-sandbox` | Boolean | optional | false | Alias for `--yolo`. |
 | `-h`, `--help` | Boolean | optional | false | Prints launcher help without starting children. |
 | `--app-server` | prohibited | none | launcher-owned | Produces status 2 before starting children, in both split and `=` forms. |
 | `--client-endpoint` | prohibited | none | launcher-owned | Produces status 2 before starting children, in both split and `=` forms. |
+| `--mcp-bridge` | prohibited | none | launcher-owned | Produces status 2 before starting children, in both split and `=` forms. |
+| `--adopt-session` | prohibited | none | internal | Produces status 2 and directs the caller to `--adopt`, in both split and `=` forms. |
+| `--fork-session` | prohibited | none | internal | Produces status 2 and directs the caller to `--fork-from`, in both split and `=` forms. |
 
 #### Semantics
 
-The launcher selects `${XDG_RUNTIME_DIR}`, then `${TMPDIR}`, then `/tmp` as its runtime base. It creates a unique mode-0700 temporary directory, resolves that directory to a physical absolute path, and rejects a resolved pathname containing `%`, `?`, or `#` because the raw Unix endpoint must be accepted by both Codex and the Go URL parser. The directory contains the `app-server.sock` and `client.sock` pathnames. Separate launcher processes therefore use separate endpoints without port allocation. It starts `CODEX_BIN app-server --listen APP_SERVER_ENDPOINT`, sends app-server standard output to launcher standard error, and polls every 100 milliseconds for the upstream socket. It then starts `INTERCOM_BIN codex --app-server APP_SERVER_ENDPOINT --client-endpoint CLIENT_ENDPOINT` with the forwarded options. Adapter standard output remains launcher standard output and carries the readiness block.
+The launcher selects `${XDG_RUNTIME_DIR}`, then `${TMPDIR}`, then `/tmp` as its runtime base. It creates a unique mode-0700 temporary directory, resolves that directory to a physical absolute path, and rejects a resolved pathname containing `%`, `?`, or `#` because the raw Unix endpoint must be accepted by both Codex and the Go URL parser. The directory assigns the `app-server.sock`, `client.sock`, and `mcp-bridge.sock` pathnames. Separate launcher processes therefore use separate endpoints without port allocation. It starts `CODEX_BIN app-server --listen APP_SERVER_ENDPOINT`, sends app-server standard output to launcher standard error, and polls every 100 milliseconds for the upstream socket.
 
-The first printed attach command appears only after app-server initialization, managed-thread validation, broker registration, downstream proxy startup, and live-descriptor publication. The launcher continues running after a TUI disconnect. Multiple launchers may run on one machine subject to operating-system resource limits. Names must be distinct within one broker and within one `INTERCOM_DIR` managed-binding namespace. Equal names on different broker sockets still contend for `$INTERCOM_DIR/codex/NAME.lock`; separate `INTERCOM_DIR` values isolate that binding. Each launcher accepts at most one TUI at a time.
+For `--list-sessions`, the launcher next runs `INTERCOM_BIN codex sessions --app-server APP_SERVER_ENDPOINT [--cwd DIRECTORY] [--all] --list`, propagates its status, and stops app-server. For an ID-less adopt or fork, it runs the same selector without `--list`, leaves its standard error attached to the terminal, captures the one-line session ID from standard output, and rejects an empty or multiline result. An explicit ID bypasses selector startup.
+
+The service path starts `INTERCOM_BIN codex --app-server APP_SERVER_ENDPOINT --client-endpoint CLIENT_ENDPOINT --mcp-bridge MCP_BRIDGE_PATH`, adds the internal adopt or fork ID when selected, and forwards the remaining adapter options. Adapter standard output remains launcher standard output and carries the readiness block. A dynamic-tool thread does not create the MCP socket; an adopted, forked, or resumed MCP-bridge thread creates it with mode 0600 inside the private directory.
+
+The first printed attach command appears only after app-server initialization, managed-thread and tool validation, broker registration, downstream proxy startup, and live-descriptor publication. It includes the execution-policy name and attachment commands that inherit that policy. The launcher continues running after a TUI disconnect. Multiple launchers may run on one machine subject to operating-system resource limits. Peer names must be distinct within one broker and within one `INTERCOM_DIR` managed-binding namespace. Managed thread IDs must also be distinct across live Intercom adapters sharing one `CODEX_HOME`. Equal names on different broker sockets still contend for `$INTERCOM_DIR/codex/NAME.lock`. Separate `INTERCOM_DIR` values isolate binding names but do not isolate thread ownership because the thread lock is stored under `CODEX_HOME`. Each launcher accepts at most one TUI at a time.
 
 The service group remains in the foreground. A 100-millisecond poll checks the adapter first and app-server second. An observed child exit stops the other child. When both children become nonrunning between observations, adapter status takes precedence. Signal cleanup stops the adapter before app-server and removes the temporary directory. Each child receives `SIGTERM`, then `SIGKILL` when it remains running past the per-child timeout.
 
@@ -719,13 +843,22 @@ The service group remains in the foreground. A 100-millisecond poll checks the a
 | Condition | Result |
 |---|---|
 | Either nonblank timeout variable is nondecimal, zero, or greater than 922337203685477580 seconds, and help is not requested. | Status 2 before runtime-directory or child creation. Leading zeroes are accepted for a positive value. An unset or empty variable selects its default. |
-| `--app-server`, `--app-server=...`, `--client-endpoint`, or `--client-endpoint=...` is supplied. | Status 2 before child creation. |
+| `--app-server`, `--client-endpoint`, or `--mcp-bridge` is supplied in split or `=` form. | Status 2 before child creation. |
+| `--adopt-session` or `--fork-session` is supplied in split or `=` form. | Status 2 before child creation; the diagnostic names the public launcher option. |
+| More than one occurrence or kind among `--new`, `--adopt`, `--fork-from`, and `--list-sessions` is selected. | Status 2 before child creation. |
+| `--adopt=` or `--fork-from=` has an empty value. | Status 2 before child creation. |
+| `--cwd` is the final token and has no directory operand. | Status 2 before child creation. |
+| `--all-sessions` is not paired with `--list-sessions` or ID-less adoption or fork. | Status 2 before child creation. |
+| `--replace-binding` is not paired with adoption or fork. | Status 2 before child creation. |
+| `--list-sessions` is combined with `--name`, yolo selection, an unknown option, or a positional or other adapter-only token. | `--list-sessions does not accept adapter argument`; status 2 before child creation. |
 | Temporary-directory creation or chmod fails. | Status 1. |
 | The created runtime directory cannot be resolved to a physical absolute path. | Status 1 before child creation; the directory is removed. |
 | The resolved runtime directory contains `%`, `?`, or `#`. | Status 2 before child creation; the directory is removed. |
 | Codex executable startup fails. | Shell child-start failure status. |
 | App-server exits before its socket appears. | Its nonzero status is propagated; an observed zero status maps to 1 when it is the operational failure. |
 | The socket does not appear before the startup timeout. | Status 1; app-server is stopped. |
+| Session listing or interactive selection fails. | Selector status is propagated; app-server is stopped and no adapter starts. |
+| Interactive selection returns an empty or multiline ID despite selector success. | Status 1; app-server is stopped and no adapter starts. |
 | Adapter startup or runtime fails. | Adapter status is propagated; app-server is stopped. |
 | Downstream proxy creation, live-descriptor publication, or readiness-output writing fails. | Adapter status 1 is propagated; app-server is stopped. No usable attach command is printed. |
 | App-server exits while the adapter runs. | Nonzero app-server status is propagated; status 0 maps to 1; adapter is stopped. |
@@ -752,9 +885,15 @@ intercom-codex-project --name reviewer --cwd .
 
 The command prints a shell-safe `intercom codex attach --name reviewer` command prefixed with its descriptor-discovery and Codex-selection environment. That complete line runs in another terminal while the launcher remains in the foreground.
 
+The following invocation presents eligible sessions in the current project, adopts the selected ID exactly, and permits replacement of another saved binding only after the selected session passes validation:
+
+```sh
+intercom-codex-project --name reviewer --cwd . --adopt --replace-binding
+```
+
 #### See also
 
-[`intercom codex`](#intercom-codex), [`intercom codex attach`](#intercom-codex-attach), [Handbook: managed Codex](HANDBOOK.md#3-add-a-managed-codex-peer)
+[`intercom codex`](#intercom-codex), [`intercom codex attach`](#intercom-codex-attach), [`intercom codex sessions`](#intercom-codex-sessions), [Handbook: managed Codex](HANDBOOK.md#3-add-a-managed-codex-peer), [Handbook: resume, adopt, fork, or replace](HANDBOOK.md#5-resume-adopt-fork-or-replace-a-codex-thread)
 
 ## AGENT TOOLS
 
@@ -781,7 +920,7 @@ The tool validates arguments, connects or reconnects to the broker, issues one c
 
 Acceptance means that the broker wrote a `deliver` frame to the live destination connection. It does not mean that the destination adapter retained the frame after the write, that the model observed it, or that a reply exists.
 
-Claude MCP returns `{"content":[{"type":"text","text":"TEXT"}]}` on success and adds `"isError":true` on a tool failure. Codex returns `{"contentItems":[{"type":"inputText","text":"TEXT"}],"success":true}` on success and changes `success` to false on a tool failure.
+Claude MCP and the Codex MCP bridge return `{"content":[{"type":"text","text":"TEXT"}]}` on success and add `"isError":true` on a tool failure. A Codex app-server dynamic-tool result is `{"contentItems":[{"type":"inputText","text":"TEXT"}],"success":true}` on success and changes `success` to false on a tool failure.
 
 #### Errors
 
@@ -800,7 +939,7 @@ Claude MCP returns `{"content":[{"type":"text","text":"TEXT"}]}` on success and 
 | Delivery write fails or times out. | `send rejected (deliver_failed): ...` |
 | The broker-generated delivery envelope exceeds 262144 bytes. | `send rejected (oversize): ...`; shared tool preflight prevents this under the standard broker. |
 
-Claude MCP results mark these failures with `isError: true`. Codex dynamic-tool results set `success: false`.
+Claude MCP and Codex MCP-bridge results mark these failures with `isError: true`. Codex dynamic-tool results set `success: false`.
 
 #### Minimal example
 
@@ -831,7 +970,7 @@ The tool connects or reconnects to the broker and returns other registered peer 
 
 The empty result text is `No other peers are connected.`. A nonempty result has the form `Connected peers: NAME, NAME`.
 
-Claude MCP returns `{"content":[{"type":"text","text":"TEXT"}]}` on success and adds `"isError":true` on a tool failure. Codex returns `{"contentItems":[{"type":"inputText","text":"TEXT"}],"success":true}` on success and changes `success` to false on a tool failure.
+Claude MCP and the Codex MCP bridge return `{"content":[{"type":"text","text":"TEXT"}]}` on success and add `"isError":true` on a tool failure. A Codex app-server dynamic-tool result is `{"contentItems":[{"type":"inputText","text":"TEXT"}],"success":true}` on success and changes `success` to false on a tool failure.
 
 #### Errors
 
@@ -842,7 +981,7 @@ Claude MCP returns `{"content":[{"type":"text","text":"TEXT"}]}` on success and 
 | The object contains any member. | `list_peers does not accept arguments` |
 | Broker connection, write, correlation, or reply fails. | `list_peers failed: ...` |
 
-Claude MCP results mark these failures with `isError: true`. Codex dynamic-tool results set `success: false`.
+Claude MCP and Codex MCP-bridge results mark these failures with `isError: true`. Codex dynamic-tool results set `success: false`.
 
 #### Minimal example
 
@@ -873,13 +1012,14 @@ The operational command `intercom peers` claims `intercom-peers` for the lifetim
 | `INTERCOM_BROKER_LOG` | file path | broker | `$INTERCOM_DIR/broker.log` | Selects the append-only structured log. `--foreground` writes to standard error instead. |
 | `INTERCOM_BROKER_BIN` | executable path or name | shim, Codex adapter, `peers` | running `intercom` executable | Selects the command executed with argument `broker` during auto-start. Empty means default. |
 | `INTERCOM_IDLE_EXIT` | Go duration | broker | `10m` | Supplies idle exit only when `--idle-after` is absent. `0` disables. Blank means default. Invalid or negative content is fatal. |
-| `CODEX_BIN` | executable path or name | launcher, Codex adapter readiness output, and `codex attach` | `codex` | Selects the launcher child executed as `app-server --listen ENDPOINT` and the attach executable resolved through `PATH`. Unset or empty selects the default. The readiness attachment command includes this assignment; a slash-containing relative value is displayed as an absolute path. |
-| `INTERCOM_BIN` | executable path or name | launcher and Codex adapter readiness output | `intercom` | Selects the child adapter command and the Intercom executable token displayed in the attachment command. Unset or empty selects the default. A slash-containing relative value is displayed as an absolute path. The Nix-packaged launcher defaults to its bundled Intercom binary. |
+| `CODEX_BIN` | executable path or name | launcher, Codex adapter readiness output, session selection, and `codex attach` | `codex` | Selects the launcher child executed as `app-server --listen ENDPOINT` and the attach executable resolved through `PATH`. Unset or empty selects the default. The readiness attachment command includes this assignment; a slash-containing relative value is displayed as an absolute path. |
+| `INTERCOM_BIN` | executable path or name | launcher, session selection, MCP bridge, and Codex adapter readiness output | `intercom` | Selects the child adapter and selector command, the command injected as the managed MCP server, and the Intercom executable token displayed in the attachment command. Unset or empty selects the default. A slash-containing relative value is displayed as an absolute path. The Nix-packaged launcher defaults to its bundled Intercom binary. |
 | `INTERCOM_CODEX_STARTUP_TIMEOUT_SECONDS` | positive decimal seconds | launcher | `30` | Bounds socket readiness. Unset or empty selects the default. Otherwise zero, nondigits, and values above 922337203685477580 are fatal with status 2 unless help suppresses timeout validation. |
 | `INTERCOM_CODEX_SHUTDOWN_TIMEOUT_SECONDS` | positive decimal seconds per child | launcher | `40` | Bounds each child `SIGTERM` wait before `SIGKILL`. Unset or empty selects the default; other validation matches the startup timeout. |
+| `INTERCOM_CODEX_BRIDGE_TOKEN` | 64-character lowercase hexadecimal token | internal `codex-mcp-bridge` helper | none | Authenticates one service's helper to its private controller socket. The adapter generates and injects it through request-scoped MCP configuration. Users do not set or persist it. An absent value makes the helper fail before serving MCP. |
 | `XDG_RUNTIME_DIR` | directory path | launcher | none | Supplies the first-choice base for the launcher temporary directory. |
 | `TMPDIR` | directory path | launcher | none | Supplies the second-choice base when `XDG_RUNTIME_DIR` is empty. An unset or empty value selects `/tmp`. |
-| `CODEX_HOME` | directory path | app-server, binding identity, and readiness output | Codex-defined | Selects Codex configuration and rollout storage through Codex. A changed app-server-reported value makes an existing binding incompatible without `--new`. A nonempty value is displayed as an absolute assignment in both readiness commands. |
+| `CODEX_HOME` | directory path | app-server, session discovery, thread locks, binding identity, and readiness output | Codex-defined | Selects Codex configuration and rollout storage through Codex. A changed app-server-reported value makes an existing binding incompatible without a new or explicitly replaced selection. A nonempty value is displayed as an absolute assignment in both readiness commands. |
 | `HOME` | directory path | path defaults, Codex, shell | operating-system account home | Supplies the Intercom default directory when `INTERCOM_DIR` is empty. Home-resolution failure is fatal for commands that need the default directory. |
 | `PATH` | command search list | shell, launcher, and `codex attach` | shell-defined | Resolves `intercom`, `codex`, and launcher utility programs when their variables contain bare names. |
 
@@ -904,6 +1044,7 @@ All child processes inherit other environment variables unchanged. Provider auth
 |---|---|---|---|
 | `$INTERCOM_DIR/codex/NAME.json` | 0600 | persistent | Atomic Intercom-to-Codex binding. It contains identity metadata, not conversation messages. |
 | `$INTERCOM_DIR/codex/NAME.lock` | 0600 | persistent | Lifetime advisory lock. A running adapter holds `flock`; file existence alone has no ownership meaning. |
+| `$CODEX_HOME/.intercom/thread-locks/DIGEST.lock` | 0600 | persistent | Thread-ownership advisory lock shared by Intercom adapters that use this Codex home. `DIGEST` is the lowercase SHA-256 of the thread ID. One running Intercom adapter holds it for the managed thread, including across different `INTERCOM_DIR` values. Ordinary Codex processes do not acquire this lock. |
 
 The binding object contains every member in the following table:
 
@@ -916,10 +1057,11 @@ The binding object contains every member in the following table:
 | `codexHome` | string | App-server-reported Codex home identity. |
 | `serverUserAgent` | string | App-server user agent from the runtime that most recently passed thread start or resume validation. The value is diagnostic and does not gate resume. |
 | `codexVersion` | string | Extracted Codex semantic version from the runtime that most recently passed thread start or resume validation. The value is diagnostic and does not gate resume. |
-| `toolContractVersion` | number | Dynamic-tool contract `1`. |
+| `toolContractVersion` | number | Intercom tool contract `1`. |
+| `toolTransport` | string | `dynamic` for a thread created by Intercom, or `mcpBridge` for an adopted or forked interactive thread. An omitted schema-1 member is interpreted as `dynamic` and receives the explicit member after a successful persisted update. |
 | `materialized` | Boolean | True after the first terminal turn is confirmed readable. |
 
-The state decoder ignores unknown object members. A missing member receives its JSON zero value. Missing required members, schema version 0, and tool-contract version 0 fail validation; an omitted `materialized` member is false. A successful saved-thread resume refreshes `serverUserAgent` and `codexVersion` atomically after the returned thread and materialization state pass validation. A failed resume leaves both diagnostic values unchanged.
+The state decoder ignores unknown object members. A missing member receives its JSON zero value except for the `toolTransport` compatibility rule above. Missing required members, schema version 0, tool-contract version 0, and an unknown tool transport fail validation; an omitted `materialized` member is false. A successful saved-thread resume refreshes `serverUserAgent` and `codexVersion` atomically after the returned thread, tool status, and materialization state pass validation. A failed resume leaves both diagnostic values unchanged. Adoption and fork replace the entire record only after startup, thread, and tool validation succeeds.
 
 Codex rollout and conversation files remain under `CODEX_HOME` and are owned by Codex. `--new` does not delete them.
 
@@ -936,7 +1078,7 @@ The descriptor object contains exactly the following members. Unknown members, d
 
 | Member | JSON type | Required value or meaning |
 |---|---|---|
-| `schemaVersion` | number | Live-descriptor schema `1`. |
+| `schemaVersion` | number | Live-descriptor schema `2`. |
 | `peer` | string | Selected Intercom peer name, 1 through 64 bytes under the peer-name grammar. |
 | `cwd` | string | Clean absolute managed directory spelling, at most 4096 bytes and without NUL. Symbolic links are not resolved by descriptor validation. |
 | `brokerSocketIdentity` | string | Clean absolute broker socket identity used in the descriptor key, at most 4096 bytes and without NUL. |
@@ -945,12 +1087,13 @@ The descriptor object contains exactly the following members. Unknown members, d
 | `pid` | number | Positive adapter process ID. |
 | `instanceNonce` | string | Random 128-bit lowercase hexadecimal owner nonce. Accepted descriptors permit 16 through 256 ASCII letters, digits, hyphens, or underscores. |
 | `codexVersion` | string | Nonblank Codex version, at most 4096 bytes and without control characters. |
+| `executionPolicy` | string | `workspace-write` or `danger-full-access`. Attach derives the Codex CLI policy option from this value. |
 
 Publication holds the registry lock and replaces an absent descriptor, a descriptor with the same nonce, or a descriptor whose recorded PID does not exist. A descriptor with another nonce and an existing PID blocks publication. Attach validates the file and checks the PID but does not probe the downstream socket. A process crash can leave a stale descriptor; attach reports it and the next publisher may replace it.
 
 ### Launcher files
 
-The launcher creates `intercom-codex.XXXXXX` with mode 0700 beneath its selected runtime base and resolves the created directory to its physical absolute pathname before constructing endpoints. Codex creates `app-server.sock`; the containing directory supplies its Intercom-side access boundary. The adapter creates `client.sock` with mode 0600. The launcher removes the temporary directory on handled exit. `SIGKILL`, host failure, or shell failure can leave the directory and sockets behind.
+The launcher creates `intercom-codex.XXXXXX` with mode 0700 beneath its selected runtime base and resolves the created directory to its physical absolute pathname before constructing endpoints. Codex creates `app-server.sock`; the containing directory supplies its Intercom-side access boundary. The adapter creates `client.sock` with mode 0600. An adapter managing an adopted, forked, or resumed MCP-bridge thread also creates `mcp-bridge.sock` with mode 0600 and validates that the parent is a real mode-0700 directory owned by the effective user. The launcher removes the temporary directory on handled exit. `SIGKILL`, host failure, or shell failure can leave the directory and sockets behind.
 
 ## LIMITS AND TIMERS
 
@@ -959,8 +1102,12 @@ The launcher creates `intercom-codex.XXXXXX` with mode 0700 beneath its selected
 | Peer name | 64 | ASCII bytes |
 | Raw agent-tool message | 204800 | UTF-8 bytes before JSON escaping |
 | Broker JSON payload | 262144 | bytes, excluding the four-byte frame prefix |
-| Claude MCP input line | 8388608 | bytes; a line reaching scanner capacity is rejected |
+| Intercom stdio MCP input line | 8388608 | bytes for Claude shim or Codex MCP helper; a line reaching scanner capacity is rejected |
 | Codex app-server JSON message | 134217728 | bytes per WebSocket text message |
+| Codex session-list page request | 50 | records requested per app-server page; all cursored pages are collected |
+| Codex session ID | 256 | UTF-8 bytes; printable and free of whitespace |
+| Codex MCP bridge frame | 1048576 | bytes per newline-terminated request or response |
+| Concurrent Codex MCP bridge handlers | 64 | authenticated connections; an excess request receives overload failure and closes |
 | Broker accepted connections and registered peers | no Intercom limit | operating-system descriptors, memory, and process resources bound the count |
 | Claude concurrent MCP tool handlers | no Intercom limit | one goroutine per active `tools/call`; process resources bound the count |
 | Codex inbound delivery queue | 64 | messages not yet started; an attempted 65th queued delivery is fatal |
@@ -985,13 +1132,16 @@ The launcher creates `intercom-codex.XXXXXX` with mode 0700 beneath its selected
 | Broker initial dial | 1 | second |
 | Broker spawn retry waits | 100 ms, 300 ms, 1 s, 3 s | maximum scheduled waits before up to four one-second-bounded dials; spawned-broker exit ends the current wait early, and scheduling plus dial duration add to elapsed time |
 | Codex app-server initial connection | 30 | seconds total; retries begin at 50 ms and double up to an effective 1.6 s step |
+| Codex session discovery | 30 | seconds total for app-server connection, initialization, and all list pages; terminal prompting occurs after discovery |
 | Codex app-server control operation | 30 | seconds per initialize, initialized notification, thread control call, turn-start write, or turn-start response |
+| Codex managed MCP status validation | 30 | seconds total across all status pages during one startup or cold resume |
 | Codex startup broker registration | 30 | seconds total around broker-client connection and registration |
 | Codex post-terminal materialization confirmation | 30 | seconds total; `thread/read` retries after 50-millisecond delays while Codex reports pre-materialization |
 | Codex shutdown | 30 | seconds shared across broker close, turn interrupt and drain, and reverse-handler drain |
 | Codex broker-close wait during shutdown | 15 | seconds by default; first half of the shared shutdown budget is reserved for broker close before app-server cleanup proceeds |
 | Codex headless or dynamic-tool reverse request | 10 | seconds total: 9 seconds for handling and 1 second for the response write; a request delegated to the TUI uses the separate interactive limit |
-| Codex dynamic-tool descendant ancestry | 64 | distinct thread IDs examined by one `thread/read` parent-and-fork walk |
+| Codex MCP bridge request | 10 | seconds per authenticated tool operation, including broker handling and reply |
+| Codex Intercom-tool descendant ancestry | 64 | distinct thread IDs examined by one dynamic-tool or MCP authorization `thread/read` parent-and-fork walk |
 | Codex active-turn inactivity | 15 | minutes since app-server activity |
 | Codex TUI pre-ready handshake | 30 | seconds from WebSocket acceptance through successful managed-thread resume; uses the adapter control timeout and releases the sole-session slot on expiry |
 | Codex TUI WebSocket write | 30 | seconds per downstream response, notification, or reverse-request frame; uses the adapter control timeout and disconnects the TUI on expiry |
@@ -1010,7 +1160,7 @@ Tool-call reply waiting uses the calling MCP or Codex request context. It has no
 
 `intercom` command failures have the form `intercom: MESSAGE` on standard error and status 1. Subcommand sections enumerate command-specific failure conditions. Broker routing codes are exhaustive in [Broker Protocol: error codes](BROKER_PROTOCOL.md#error-codes).
 
-Tool argument and routing failures are returned to the model as tool failures. They do not terminate a Claude shim. A Codex dynamic-tool protocol or ownership violation is fatal to the managed adapter because it invalidates sole thread control.
+Tool argument and routing failures are returned to the model as tool failures. They do not terminate a Claude shim. A Codex dynamic-tool or MCP-bridge ownership violation is fatal to the managed adapter because it invalidates sole thread control.
 
 Operating-system errors preserve their underlying diagnostic. They arise when required directories, files, sockets, executables, signals, locks, or standard streams cannot be accessed as described in the command entry.
 

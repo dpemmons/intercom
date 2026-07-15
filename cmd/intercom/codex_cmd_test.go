@@ -36,6 +36,29 @@ func TestRootRegistersCodexWithBackendNeutralDescription(t *testing.T) {
 	}
 }
 
+func TestCodexMCPBridgeCmdValidatesInternalOptions(t *testing.T) {
+	newCommand := func(args ...string) *cobra.Command {
+		cmd := newCodexMCPBridgeCmd()
+		cmd.SetArgs(args)
+		cmd.SetIn(strings.NewReader(""))
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		return cmd
+	}
+
+	t.Setenv(codexBridgeTokenEnv, "")
+	err := newCommand("--socket", filepath.Join(t.TempDir(), "bridge.sock")).Execute()
+	if err == nil || !strings.Contains(err.Error(), "token is not set") {
+		t.Fatalf("missing-token error = %v", err)
+	}
+
+	t.Setenv(codexBridgeTokenEnv, strings.Repeat("a", 64))
+	err = newCommand("--socket", filepath.Join(t.TempDir(), "bridge.sock"), "--timeout", "0s").Execute()
+	if err == nil || !strings.Contains(err.Error(), "timeout must be positive") {
+		t.Fatalf("invalid-timeout error = %v", err)
+	}
+}
+
 func TestCodexCmdWiresFlagsAndRuntimePaths(t *testing.T) {
 	project := t.TempDir()
 	appSocket := filepath.Join(t.TempDir(), "codex socket.sock")
@@ -268,11 +291,12 @@ func TestCodexCmdPublishesReadinessAndRemovesDescriptor(t *testing.T) {
 			return errors.New("OnReady is nil")
 		}
 		if err := cfg.OnReady(codex.ReadyInfo{
-			Name:           cfg.Name,
-			CWD:            cfg.CWD,
-			ThreadID:       "019-thread-id",
-			ClientEndpoint: cfg.ClientEndpoint,
-			CodexVersion:   "codex-cli 0.144.1",
+			Name:            cfg.Name,
+			CWD:             cfg.CWD,
+			ThreadID:        "019-thread-id",
+			ClientEndpoint:  cfg.ClientEndpoint,
+			CodexVersion:    "codex-cli 0.144.1",
+			ExecutionPolicy: cfg.ExecutionPolicy,
 		}); err != nil {
 			return err
 		}
@@ -326,7 +350,7 @@ func TestCodexCmdPublishesReadinessAndRemovesDescriptor(t *testing.T) {
 	}, " ")
 	wantDirect := "CODEX_HOME=" + shellQuote(wantCodexHome) +
 		" 'codex-test' resume --remote " + shellQuote(wantEndpoint) + " 019-thread-id"
-	wantOutput := fmt.Sprintf(readinessText, "PrologMotion", wantAttach, wantDirect)
+	wantOutput := fmt.Sprintf(readinessText, "PrologMotion", codex.ExecutionWorkspaceWrite, wantAttach, wantDirect)
 	if output.String() != wantOutput {
 		t.Fatalf("readiness output:\n%s\nwant:\n%s", output.String(), wantOutput)
 	}
@@ -338,7 +362,8 @@ func TestCodexCmdPublishesReadinessAndRemovesDescriptor(t *testing.T) {
 		live.ThreadID != "019-thread-id" ||
 		live.PID != os.Getpid() ||
 		live.InstanceNonce == "" ||
-		live.CodexVersion != "codex-cli 0.144.1" {
+		live.CodexVersion != "codex-cli 0.144.1" ||
+		live.ExecutionPolicy != codexinstance.ExecutionWorkspaceWrite {
 		t.Fatalf("live descriptor = %+v", live)
 	}
 
@@ -366,6 +391,7 @@ func TestCodexCmdPublishesCanonicalCWDThroughSymlink(t *testing.T) {
 		if err := cfg.OnReady(codex.ReadyInfo{
 			Name: cfg.Name, CWD: project, ThreadID: "thread-id",
 			ClientEndpoint: cfg.ClientEndpoint, CodexVersion: appserver.MinimumSupportedVersion,
+			ExecutionPolicy: cfg.ExecutionPolicy,
 		}); err != nil {
 			return err
 		}
@@ -401,11 +427,12 @@ func TestCodexCmdRemovesDescriptorWhenReadinessOutputFails(t *testing.T) {
 
 	run := func(_ context.Context, cfg codex.Config) error {
 		return cfg.OnReady(codex.ReadyInfo{
-			Name:           cfg.Name,
-			CWD:            cfg.CWD,
-			ThreadID:       "thread-id",
-			ClientEndpoint: cfg.ClientEndpoint,
-			CodexVersion:   "codex-cli 0.144.1",
+			Name:            cfg.Name,
+			CWD:             cfg.CWD,
+			ThreadID:        "thread-id",
+			ClientEndpoint:  cfg.ClientEndpoint,
+			CodexVersion:    "codex-cli 0.144.1",
+			ExecutionPolicy: cfg.ExecutionPolicy,
 		})
 	}
 	cmd := newCodexCmdWithRunner(run)
@@ -446,7 +473,7 @@ func TestCodexAttachExecutesResumeInManagedCWD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publishTestDescriptor(t, codexinstance.Descriptor{
+	descriptor := codexinstance.Descriptor{
 		SchemaVersion:          codexinstance.SchemaVersion,
 		Peer:                   "PrologMotion",
 		CWD:                    project,
@@ -456,7 +483,9 @@ func TestCodexAttachExecutesResumeInManagedCWD(t *testing.T) {
 		PID:                    os.Getpid(),
 		InstanceNonce:          "attach-test-nonce",
 		CodexVersion:           "codex-cli 0.144.1",
-	})
+		ExecutionPolicy:        codexinstance.ExecutionWorkspaceWrite,
+	}
+	publishTestDescriptor(t, descriptor)
 
 	before, err := os.Getwd()
 	if err != nil {
@@ -501,6 +530,23 @@ func TestCodexAttachExecutesResumeInManagedCWD(t *testing.T) {
 	if after != before {
 		t.Fatalf("cwd after injected exec = %q, want restored %q", after, before)
 	}
+
+	descriptor.ExecutionPolicy = codexinstance.ExecutionDangerFullAccess
+	publishTestDescriptor(t, descriptor)
+	gotArgv = nil
+	cmd = newCodexCmdWithDependencies(func(context.Context, codex.Config) error {
+		return errors.New("service runner must not run")
+	}, replace)
+	cmd.SetArgs([]string{"attach", "--name", "PrologMotion"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	wantArgv = []string{codexBin, "resume", "--dangerously-bypass-approvals-and-sandbox", "--remote", endpoint, "019-thread-id"}
+	if !slices.Equal(gotArgv, wantArgv) {
+		t.Fatalf("danger-full-access exec argv = %#v, want %#v", gotArgv, wantArgv)
+	}
 }
 
 func TestCodexAttachResolvesRelativeExecutableBeforeChangingDirectory(t *testing.T) {
@@ -536,6 +582,7 @@ func TestCodexAttachResolvesRelativeExecutableBeforeChangingDirectory(t *testing
 		PID:                    os.Getpid(),
 		InstanceNonce:          "relative-bin-test-nonce",
 		CodexVersion:           "codex-cli 0.144.1",
+		ExecutionPolicy:        codexinstance.ExecutionWorkspaceWrite,
 	})
 
 	var gotPath, gotCWD string
@@ -600,6 +647,7 @@ func TestCodexAttachReportsMissingAndStaleInstances(t *testing.T) {
 		PID:                    1 << 30,
 		InstanceNonce:          "stale-test-nonce",
 		CodexVersion:           "codex-cli 0.144.1",
+		ExecutionPolicy:        codexinstance.ExecutionWorkspaceWrite,
 	})
 	err = newAttach("stale-peer")
 	if err == nil || !errors.Is(err, codexinstance.ErrStale) {

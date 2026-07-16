@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ type fakeAppServer struct {
 	startErr            error
 	resume              appserver.ThreadResumeResponse
 	resumeErr           error
+	resumeHook          func(appserver.ThreadResumeParams)
 	fork                appserver.ThreadForkResponse
 	forkErr             error
 	list                appserver.ThreadListResponse
@@ -40,6 +42,9 @@ type fakeAppServer struct {
 	readErr             error
 	threadReadResponses map[string]appserver.ThreadReadResponse
 	threadReadErrors    map[string]error
+	goalGet             appserver.ThreadGoalGetResponse
+	goalGetErr          error
+	goalGetHook         func()
 	turnStart           appserver.TurnStartResponse
 	turnStartResponses  []appserver.TurnStartResponse
 	turnStartHook       func(context.Context, appserver.TurnStartParams) error
@@ -53,6 +58,7 @@ type fakeAppServer struct {
 	threadLists      []appserver.ThreadListParams
 	mcpStatusLists   []appserver.MCPServerStatusListParams
 	threadReads      []appserver.ThreadReadParams
+	goalGets         []appserver.ThreadGoalGetParams
 	turnStarts       []appserver.TurnStartParams
 	interrupts       []appserver.TurnInterruptParams
 	done             chan struct{}
@@ -102,7 +108,11 @@ func (f *fakeAppServer) ThreadStart(_ context.Context, params appserver.ThreadSt
 func (f *fakeAppServer) ThreadResume(_ context.Context, params appserver.ThreadResumeParams) (appserver.ThreadResumeResponse, error) {
 	f.mu.Lock()
 	f.threadResumes = append(f.threadResumes, params)
+	hook := f.resumeHook
 	f.mu.Unlock()
+	if hook != nil {
+		hook(params)
+	}
 	return f.resume, f.resumeErr
 }
 func (f *fakeAppServer) ThreadFork(_ context.Context, params appserver.ThreadForkParams) (appserver.ThreadForkResponse, error) {
@@ -139,6 +149,16 @@ func (f *fakeAppServer) ThreadRead(_ context.Context, params appserver.ThreadRea
 		return appserver.ThreadReadResponse{}, err
 	}
 	return appserver.ThreadReadResponse{Thread: f.start.Thread}, f.readErr
+}
+func (f *fakeAppServer) ThreadGoalGet(_ context.Context, params appserver.ThreadGoalGetParams) (appserver.ThreadGoalGetResponse, error) {
+	f.mu.Lock()
+	f.goalGets = append(f.goalGets, params)
+	response, err, hook := f.goalGet, f.goalGetErr, f.goalGetHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return response, err
 }
 func (f *fakeAppServer) StartTurn(_ context.Context, params appserver.TurnStartParams) (appserver.TurnStartAwait, error) {
 	f.mu.Lock()
@@ -262,6 +282,27 @@ func (b *fakeBroker) ListPeers(context.Context) ([]string, error) { return []str
 func (b *fakeBroker) ConnectionEvents() <-chan brokerclient.ConnectionEvent {
 	return b.events
 }
+
+type recordingTUIProxy struct {
+	events chan string
+	done   chan struct{}
+}
+
+func newRecordingTUIProxy() *recordingTUIProxy {
+	return &recordingTUIProxy{events: make(chan string, 8), done: make(chan struct{})}
+}
+
+func (p *recordingTUIProxy) Notify(notification appserver.Notification) {
+	p.events <- "notify:" + notification.Method
+}
+
+func (p *recordingTUIProxy) ForwardReverse(_ context.Context, request *appserver.ReverseRequest) (bool, error) {
+	p.events <- "reverse:" + request.Method
+	return true, nil
+}
+
+func (p *recordingTUIProxy) Done() <-chan struct{} { return p.done }
+func (p *recordingTUIProxy) Close() error          { return nil }
 
 type controllerHarness struct {
 	cfg         Config
@@ -1026,13 +1067,186 @@ func TestControllerShutdownReservesCleanupBudgetWhenBrokerCloseBlocks(t *testing
 	})
 }
 
+func TestControllerShutdownInterruptsGoalContinuationStartedDuringBrokerClose(t *testing.T) {
+	app := newFakeApp(t.TempDir())
+	broker := newFakeBroker(brokerclient.ClientOptions{})
+	var c *controller
+	broker.closeHook = func() {
+		for _, notification := range []appserver.Notification{
+			{
+				Method: appserver.NotificationTurnCompleted,
+				Params: mustJSONBytes(appserver.TurnCompletedNotification{
+					ThreadID: "thread-1",
+					Turn:     appserver.Turn{ID: "goal-turn-1", Status: appserver.TurnStatusCompleted},
+				}),
+			},
+			{
+				Method: appserver.NotificationTurnStarted,
+				Params: mustJSONBytes(appserver.TurnStartedNotification{
+					ThreadID: "thread-1",
+					Turn:     appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusInProgress},
+				}),
+			},
+		} {
+			c.enqueueNotification(notification)
+		}
+	}
+	app.interruptHook = func(params appserver.TurnInterruptParams) error {
+		c.enqueueNotification(appserver.Notification{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: params.ThreadID,
+				Turn:     appserver.Turn{ID: params.TurnID, Status: appserver.TurnStatusInterrupted},
+			}),
+		})
+		return nil
+	}
+	c = &controller{
+		cfg:                   Config{ControlTimeout: time.Second},
+		logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		app:                   app,
+		broker:                broker,
+		phase:                 phaseActive,
+		threadID:              "thread-1",
+		turnID:                "goal-turn-1",
+		turnOwner:             turnOwnerCodex,
+		codexGoalActive:       true,
+		turnStartResponseSeen: true,
+		notifications:         make(chan queuedNotification, 8),
+		activity:              make(chan struct{}, 1),
+		fatal:                 make(chan error, 1),
+		lifecycleWait:         make(chan struct{}),
+	}
+
+	c.shutdown(nil)
+	app.mu.Lock()
+	interrupts := append([]appserver.TurnInterruptParams(nil), app.interrupts...)
+	app.mu.Unlock()
+	if len(interrupts) != 1 || interrupts[0].ThreadID != "thread-1" || interrupts[0].TurnID != "goal-turn-2" {
+		t.Fatalf("shutdown turn interrupts = %#v, want newest goal continuation", interrupts)
+	}
+}
+
+func TestControllerShutdownRetriesGoalContinuationStartedDuringInterrupt(t *testing.T) {
+	app := newFakeApp(t.TempDir())
+	broker := newFakeBroker(brokerclient.ClientOptions{})
+	var c *controller
+	app.interruptHook = func(params appserver.TurnInterruptParams) error {
+		if params.TurnID == "goal-turn-1" {
+			for _, notification := range []appserver.Notification{
+				{
+					Method: appserver.NotificationTurnCompleted,
+					Params: mustJSONBytes(appserver.TurnCompletedNotification{
+						ThreadID: params.ThreadID,
+						Turn:     appserver.Turn{ID: params.TurnID, Status: appserver.TurnStatusCompleted},
+					}),
+				},
+				{
+					Method: appserver.NotificationTurnStarted,
+					Params: mustJSONBytes(appserver.TurnStartedNotification{
+						ThreadID: params.ThreadID,
+						Turn:     appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusInProgress},
+					}),
+				},
+			} {
+				c.enqueueNotification(notification)
+			}
+			return nil
+		}
+		c.enqueueNotification(appserver.Notification{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: params.ThreadID,
+				Turn:     appserver.Turn{ID: params.TurnID, Status: appserver.TurnStatusInterrupted},
+			}),
+		})
+		return nil
+	}
+	c = &controller{
+		cfg:                   Config{ControlTimeout: time.Second},
+		logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		app:                   app,
+		broker:                broker,
+		phase:                 phaseActive,
+		threadID:              "thread-1",
+		turnID:                "goal-turn-1",
+		turnOwner:             turnOwnerCodex,
+		codexGoalActive:       true,
+		turnStartResponseSeen: true,
+		notifications:         make(chan queuedNotification, 8),
+		activity:              make(chan struct{}, 1),
+		fatal:                 make(chan error, 1),
+		lifecycleWait:         make(chan struct{}),
+	}
+
+	c.shutdown(nil)
+	app.mu.Lock()
+	interrupts := append([]appserver.TurnInterruptParams(nil), app.interrupts...)
+	app.mu.Unlock()
+	if len(interrupts) != 2 || interrupts[0].TurnID != "goal-turn-1" || interrupts[1].TurnID != "goal-turn-2" {
+		t.Fatalf("shutdown turn interrupts = %#v, want original then continuation", interrupts)
+	}
+}
+
+func TestControllerShutdownInterruptsGoalTurnStartedWhileHandlersDrain(t *testing.T) {
+	app := newFakeApp(t.TempDir())
+	broker := newFakeBroker(brokerclient.ClientOptions{})
+	var c *controller
+	app.waitHandlersHook = func(context.Context) error {
+		c.enqueueNotification(appserver.Notification{
+			Method: appserver.NotificationTurnStarted,
+			Params: mustJSONBytes(appserver.TurnStartedNotification{
+				ThreadID: "thread-1",
+				Turn:     appserver.Turn{ID: "goal-turn-late", Status: appserver.TurnStatusInProgress},
+			}),
+		})
+		return nil
+	}
+	app.interruptHook = func(params appserver.TurnInterruptParams) error {
+		c.enqueueNotification(appserver.Notification{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: params.ThreadID,
+				Turn:     appserver.Turn{ID: params.TurnID, Status: appserver.TurnStatusInterrupted},
+			}),
+		})
+		return nil
+	}
+	c = &controller{
+		cfg:             Config{ControlTimeout: time.Second},
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		app:             app,
+		broker:          broker,
+		phase:           phaseIdle,
+		threadID:        "thread-1",
+		codexGoalActive: true,
+		notifications:   make(chan queuedNotification, 4),
+		activity:        make(chan struct{}, 1),
+		fatal:           make(chan error, 1),
+		lifecycleWait:   make(chan struct{}),
+	}
+
+	c.shutdown(nil)
+	app.mu.Lock()
+	interrupts := append([]appserver.TurnInterruptParams(nil), app.interrupts...)
+	app.mu.Unlock()
+	if len(interrupts) != 1 || interrupts[0].TurnID != "goal-turn-late" {
+		t.Fatalf("shutdown turn interrupts = %#v, want late goal continuation", interrupts)
+	}
+}
+
 func TestControllerStartupGateClosesRaceDuringBrokerConnect(t *testing.T) {
 	h := newControllerHarness(t)
 	var broker *fakeBroker
 	h.cfg.newBroker = func(opts brokerclient.ClientOptions) brokerConnection {
 		broker = newFakeBroker(opts)
 		broker.connectHook = func(int) {
-			h.app.opts.OnReverseRequestReceived(appserver.MethodDynamicToolCall)
+			h.app.opts.OnReverseRequestReceived(&appserver.ReverseRequest{
+				Method: appserver.MethodDynamicToolCall,
+				Params: mustJSONBytes(appserver.DynamicToolCallParams{
+					ThreadID: "thread-1", TurnID: "unowned-turn", CallID: "call-1", Tool: "list_peers", Arguments: json.RawMessage(`{}`),
+				}),
+			})
 		}
 		h.brokerReady <- broker
 		return broker
@@ -1049,6 +1263,248 @@ func TestControllerStartupGateClosesRaceDuringBrokerConnect(t *testing.T) {
 	case <-broker.closed:
 	case <-time.After(time.Second):
 		t.Fatal("broker remained registered after startup violation")
+	}
+}
+
+func TestCodexOwnedTurnToolWaitsForBrokerReadiness(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &controller{
+		ctx:           ctx,
+		phase:         phaseActive,
+		turnOwner:     turnOwnerCodex,
+		threadID:      "thread-1",
+		turnID:        "goal-turn",
+		lifecycleWait: make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- c.authorizeReverse(t.Context(), "thread-1", "goal-turn")
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("pre-ready goal tool did not wait: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	c.mu.Lock()
+	c.ready = true
+	c.signalLifecycleChangeLocked()
+	c.mu.Unlock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("goal tool authorization after readiness = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("goal tool remained blocked after broker readiness")
+	}
+}
+
+func TestPreReadyGoalToolRejectsMismatchedTurnWithoutWaiting(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &controller{
+		ctx:             ctx,
+		phase:           phaseActive,
+		turnOwner:       turnOwnerCodex,
+		threadID:        "thread-1",
+		turnID:          "goal-turn",
+		codexGoalActive: true,
+		lifecycleWait:   make(chan struct{}),
+	}
+	started := time.Now()
+	err := c.authorizeReverse(t.Context(), "thread-1", "piggyback-turn")
+	if err == nil || !strings.Contains(err.Error(), "ownership is not established") {
+		t.Fatalf("mismatched pre-ready tool error = %v", err)
+	}
+	if time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("mismatched pre-ready tool waited for readiness: %v", time.Since(started))
+	}
+	if !c.hasStartupViolation() {
+		t.Fatal("mismatched pre-ready tool did not latch a startup violation")
+	}
+}
+
+func TestSpontaneousTurnRequiresPersistentGoalReservation(t *testing.T) {
+	c := &controller{phase: phaseIdle, threadID: "thread-1"}
+	if err := c.reconcileTurn("thread-1", "unexpected", appserver.TurnStatusInProgress); err == nil ||
+		!strings.Contains(err.Error(), "without a persistent-goal scheduler reservation") {
+		t.Fatalf("unreserved spontaneous turn error = %v", err)
+	}
+	c.codexGoalActive = true
+	if err := c.reconcileTurn("thread-1", "goal-turn", appserver.TurnStatusInProgress); err != nil {
+		t.Fatalf("reserved goal turn was rejected: %v", err)
+	}
+	if c.phase != phaseActive || c.turnOwner != turnOwnerCodex || c.turnID != "goal-turn" {
+		t.Fatalf("goal turn state = phase %s owner %s turn %q", c.phase, c.turnOwner, c.turnID)
+	}
+}
+
+func TestGoalNotificationsReserveOnlyManagedScheduler(t *testing.T) {
+	c := &controller{
+		threadID:      "thread-1",
+		lifecycleWait: make(chan struct{}),
+		stateChanged:  make(chan struct{}, 1),
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	foreign := appserver.Notification{
+		Method: appserver.NotificationThreadGoalUpdated,
+		Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+			ThreadID: "other-thread",
+			Goal:     appserver.ThreadGoal{Status: "future-status"},
+		}),
+	}
+	if err := c.observeGoalNotification(foreign); err != nil {
+		t.Fatalf("foreign malformed goal notification affected controller: %v", err)
+	}
+	if c.codexGoalActive {
+		t.Fatal("foreign goal reserved the managed scheduler")
+	}
+
+	setStatus := func(status string) {
+		t.Helper()
+		err := c.observeGoalNotification(appserver.Notification{
+			Method: appserver.NotificationThreadGoalUpdated,
+			Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+				ThreadID: "thread-1",
+				Goal:     appserver.ThreadGoal{ThreadID: "thread-1", Status: status},
+			}),
+		})
+		if err != nil {
+			t.Fatalf("observe goal status %q: %v", status, err)
+		}
+	}
+	setStatus(appserver.ThreadGoalStatusActive)
+	if !c.codexGoalActive {
+		t.Fatal("active goal did not reserve the managed scheduler")
+	}
+	setStatus("future-status")
+	if !c.codexGoalActive {
+		t.Fatal("unknown goal status released scheduler ownership")
+	}
+	setStatus(appserver.ThreadGoalStatusComplete)
+	if c.codexGoalActive {
+		t.Fatal("complete goal retained scheduler ownership")
+	}
+}
+
+func TestGoalNotificationSupersedesEarlierGoalReadResponse(t *testing.T) {
+	t.Run("completion supersedes active response", func(t *testing.T) {
+		app := newFakeApp(t.TempDir())
+		c := &controller{
+			app:          app,
+			cfg:          Config{ControlTimeout: time.Second},
+			threadID:     "thread-1",
+			logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+			stateChanged: make(chan struct{}, 1),
+		}
+		app.goalGet.Goal = &appserver.ThreadGoal{
+			ThreadID: "thread-1",
+			Status:   appserver.ThreadGoalStatusActive,
+		}
+		app.goalGetHook = func() {
+			if err := c.observeGoalNotification(appserver.Notification{
+				Method: appserver.NotificationThreadGoalUpdated,
+				Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+					ThreadID: "thread-1",
+					Goal:     appserver.ThreadGoal{ThreadID: "thread-1", Status: appserver.ThreadGoalStatusComplete},
+				}),
+			}); err != nil {
+				t.Errorf("observe completion: %v", err)
+			}
+		}
+		if err := c.refreshGoalReservation(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if c.codexGoalActive {
+			t.Fatal("earlier active goal/read response overwrote later completion notification")
+		}
+	})
+
+	t.Run("activation supersedes null response", func(t *testing.T) {
+		app := newFakeApp(t.TempDir())
+		c := &controller{
+			app:          app,
+			cfg:          Config{ControlTimeout: time.Second},
+			threadID:     "thread-1",
+			logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+			stateChanged: make(chan struct{}, 1),
+		}
+		app.goalGetHook = func() {
+			if err := c.observeGoalNotification(appserver.Notification{
+				Method: appserver.NotificationThreadGoalUpdated,
+				Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+					ThreadID: "thread-1",
+					Goal:     appserver.ThreadGoal{ThreadID: "thread-1", Status: appserver.ThreadGoalStatusActive},
+				}),
+			}); err != nil {
+				t.Errorf("observe activation: %v", err)
+			}
+		}
+		if err := c.refreshGoalReservation(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if !c.codexGoalActive {
+			t.Fatal("earlier null goal/read response overwrote later activation notification")
+		}
+	})
+}
+
+func TestDeferredGoalContinuationRetainsAdmissionReservation(t *testing.T) {
+	c := &controller{
+		logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ready:                 true,
+		phase:                 phaseActive,
+		threadID:              "thread-1",
+		turnID:                "goal-turn-1",
+		turnOwner:             turnOwnerCodex,
+		codexGoalActive:       true,
+		turnStartResponseSeen: true,
+		notifications:         make(chan queuedNotification, 4),
+		activity:              make(chan struct{}, 1),
+		fatal:                 make(chan error, 1),
+		lifecycleWait:         make(chan struct{}),
+	}
+	for _, notification := range []appserver.Notification{
+		{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-1", Status: appserver.TurnStatusCompleted},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnStarted,
+			Params: mustJSONBytes(appserver.TurnStartedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusInProgress},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusCompleted},
+			}),
+		},
+		{
+			Method: appserver.NotificationThreadGoalUpdated,
+			Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+				ThreadID: "thread-1",
+				Goal:     appserver.ThreadGoal{ThreadID: "thread-1", Status: appserver.ThreadGoalStatusComplete},
+			}),
+		},
+	} {
+		c.enqueueNotification(notification)
+	}
+	if c.codexGoalActive {
+		t.Fatal("goal completion did not release the continuation gap")
+	}
+	for index := 0; index < 3; index++ {
+		if err := c.finishNotification(t.Context(), <-c.notifications); err != nil {
+			t.Fatalf("finish queued lifecycle %d: %v", index+1, err)
+		}
+	}
+	if c.phase != phaseIdle || c.turnOwner != turnOwnerNone {
+		t.Fatalf("completed continuation = phase %s owner %s", c.phase, c.turnOwner)
 	}
 }
 
@@ -1091,6 +1547,215 @@ func TestControllerActiveTurnWatchdogClosesPresenceAndInterrupts(t *testing.T) {
 	h.app.mu.Unlock()
 	if len(interrupts) != 1 || interrupts[0].ThreadID != "thread-1" || interrupts[0].TurnID != "turn-1" {
 		t.Fatalf("turn interrupts = %#v", interrupts)
+	}
+}
+
+func TestControllerActiveTurnWatchdogPausesForInteractiveReverseRequest(t *testing.T) {
+	app := newFakeApp(t.TempDir())
+	broker := newFakeBroker(brokerclient.ClientOptions{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &controller{
+		ctx:           ctx,
+		cfg:           Config{ActivityTimeout: 20 * time.Millisecond},
+		phase:         phaseActive,
+		threadID:      "thread-1",
+		app:           app,
+		broker:        broker,
+		deliveries:    make(chan wire.Deliver, 1),
+		notifications: make(chan queuedNotification, 1),
+		fatal:         make(chan error, 1),
+		activity:      make(chan struct{}, 1),
+		stateChanged:  make(chan struct{}, 1),
+		reconnectDone: make(chan error, 1),
+		lifecycleWait: make(chan struct{}),
+	}
+	request := &appserver.ReverseRequest{
+		Method: appserver.MethodMCPServerElicitation,
+		Params: json.RawMessage(`{"threadId":"thread-1"}`),
+	}
+	c.observeReverseRequest(request)
+	done := make(chan error, 1)
+	go func() { done <- c.loop(ctx) }()
+	select {
+	case err := <-done:
+		t.Fatalf("interactive reverse request did not suspend watchdog: %v", err)
+	case <-time.After(3 * c.cfg.ActivityTimeout):
+	}
+
+	c.endInteractiveReverse(request)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "no app-server activity") {
+			t.Fatalf("watchdog after interactive request = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not restart after interactive reverse request")
+	}
+}
+
+func TestInteractiveReverseWaitsForDeferredTUILifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	proxy := newRecordingTUIProxy()
+	c := &controller{
+		ctx:                ctx,
+		cfg:                Config{ControlTimeout: time.Second, ActivityTimeout: time.Second},
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ready:              true,
+		phase:              phaseActive,
+		threadID:           "thread-1",
+		proxyEventGate:     true,
+		proxyEventQueue:    []appserver.Notification{{Method: appserver.NotificationTurnStarted}},
+		lifecycleWait:      make(chan struct{}),
+		activity:           make(chan struct{}, 1),
+		stateChanged:       make(chan struct{}, 1),
+		fatal:              make(chan error, 1),
+		interactiveReverse: 0,
+	}
+	c.proxy = proxy
+	request := &appserver.ReverseRequest{
+		Method: appserver.MethodMCPServerElicitation,
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1"}`),
+	}
+	c.observeReverseRequest(request)
+	done := make(chan struct{})
+	go func() {
+		c.handleReverseRequest(request)
+		close(done)
+	}()
+	select {
+	case event := <-proxy.events:
+		t.Fatalf("reverse request overtook deferred lifecycle event: %s", event)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	c.releaseProxyEventGate()
+	for _, want := range []string{
+		"notify:" + appserver.NotificationTurnStarted,
+		"reverse:" + appserver.MethodMCPServerElicitation,
+	} {
+		select {
+		case got := <-proxy.events:
+			if got != want {
+				t.Fatalf("proxy event = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("proxy did not receive %q", want)
+		}
+	}
+	waitForSignal(t, "interactive reverse completion", done)
+	c.mu.Lock()
+	pending := c.interactiveReverse
+	c.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("interactive reverse count = %d, want 0", pending)
+	}
+}
+
+func TestInteractiveReverseIgnoresThreadOutsideManagedAncestry(t *testing.T) {
+	proxy := newRecordingTUIProxy()
+	c := &controller{
+		cfg:               Config{ControlTimeout: time.Second, ActivityTimeout: time.Second},
+		logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ready:             true,
+		phase:             phaseActive,
+		threadID:          "thread-1",
+		descendantThreads: map[string]struct{}{"child-thread": {}},
+		activity:          make(chan struct{}, 1),
+		stateChanged:      make(chan struct{}, 1),
+	}
+	c.proxy = proxy
+	request := &appserver.ReverseRequest{
+		Method: appserver.MethodMCPServerElicitation,
+		Params: json.RawMessage(`{"threadId":"unrelated-thread","turnId":null}`),
+	}
+	activitySeq := c.activitySeq.Load()
+	answered := func() bool {
+		return reflect.ValueOf(request).Elem().FieldByName("answered").Bool()
+	}
+	if answered() {
+		t.Fatal("new reverse request is already answered")
+	}
+	c.observeReverseRequest(request)
+	if answered() {
+		t.Fatal("ordered receipt answered reverse request")
+	}
+	c.handleReverseRequest(request)
+	if !answered() {
+		t.Fatal("unrelated reverse request was left unanswered")
+	}
+	select {
+	case event := <-proxy.events:
+		t.Fatalf("unrelated reverse request reached managed TUI: %s", event)
+	default:
+	}
+	if c.interactiveReverse != 0 {
+		t.Fatalf("interactive reverse count = %d, want 0", c.interactiveReverse)
+	}
+	if got := c.activitySeq.Load(); got != activitySeq {
+		t.Fatalf("unrelated reverse request changed activity generation from %d to %d", activitySeq, got)
+	}
+	select {
+	case <-c.activity:
+		t.Fatal("unrelated reverse request signaled managed activity")
+	default:
+	}
+
+	for _, threadID := range []string{"thread-1", "child-thread"} {
+		owned, err := c.ownsInteractiveReverseThread(&appserver.ReverseRequest{
+			Method: appserver.MethodMCPServerElicitation,
+			Params: json.RawMessage(fmt.Sprintf(`{"threadId":%q}`, threadID)),
+		})
+		if err != nil || !owned {
+			t.Fatalf("owned reverse thread %q = %v, %v", threadID, owned, err)
+		}
+	}
+}
+
+func TestWatchdogRejectsExpiryConcurrentWithInteractiveResponse(t *testing.T) {
+	request := &appserver.ReverseRequest{}
+	c := &controller{
+		phase:               phaseActive,
+		interactiveReverse:  1,
+		interactiveRequests: map[*appserver.ReverseRequest]struct{}{request: {}},
+		activity:            make(chan struct{}, 1),
+	}
+	expected := c.activitySeq.Load()
+	c.endInteractiveReverse(request)
+	if c.claimWatchdogExpiry(expected) {
+		t.Fatal("stale watchdog expiry won after an interactive response")
+	}
+	if c.phase != phaseActive {
+		t.Fatalf("phase = %s, want active", c.phase)
+	}
+}
+
+func TestPersistentGoalContinuationGapHasWatchdog(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &controller{
+		ctx:             ctx,
+		cfg:             Config{ActivityTimeout: 20 * time.Millisecond},
+		ready:           true,
+		phase:           phaseIdle,
+		codexGoalActive: true,
+		app:             newFakeApp(t.TempDir()),
+		broker:          newFakeBroker(brokerclient.ClientOptions{}),
+		deliveries:      make(chan wire.Deliver, 1),
+		notifications:   make(chan queuedNotification, 1),
+		fatal:           make(chan error, 1),
+		activity:        make(chan struct{}, 1),
+		stateChanged:    make(chan struct{}, 1),
+		reconnectDone:   make(chan error, 1),
+		lifecycleWait:   make(chan struct{}),
+	}
+	err := c.loop(ctx)
+	if err == nil || !strings.Contains(err.Error(), "persistent goal had no app-server activity") {
+		t.Fatalf("continuation-gap watchdog error = %v", err)
+	}
+	if c.phase != phaseFailed {
+		t.Fatalf("phase = %s, want failed", c.phase)
 	}
 }
 
@@ -1928,7 +2593,7 @@ func TestTUIResumeRewritePreservesClientFields(t *testing.T) {
 
 func TestTUISettingsUpdatePinsManagedPolicyAndFiltersFields(t *testing.T) {
 	c := &controller{
-		cfg: Config{CWD: t.TempDir()}, threadID: "thread-1", phase: phaseIdle,
+		cfg: Config{CWD: t.TempDir()}, threadID: "thread-1", ready: true, phase: phaseIdle,
 		sandbox: appserver.SandboxPolicy{Type: "workspaceWrite", NetworkAccess: false},
 	}
 	params := json.RawMessage(`{
@@ -1946,8 +2611,8 @@ func TestTUISettingsUpdatePinsManagedPolicyAndFiltersFields(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("beforeTUIRequest() error = %v", rpcErr)
 	}
-	if state != nil {
-		t.Fatalf("thread/settings/update state = %#v, want nil", state)
+	if _, ok := state.(tuiSettingsReservation); !ok {
+		t.Fatalf("thread/settings/update state = %#v, want settings reservation", state)
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(rewritten, &object); err != nil {
@@ -1971,15 +2636,17 @@ func TestTUISettingsUpdatePinsManagedPolicyAndFiltersFields(t *testing.T) {
 	if _, ok := object["futureField"]; ok {
 		t.Fatalf("unknown future field survived: %s", rewritten)
 	}
+	c.afterTUIRequest("thread/settings/update", state, json.RawMessage(`{}`), nil)
 
 	nullCWD := json.RawMessage(`{"threadId":"thread-1","cwd":null,"model":"gpt-test"}`)
-	rewritten, _, rpcErr = c.beforeTUIRequest("thread/settings/update", nullCWD)
+	rewritten, state, rpcErr = c.beforeTUIRequest("thread/settings/update", nullCWD)
 	if rpcErr != nil {
 		t.Fatalf("null cwd beforeTUIRequest() error = %v", rpcErr)
 	}
 	if !strings.Contains(string(rewritten), fmt.Sprintf(`"cwd":%q`, c.cfg.CWD)) {
 		t.Fatalf("null cwd was not pinned: %s", rewritten)
 	}
+	c.afterTUIRequest("thread/settings/update", state, json.RawMessage(`{}`), nil)
 }
 
 func TestTUITurnReservationReconcilesEventBeforeResponse(t *testing.T) {
@@ -2130,6 +2797,84 @@ func TestTUITurnReservationReconcilesCompletionBeforeResponse(t *testing.T) {
 	}
 }
 
+func TestDeferredThirdGoalTurnToolWaitsForItsLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &controller{
+		ctx:                   ctx,
+		logger:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ready:                 true,
+		phase:                 phaseActive,
+		threadID:              "thread-1",
+		turnID:                "goal-turn-1",
+		turnOwner:             turnOwnerCodex,
+		codexGoalActive:       true,
+		turnStartResponseSeen: true,
+		notifications:         make(chan queuedNotification, 8),
+		activity:              make(chan struct{}, 1),
+		fatal:                 make(chan error, 1),
+		lifecycleWait:         make(chan struct{}),
+	}
+	for _, notification := range []appserver.Notification{
+		{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-1", Status: appserver.TurnStatusCompleted},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnStarted,
+			Params: mustJSONBytes(appserver.TurnStartedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusInProgress},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusCompleted},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnStarted,
+			Params: mustJSONBytes(appserver.TurnStartedNotification{
+				ThreadID: "thread-1", Turn: appserver.Turn{ID: "goal-turn-3", Status: appserver.TurnStatusInProgress},
+			}),
+		},
+	} {
+		c.enqueueNotification(notification)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- c.authorizeReverse(ctx, "thread-1", "goal-turn-3") }()
+	select {
+	case err := <-result:
+		t.Fatalf("future-turn tool did not wait: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := c.finishNotification(ctx, <-c.notifications); err != nil {
+			t.Fatalf("finish queued lifecycle %d: %v", i+1, err)
+		}
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("future-turn tool escaped before turn/started was applied: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := c.finishNotification(ctx, <-c.notifications); err != nil {
+		t.Fatalf("finish third turn/start: %v", err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("third-turn tool authorization = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("third-turn tool remained blocked after its lifecycle was applied")
+	}
+}
+
 func TestTUIReservationWinsAtomicRaceWithBrokerDelivery(t *testing.T) {
 	c := &controller{ready: true, phase: phaseIdle, fatal: make(chan error, 1)}
 	if _, rpcErr := c.reserveTUITurn(); rpcErr != nil {
@@ -2141,6 +2886,38 @@ func TestTUIReservationWinsAtomicRaceWithBrokerDelivery(t *testing.T) {
 	}
 	if c.turnOwner != turnOwnerTUI || c.phase != phaseStarting {
 		t.Fatalf("broker delivery replaced TUI reservation: phase %s owner %s", c.phase, c.turnOwner)
+	}
+}
+
+func TestTUISettingsReservationWinsAtomicRaceWithTurns(t *testing.T) {
+	c := &controller{
+		cfg: Config{CWD: t.TempDir()}, ready: true, phase: phaseIdle, threadID: "thread-1",
+		stateChanged: make(chan struct{}, 1), lifecycleWait: make(chan struct{}),
+	}
+	_, reservation, rpcErr := c.beforeTUIRequest("thread/settings/update", json.RawMessage(`{"threadId":"thread-1"}`))
+	if rpcErr != nil {
+		t.Fatalf("reserve settings = %v", rpcErr)
+	}
+	if _, turnErr := c.reserveTUITurn(); turnErr == nil {
+		t.Fatal("TUI turn overtook in-flight settings update")
+	}
+	err := c.startDelivery(t.Context(), wire.Deliver{ID: "queued", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)})
+	if !errors.Is(err, errTurnAlreadyReserved) {
+		t.Fatalf("startDelivery() error = %v, want %v", err, errTurnAlreadyReserved)
+	}
+	c.afterTUIRequest("thread/settings/update", reservation, json.RawMessage(`{}`), nil)
+	if _, turnErr := c.reserveTUITurn(); turnErr != nil {
+		t.Fatalf("reserve TUI turn after settings completion = %v", turnErr)
+	}
+}
+
+func TestPersistentGoalReservationBlocksTUIStartAndSettings(t *testing.T) {
+	c := &controller{ready: true, phase: phaseIdle, threadID: "thread-1", codexGoalActive: true}
+	if _, rpcErr := c.reserveTUITurn(); rpcErr == nil {
+		t.Fatal("TUI turn reserved while a persistent goal owned the scheduler")
+	}
+	if _, _, rpcErr := c.beforeTUIRequest("thread/settings/update", json.RawMessage(`{"threadId":"thread-1"}`)); rpcErr == nil {
+		t.Fatal("TUI settings update passed during a persistent-goal continuation gap")
 	}
 }
 

@@ -28,6 +28,7 @@ const (
 	MethodThreadFork          = "thread/fork"
 	MethodThreadList          = "thread/list"
 	MethodThreadRead          = "thread/read"
+	MethodThreadGoalGet       = "thread/goal/get"
 	MethodThreadUnsubscribe   = "thread/unsubscribe"
 	MethodTurnStart           = "turn/start"
 	MethodTurnInterrupt       = "turn/interrupt"
@@ -54,6 +55,8 @@ const (
 const (
 	NotificationError                         = "error"
 	NotificationThreadStarted                 = "thread/started"
+	NotificationThreadGoalUpdated             = "thread/goal/updated"
+	NotificationThreadGoalCleared             = "thread/goal/cleared"
 	NotificationTurnStarted                   = "turn/started"
 	NotificationTurnCompleted                 = "turn/completed"
 	NotificationItemStarted                   = "item/started"
@@ -606,6 +609,38 @@ type TurnError struct {
 type ThreadStartedNotification struct {
 	Thread Thread `json:"thread"`
 }
+
+type ThreadGoalUpdatedNotification struct {
+	ThreadID string     `json:"threadId"`
+	TurnID   *string    `json:"turnId"`
+	Goal     ThreadGoal `json:"goal"`
+}
+
+type ThreadGoalClearedNotification struct {
+	ThreadID string `json:"threadId"`
+}
+
+type ThreadGoalGetParams struct {
+	ThreadID string `json:"threadId"`
+}
+
+type ThreadGoalGetResponse struct {
+	Goal *ThreadGoal `json:"goal"`
+}
+
+type ThreadGoal struct {
+	ThreadID string `json:"threadId"`
+	Status   string `json:"status"`
+}
+
+const (
+	ThreadGoalStatusActive        = "active"
+	ThreadGoalStatusPaused        = "paused"
+	ThreadGoalStatusBlocked       = "blocked"
+	ThreadGoalStatusUsageLimited  = "usageLimited"
+	ThreadGoalStatusBudgetLimited = "budgetLimited"
+	ThreadGoalStatusComplete      = "complete"
+)
 
 type TurnStartedNotification struct {
 	ThreadID string `json:"threadId"`

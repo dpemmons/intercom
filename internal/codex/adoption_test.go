@@ -3,6 +3,7 @@ package codex
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/dpemmons/intercom/internal/appserver"
 	"github.com/dpemmons/intercom/internal/brokerclient"
+	"github.com/dpemmons/intercom/internal/wire"
 )
 
 func prepareInteractiveSession(t *testing.T, h *controllerHarness, threadID string) {
@@ -131,6 +133,158 @@ func TestControllerAdoptsInteractiveSessionTransactionally(t *testing.T) {
 	}
 }
 
+func TestControllerAdoptsActiveGoalLifecycleDuringResume(t *testing.T) {
+	h := newControllerHarness(t)
+	prepareInteractiveSession(t, h, "ordinary-thread")
+	h.cfg.AdoptThreadID = "ordinary-thread"
+	h.app.turnStart = appserver.TurnStartResponse{
+		Turn: appserver.Turn{ID: "delivery-turn", Status: appserver.TurnStatusInProgress},
+	}
+	h.app.goalGet.Goal = &appserver.ThreadGoal{ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusActive}
+	h.app.resumeHook = func(appserver.ThreadResumeParams) {
+		for _, notification := range []appserver.Notification{
+			{
+				Method: appserver.NotificationThreadGoalUpdated,
+				Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+					ThreadID: "ordinary-thread",
+					Goal: appserver.ThreadGoal{
+						ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusActive,
+					},
+				}),
+			},
+			{
+				Method: appserver.NotificationTurnStarted,
+				Params: mustJSONBytes(appserver.TurnStartedNotification{
+					ThreadID: "ordinary-thread",
+					Turn:     appserver.Turn{ID: "goal-turn-1", Status: appserver.TurnStatusInProgress},
+				}),
+			},
+			{
+				Method: appserver.NotificationTurnCompleted,
+				Params: mustJSONBytes(appserver.TurnCompletedNotification{
+					ThreadID: "ordinary-thread",
+					Turn:     appserver.Turn{ID: "goal-turn-1", Status: appserver.TurnStatusCompleted},
+				}),
+			},
+			{
+				Method: appserver.NotificationTurnStarted,
+				Params: mustJSONBytes(appserver.TurnStartedNotification{
+					ThreadID: "ordinary-thread",
+					Turn:     appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusInProgress},
+				}),
+			},
+		} {
+			h.app.opts.OnNotification(notification)
+		}
+	}
+
+	cancel, done := runHarness(t, h)
+	h.broker.opts.OnDeliver(wire.Deliver{
+		ID: "queued-delivery", From: "alice", Message: "wait for the goal",
+		Timestamp: "2026-07-15T18:00:00Z",
+	})
+	time.Sleep(25 * time.Millisecond)
+	if got := turnStartCount(h.app); got != 0 {
+		t.Fatalf("broker delivery overtook Codex-owned goal turn: %d starts", got)
+	}
+
+	h.app.opts.OnNotification(appserver.Notification{
+		Method: appserver.NotificationThreadGoalUpdated,
+		Params: mustJSON(t, appserver.ThreadGoalUpdatedNotification{
+			ThreadID: "ordinary-thread",
+			Goal: appserver.ThreadGoal{
+				ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusComplete,
+			},
+		}),
+	})
+	h.app.opts.OnNotification(appserver.Notification{
+		Method: appserver.NotificationTurnCompleted,
+		Params: mustJSON(t, appserver.TurnCompletedNotification{
+			ThreadID: "ordinary-thread",
+			Turn:     appserver.Turn{ID: "goal-turn-2", Status: appserver.TurnStatusCompleted},
+		}),
+	})
+	waitFor(t, "queued delivery after automatic goal turns", func() bool {
+		return turnStartCount(h.app) == 1
+	})
+	h.app.opts.OnNotification(appserver.Notification{
+		Method: appserver.NotificationTurnCompleted,
+		Params: mustJSON(t, appserver.TurnCompletedNotification{
+			ThreadID: "ordinary-thread",
+			Turn:     appserver.Turn{ID: "delivery-turn", Status: appserver.TurnStatusCompleted},
+		}),
+	})
+	stopHarness(t, cancel, done)
+}
+
+func TestControllerQueuesDeliveryAcrossPersistentGoalContinuationGap(t *testing.T) {
+	h := newControllerHarness(t)
+	prepareInteractiveSession(t, h, "ordinary-thread")
+	h.cfg.AdoptThreadID = "ordinary-thread"
+	h.app.turnStart = appserver.TurnStartResponse{
+		Turn: appserver.Turn{ID: "delivery-turn", Status: appserver.TurnStatusInProgress},
+	}
+	h.app.goalGet.Goal = &appserver.ThreadGoal{ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusActive}
+
+	cancel, done := runHarness(t, h)
+	h.broker.opts.OnDeliver(wire.Deliver{
+		ID: "queued-delivery", From: "alice", Message: "wait across the scheduler gap",
+		Timestamp: "2026-07-15T18:00:00Z",
+	})
+	time.Sleep(25 * time.Millisecond)
+	if got := turnStartCount(h.app); got != 0 {
+		t.Fatalf("broker delivery occupied persistent-goal continuation gap: %d starts", got)
+	}
+
+	for _, notification := range []appserver.Notification{
+		{
+			Method: appserver.NotificationThreadGoalUpdated,
+			Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+				ThreadID: "ordinary-thread",
+				Goal: appserver.ThreadGoal{
+					ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusActive,
+				},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnStarted,
+			Params: mustJSONBytes(appserver.TurnStartedNotification{
+				ThreadID: "ordinary-thread",
+				Turn:     appserver.Turn{ID: "goal-turn", Status: appserver.TurnStatusInProgress},
+			}),
+		},
+		{
+			Method: appserver.NotificationThreadGoalUpdated,
+			Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+				ThreadID: "ordinary-thread",
+				Goal: appserver.ThreadGoal{
+					ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusComplete,
+				},
+			}),
+		},
+		{
+			Method: appserver.NotificationTurnCompleted,
+			Params: mustJSONBytes(appserver.TurnCompletedNotification{
+				ThreadID: "ordinary-thread",
+				Turn:     appserver.Turn{ID: "goal-turn", Status: appserver.TurnStatusCompleted},
+			}),
+		},
+	} {
+		h.app.opts.OnNotification(notification)
+	}
+	waitFor(t, "delivery after persistent goal released scheduler ownership", func() bool {
+		return turnStartCount(h.app) == 1
+	})
+	h.app.opts.OnNotification(appserver.Notification{
+		Method: appserver.NotificationTurnCompleted,
+		Params: mustJSONBytes(appserver.TurnCompletedNotification{
+			ThreadID: "ordinary-thread",
+			Turn:     appserver.Turn{ID: "delivery-turn", Status: appserver.TurnStatusCompleted},
+		}),
+	})
+	stopHarness(t, cancel, done)
+}
+
 func TestControllerForksInteractiveSessionWithoutOwningSource(t *testing.T) {
 	h := newControllerHarness(t)
 	prepareInteractiveSession(t, h, "source-thread")
@@ -217,6 +371,57 @@ func TestControllerFailedAdoptionPreservesExistingBinding(t *testing.T) {
 	_ = lock.Close()
 }
 
+func TestControllerReplacementRetainsPriorThreadLockThroughRollbackWindow(t *testing.T) {
+	h := newControllerHarness(t)
+	prepareInteractiveSession(t, h, "replacement-thread")
+	old := validState()
+	old.CWD = h.cfg.CWD
+	old.CodexHome = h.app.init.CodexHome
+	old.ServerUserAgent = h.app.init.UserAgent
+	old.ThreadID = "old-thread"
+	old.Materialized = true
+	writeManagedState(t, h.cfg, old)
+	h.cfg.AdoptThreadID = "replacement-thread"
+	h.cfg.ReplaceBinding = true
+	oldLockPath, err := h.cfg.threadLockPath(old.CodexHome, old.ThreadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := false
+	h.cfg.OnReady = func(ReadyInfo) error {
+		checked = true
+		lock, lockErr := AcquireThreadLock(oldLockPath)
+		if lockErr == nil {
+			_ = lock.Close()
+			return errors.New("prior thread lock was released before replacement commit")
+		}
+		if !strings.Contains(lockErr.Error(), "already managed") {
+			return fmt.Errorf("inspect prior thread lock: %w", lockErr)
+		}
+		return errors.New("readiness publication failed")
+	}
+
+	err = Run(t.Context(), h.cfg)
+	if err == nil || !strings.Contains(err.Error(), "publish readiness: readiness publication failed") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !checked {
+		t.Fatal("readiness hook did not inspect prior thread lock")
+	}
+	got, readErr := readManagedState(h.cfg.StatePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if got != old {
+		t.Fatalf("failed replacement changed binding: got %#v, want %#v", got, old)
+	}
+	lock, lockErr := AcquireThreadLock(oldLockPath)
+	if lockErr != nil {
+		t.Fatalf("prior thread lock remained held after rollback: %v", lockErr)
+	}
+	_ = lock.Close()
+}
+
 func TestControllerAdoptionCommitWaitsForBrokerAndProxyReadiness(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -240,6 +445,13 @@ func TestControllerAdoptionCommitWaitsForBrokerAndProxyReadiness(t *testing.T) {
 				h.cfg.ClientEndpoint = "unix://" + filepath.Join(h.cfg.CWD, "client.sock")
 			},
 			wantError: "does not expose raw proxy calls",
+		},
+		{
+			name: "readiness publication",
+			configure: func(h *controllerHarness) {
+				h.cfg.OnReady = func(ReadyInfo) error { return errors.New("descriptor unavailable") }
+			},
+			wantError: "publish readiness",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -268,6 +480,60 @@ func TestControllerAdoptionCommitWaitsForBrokerAndProxyReadiness(t *testing.T) {
 				t.Fatalf("failed startup changed binding: got %#v, want %#v", got, old)
 			}
 		})
+	}
+}
+
+func TestControllerStartupFailureInterruptsResumedGoalTurn(t *testing.T) {
+	h := newControllerHarness(t)
+	prepareInteractiveSession(t, h, "ordinary-thread")
+	h.cfg.AdoptThreadID = "ordinary-thread"
+	h.app.mcpStatusErr = errors.New("managed MCP status unavailable")
+	h.app.goalGet.Goal = &appserver.ThreadGoal{ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusActive}
+	h.app.resumeHook = func(appserver.ThreadResumeParams) {
+		for _, notification := range []appserver.Notification{
+			{
+				Method: appserver.NotificationThreadGoalUpdated,
+				Params: mustJSONBytes(appserver.ThreadGoalUpdatedNotification{
+					ThreadID: "ordinary-thread",
+					Goal: appserver.ThreadGoal{
+						ThreadID: "ordinary-thread", Status: appserver.ThreadGoalStatusActive,
+					},
+				}),
+			},
+			{
+				Method: appserver.NotificationTurnStarted,
+				Params: mustJSONBytes(appserver.TurnStartedNotification{
+					ThreadID: "ordinary-thread",
+					Turn:     appserver.Turn{ID: "goal-turn", Status: appserver.TurnStatusInProgress},
+				}),
+			},
+		} {
+			h.app.opts.OnNotification(notification)
+		}
+	}
+
+	started := time.Now()
+	err := Run(t.Context(), h.cfg)
+	if err == nil || !strings.Contains(err.Error(), "verify managed MCP server") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= h.cfg.ControlTimeout {
+		t.Fatalf("startup cleanup consumed the full control timeout: %v", elapsed)
+	}
+	h.app.mu.Lock()
+	interrupts := append([]appserver.TurnInterruptParams(nil), h.app.interrupts...)
+	h.app.mu.Unlock()
+	if len(interrupts) != 1 || interrupts[0].ThreadID != "ordinary-thread" || interrupts[0].TurnID != "goal-turn" {
+		t.Fatalf("startup-failure turn interrupts = %#v", interrupts)
+	}
+	if _, statErr := os.Stat(h.cfg.StatePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed adoption persisted a binding: %v", statErr)
+	}
+	broker := <-h.brokerReady
+	select {
+	case <-broker.closed:
+	default:
+		t.Fatal("startup failure left broker client open")
 	}
 }
 

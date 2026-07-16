@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dpemmons/intercom/internal/appserver"
@@ -90,6 +91,7 @@ type appServerClient interface {
 	ThreadFork(context.Context, appserver.ThreadForkParams) (appserver.ThreadForkResponse, error)
 	ThreadList(context.Context, appserver.ThreadListParams) (appserver.ThreadListResponse, error)
 	ThreadRead(context.Context, appserver.ThreadReadParams) (appserver.ThreadReadResponse, error)
+	ThreadGoalGet(context.Context, appserver.ThreadGoalGetParams) (appserver.ThreadGoalGetResponse, error)
 	MCPServerStatusList(context.Context, appserver.MCPServerStatusListParams) (appserver.MCPServerStatusListResponse, error)
 	StartTurn(context.Context, appserver.TurnStartParams) (appserver.TurnStartAwait, error)
 	TurnInterrupt(context.Context, appserver.TurnInterruptParams) error
@@ -107,6 +109,13 @@ type brokerConnection interface {
 	ConnectionEvents() <-chan brokerclient.ConnectionEvent
 }
 
+type tuiProxy interface {
+	Notify(appserver.Notification)
+	ForwardReverse(context.Context, *appserver.ReverseRequest) (bool, error)
+	Done() <-chan struct{}
+	Close() error
+}
+
 type controllerPhase uint8
 
 type turnOwner uint8
@@ -120,6 +129,7 @@ type queuedNotification struct {
 	notification      appserver.Notification
 	applied           bool
 	managedCompletion bool
+	deferredLifecycle bool
 }
 
 const (
@@ -136,6 +146,7 @@ const (
 	turnOwnerNone turnOwner = iota
 	turnOwnerIntercom
 	turnOwnerTUI
+	turnOwnerCodex
 )
 
 func (p controllerPhase) String() string {
@@ -167,23 +178,27 @@ func (o turnOwner) String() string {
 		return "intercom"
 	case turnOwnerTUI:
 		return "tui"
+	case turnOwnerCodex:
+		return "codex"
 	default:
 		return "unknown"
 	}
 }
 
 type controller struct {
-	cfg          Config
-	ctx          context.Context
-	logger       *slog.Logger
-	store        *StateStore
-	state        *ManagedState
-	pendingState *ManagedState
-	threadLock   *ThreadLock
-	app          appServerClient
-	broker       brokerConnection
-	bridge       *codexbridge.Controller
-	bridgeToken  string
+	cfg             Config
+	ctx             context.Context
+	logger          *slog.Logger
+	store           *StateStore
+	state           *ManagedState
+	pendingState    *ManagedState
+	threadLock      *ThreadLock
+	priorThreadLock *ThreadLock
+	priorThreadID   string
+	app             appServerClient
+	broker          brokerConnection
+	bridge          *codexbridge.Controller
+	bridgeToken     string
 
 	deliveries    chan wire.Deliver
 	notifications chan queuedNotification
@@ -212,13 +227,23 @@ type controller struct {
 	startAmbiguous        bool
 	turnTerminalSeen      bool
 	turnTerminalProcessed bool
+	codexGoalActive       bool
+	goalRevision          uint64
+	deferredLifecycle     int
+	deferredTurnIDs       map[string]struct{}
+	deferredGoalTurnIDs   map[string]struct{}
+	latestDeferredTurnID  string
+	interactiveReverse    int
+	interactiveRequests   map[*appserver.ReverseRequest]struct{}
+	settingsInFlight      bool
+	lifecycleWait         chan struct{}
 	proxyEventGate        bool
 	proxyEventQueue       []appserver.Notification
 
 	reverse reverseHandler
 
 	proxyMu sync.RWMutex
-	proxy   *appserverproxy.Proxy
+	proxy   tuiProxy
 
 	syntheticResumeMu sync.RWMutex
 	syntheticResume   json.RawMessage
@@ -227,6 +252,7 @@ type controller struct {
 	codexVersion          string
 	turnOwner             turnOwner
 	turnStartResponseSeen bool
+	activitySeq           atomic.Uint64
 }
 
 // Run connects one externally supervised app-server thread to the Intercom
@@ -250,6 +276,7 @@ func Run(parent context.Context, cfg Config) error {
 		activity:      make(chan struct{}, 1),
 		stateChanged:  make(chan struct{}, 1),
 		reconnectDone: make(chan error, 1),
+		lifecycleWait: make(chan struct{}),
 	}
 
 	store, err := AcquireStateStore(cfg.StatePath, cfg.LockPath)
@@ -262,12 +289,20 @@ func Run(parent context.Context, cfg Config) error {
 		if err := c.releaseThreadLock(); err != nil {
 			c.logger.Warn("release Codex thread lock", "err", err)
 		}
+		if err := c.releasePriorThreadLock(); err != nil {
+			c.logger.Warn("release prior Codex thread lock", "err", err)
+		}
 	}()
 	if !cfg.New {
 		c.state, err = store.Load()
 		if err != nil {
 			return err
 		}
+	}
+	var persistedState *ManagedState
+	if c.state != nil {
+		copy := *c.state
+		persistedState = &copy
 	}
 	if c.state != nil && (cfg.AdoptThreadID != "" || cfg.ForkThreadID != "") {
 		if cfg.AdoptThreadID == c.state.ThreadID {
@@ -276,6 +311,11 @@ func Run(parent context.Context, cfg Config) error {
 			c.cfg.AdoptThreadID = ""
 		} else if !cfg.ReplaceBinding {
 			return fmt.Errorf("codex: peer %q already binds thread %s; use --replace-binding to replace it", cfg.Name, c.state.ThreadID)
+		}
+	}
+	if persistedState != nil && (c.cfg.AdoptThreadID != "" || c.cfg.ForkThreadID != "") {
+		if err := c.acquirePriorThreadLock(persistedState.CodexHome, persistedState.ThreadID); err != nil {
+			return err
 		}
 	}
 
@@ -346,7 +386,18 @@ func Run(parent context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	defer c.app.Close()
+	shutdownOwnsBroker = true
+	defer func() {
+		c.shutdown(cancel)
+		if err := c.app.Close(); err != nil {
+			c.logger.Warn("close Codex app-server client", "err", err)
+		}
+		if proxy := c.currentProxy(); proxy != nil {
+			if err := proxy.Close(); err != nil {
+				c.logger.Warn("close Codex TUI proxy", "err", err)
+			}
+		}
+	}()
 
 	if err := c.startup(ctx); err != nil {
 		return err
@@ -354,16 +405,27 @@ func Run(parent context.Context, cfg Config) error {
 	if err := c.startTUIProxy(ctx); err != nil {
 		return err
 	}
-	if proxy := c.currentProxy(); proxy != nil {
-		defer func() {
-			if err := proxy.Close(); err != nil {
-				c.logger.Warn("close Codex TUI proxy", "err", err)
-			}
-		}()
+	bindingCommitAttempted := false
+	rollbackBinding := func(startupErr error) error {
+		if !bindingCommitAttempted {
+			return startupErr
+		}
+		var rollbackErr error
+		if persistedState == nil {
+			rollbackErr = c.store.Remove()
+		} else {
+			rollbackErr = c.store.Save(*persistedState)
+		}
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("codex: roll back replacement thread binding: %w", rollbackErr)
+		}
+		c.state = persistedState
+		return errors.Join(startupErr, rollbackErr)
 	}
 	if c.pendingState != nil {
+		bindingCommitAttempted = true
 		if err := c.store.Save(*c.pendingState); err != nil {
-			return fmt.Errorf("codex: commit replacement thread binding: %w", err)
+			return rollbackBinding(fmt.Errorf("codex: commit replacement thread binding: %w", err))
 		}
 		c.state = c.pendingState
 		c.pendingState = nil
@@ -377,11 +439,15 @@ func Run(parent context.Context, cfg Config) error {
 			CodexVersion:    c.codexVersion,
 			ExecutionPolicy: cfg.ExecutionPolicy,
 		}); err != nil {
-			return fmt.Errorf("codex: publish readiness: %w", err)
+			return rollbackBinding(fmt.Errorf("codex: publish readiness: %w", err))
 		}
 	}
-	defer c.shutdown(cancel)
-	shutdownOwnsBroker = true
+	if err := c.finishStartup(); err != nil {
+		return rollbackBinding(err)
+	}
+	if err := c.releasePriorThreadLock(); err != nil {
+		c.logger.Warn("release prior Codex thread lock after replacement commit", "err", err)
+	}
 	return c.loop(ctx)
 }
 
@@ -609,13 +675,40 @@ func (c *controller) startup(ctx context.Context) error {
 	c.mu.Lock()
 	if c.startupViolation {
 		c.mu.Unlock()
-		<-c.startBrokerClose()
 		return errors.New("codex: dynamic tool request arrived before adapter ownership was established")
 	}
-	c.ready = true
-	c.phase = phaseIdle
+	if c.phase == phaseBooting {
+		c.phase = phaseIdle
+	} else if c.phase != phaseActive && c.phase != phaseCompleting {
+		phase := c.phase
+		c.mu.Unlock()
+		return fmt.Errorf("codex: controller reached broker readiness while %s", phase)
+	}
 	c.mu.Unlock()
-	c.logger.Info("codex peer ready", "peer", c.cfg.Name, "thread", c.threadID, "cwd", c.cfg.CWD, "codex_version", version)
+	return nil
+}
+
+// finishStartup releases tool and interactive-request handlers only after the
+// broker, TUI proxy, persistent binding, and readiness descriptor are all
+// committed. A resumed persistent goal may already own a turn at this point.
+func (c *controller) finishStartup() error {
+	if err := c.takeFatal(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.startupViolation {
+		c.mu.Unlock()
+		return errors.New("codex: dynamic tool request arrived before adapter ownership was established")
+	}
+	if c.phase != phaseIdle && c.phase != phaseActive && c.phase != phaseCompleting {
+		phase := c.phase
+		c.mu.Unlock()
+		return fmt.Errorf("codex: controller reached published readiness while %s", phase)
+	}
+	c.ready = true
+	c.signalLifecycleChangeLocked()
+	c.mu.Unlock()
+	c.logger.Info("codex peer ready", "peer", c.cfg.Name, "thread", c.threadID, "cwd", c.cfg.CWD, "codex_version", c.codexVersion)
 	return nil
 }
 
@@ -657,7 +750,7 @@ func (c *controller) startTUIProxy(ctx context.Context) error {
 	return nil
 }
 
-func (c *controller) currentProxy() *appserverproxy.Proxy {
+func (c *controller) currentProxy() tuiProxy {
 	c.proxyMu.RLock()
 	defer c.proxyMu.RUnlock()
 	return c.proxy
@@ -702,6 +795,8 @@ func (c *controller) clearSyntheticResume() {
 type tuiTurnReservation struct {
 	result chan turnStartResult
 }
+
+type tuiSettingsReservation struct{}
 
 func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (json.RawMessage, any, *appserver.RPCError) {
 	rewritten := params
@@ -790,12 +885,6 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		}
 		return encoded, reservation, nil
 	case "thread/settings/update":
-		c.mu.Lock()
-		phase := c.phase
-		c.mu.Unlock()
-		if phase != phaseIdle {
-			return nil, nil, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "thread/settings/update is allowed only while the managed thread is idle"}
-		}
 		object, err := tuiRequestObject(params)
 		if err != nil {
 			return nil, nil, invalidTUIParams(method, err)
@@ -838,7 +927,11 @@ func (c *controller) beforeTUIRequest(method string, params json.RawMessage) (js
 		if err != nil {
 			return nil, nil, invalidTUIParams(method, err)
 		}
-		rewritten = encoded
+		reservation, rpcErr := c.reserveTUISettings()
+		if rpcErr != nil {
+			return nil, nil, rpcErr
+		}
+		return encoded, reservation, nil
 	case "skills/list", "hooks/list", "plugin/list", "plugin/installed":
 		object, err := tuiRequestObject(params)
 		if err != nil {
@@ -985,6 +1078,16 @@ func (c *controller) authorizeTUITurnControl(method string, params json.RawMessa
 }
 
 func (c *controller) afterTUIRequest(method string, state any, result json.RawMessage, err error) {
+	if method == "thread/settings/update" {
+		if _, ok := state.(tuiSettingsReservation); ok {
+			c.mu.Lock()
+			c.settingsInFlight = false
+			c.signalLifecycleChangeLocked()
+			c.mu.Unlock()
+			c.wakeStateChange()
+		}
+		return
+	}
 	if method != appserver.MethodTurnStart {
 		return
 	}
@@ -1077,7 +1180,7 @@ func (c *controller) reserveTUITurn() (tuiTurnReservation, *appserver.RPCError) 
 		c.mu.Unlock()
 		return tuiTurnReservation{}, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "Intercom peer is not ready"}
 	}
-	if c.phase != phaseIdle {
+	if c.phase != phaseIdle || c.deferredLifecycle != 0 || c.codexGoalActive || c.settingsInFlight {
 		c.mu.Unlock()
 		return tuiTurnReservation{}, &appserver.RPCError{Code: appserver.ErrorCodeInvalidRequest, Message: "managed thread already has an active turn"}
 	}
@@ -1095,6 +1198,22 @@ func (c *controller) reserveTUITurn() (tuiTurnReservation, *appserver.RPCError) 
 	c.mu.Unlock()
 	c.wakeStateChange()
 	return tuiTurnReservation{result: result}, nil
+}
+
+func (c *controller) reserveTUISettings() (tuiSettingsReservation, *appserver.RPCError) {
+	c.mu.Lock()
+	if !c.ready || c.phase != phaseIdle || c.deferredLifecycle != 0 || c.codexGoalActive || c.settingsInFlight {
+		c.mu.Unlock()
+		return tuiSettingsReservation{}, &appserver.RPCError{
+			Code:    appserver.ErrorCodeInvalidRequest,
+			Message: "thread/settings/update is allowed only while the managed thread is idle",
+		}
+	}
+	c.settingsInFlight = true
+	c.signalLifecycleChangeLocked()
+	c.mu.Unlock()
+	c.wakeStateChange()
+	return tuiSettingsReservation{}, nil
 }
 
 func tuiRequestObject(params json.RawMessage) (map[string]json.RawMessage, error) {
@@ -1241,6 +1360,27 @@ func (c *controller) acquireThreadLock(codexHome, threadID string) error {
 	return nil
 }
 
+func (c *controller) acquirePriorThreadLock(codexHome, threadID string) error {
+	if c.priorThreadLock != nil {
+		return errors.New("codex: prior managed thread lock is already held")
+	}
+	resolve := c.cfg.threadLockPath
+	if resolve == nil {
+		resolve = paths.CodexThreadLock
+	}
+	lockPath, err := resolve(codexHome, threadID)
+	if err != nil {
+		return err
+	}
+	lock, err := AcquireThreadLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("codex: lock prior thread %s during replacement: %w", threadID, err)
+	}
+	c.priorThreadLock = lock
+	c.priorThreadID = threadID
+	return nil
+}
+
 func (c *controller) managedMCPConfig() map[string]any {
 	startupSeconds := int(c.cfg.ControlTimeout.Round(time.Second) / time.Second)
 	if startupSeconds < 1 {
@@ -1268,6 +1408,16 @@ func (c *controller) managedMCPConfig() map[string]any {
 func (c *controller) releaseThreadLock() error {
 	lock := c.threadLock
 	c.threadLock = nil
+	if lock == nil {
+		return nil
+	}
+	return lock.Close()
+}
+
+func (c *controller) releasePriorThreadLock() error {
+	lock := c.priorThreadLock
+	c.priorThreadLock = nil
+	c.priorThreadID = ""
 	if lock == nil {
 		return nil
 	}
@@ -1348,6 +1498,7 @@ func (c *controller) adoptThread(ctx context.Context, init appserver.InitializeR
 	cwd := c.cfg.CWD
 	developer := developerInstructions(c.cfg.Name)
 	sandbox := c.cfg.ExecutionPolicy.sandboxMode()
+	c.pinManagedThread(threadID)
 	reviewer := appserver.ApprovalsReviewerUser
 	control, cancel = context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	response, err := c.app.ThreadResume(control, appserver.ThreadResumeParams{
@@ -1368,6 +1519,9 @@ func (c *controller) adoptThread(ctx context.Context, init appserver.InitializeR
 	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.ApprovalsReviewer, response.Sandbox); err != nil {
 		return err
 	}
+	if err := c.refreshGoalReservation(ctx); err != nil {
+		return fmt.Errorf("codex: adopt session %s: read persistent goal: %w", threadID, err)
+	}
 	if err := c.verifyManagedMCP(ctx); err != nil {
 		return err
 	}
@@ -1380,8 +1534,11 @@ func (c *controller) forkThread(ctx context.Context, init appserver.InitializeRe
 	if err := codexsession.ValidateID(sourceID); err != nil {
 		return fmt.Errorf("codex: fork session: %w", err)
 	}
-	if err := c.acquireThreadLock(init.CodexHome, sourceID); err != nil {
-		return err
+	sourceUsesPriorLock := c.priorThreadLock != nil && c.priorThreadID == sourceID
+	if !sourceUsesPriorLock {
+		if err := c.acquireThreadLock(init.CodexHome, sourceID); err != nil {
+			return err
+		}
 	}
 	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
 	candidate, err := codexsession.Read(control, c.app, sourceID, codexsession.Options{CWD: c.cfg.CWD})
@@ -1422,8 +1579,10 @@ func (c *controller) forkThread(ctx context.Context, init appserver.InitializeRe
 	if response.Thread.ForkedFromID == nil || *response.Thread.ForkedFromID != sourceID {
 		return fmt.Errorf("codex: fork session %s: app-server returned forkedFromId %#v", sourceID, response.Thread.ForkedFromID)
 	}
-	if err := c.releaseThreadLock(); err != nil {
-		return fmt.Errorf("codex: release source session lock: %w", err)
+	if !sourceUsesPriorLock {
+		if err := c.releaseThreadLock(); err != nil {
+			return fmt.Errorf("codex: release source session lock: %w", err)
+		}
 	}
 	if err := c.acquireThreadLock(init.CodexHome, response.Thread.ID); err != nil {
 		return err
@@ -1501,6 +1660,7 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 	cwd := c.cfg.CWD
 	developer := developerInstructions(c.cfg.Name)
 	sandbox := c.cfg.ExecutionPolicy.sandboxMode()
+	c.pinManagedThread(c.state.ThreadID)
 	reviewer := appserver.ApprovalsReviewerUser
 	var requestConfig map[string]any
 	if c.state.ToolTransport == ToolTransportMCPBridge {
@@ -1533,6 +1693,9 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 	if err := c.acceptThread(response.Thread, response.CWD, response.RuntimeWorkspaceRoots, response.ApprovalPolicy, response.ApprovalsReviewer, response.Sandbox); err != nil {
 		return err
 	}
+	if err := c.refreshGoalReservation(ctx); err != nil {
+		return fmt.Errorf("codex: resume thread %s: read persistent goal: %w", c.state.ThreadID, err)
+	}
 	if c.state.ToolTransport == ToolTransportMCPBridge {
 		if err := c.verifyManagedMCP(ctx); err != nil {
 			return err
@@ -1552,6 +1715,62 @@ func (c *controller) resumeOrReplace(ctx context.Context, init appserver.Initial
 		}
 		c.state = &updated
 	}
+	return nil
+}
+
+// pinManagedThread establishes the only thread identity whose lifecycle may
+// be admitted while thread/resume is still returning. Codex can emit an
+// automatic persistent-goal turn immediately after its resume response.
+func (c *controller) pinManagedThread(threadID string) {
+	c.mu.Lock()
+	c.threadID = threadID
+	c.mu.Unlock()
+}
+
+func (c *controller) refreshGoalReservation(ctx context.Context) error {
+	c.mu.Lock()
+	threadID := c.threadID
+	goalRevision := c.goalRevision
+	c.mu.Unlock()
+	control, cancel := context.WithTimeout(ctx, c.cfg.ControlTimeout)
+	response, err := c.app.ThreadGoalGet(control, appserver.ThreadGoalGetParams{ThreadID: threadID})
+	cancel()
+	if err != nil {
+		var rpcErr *appserver.RPCError
+		if errors.As(err, &rpcErr) && rpcErr.Code == appserver.ErrorCodeMethodNotFound {
+			c.logger.Debug("app-server does not expose persistent goals", "thread", threadID)
+			return nil
+		}
+		return err
+	}
+	active := false
+	if response.Goal != nil {
+		if response.Goal.ThreadID == "" {
+			return errors.New("thread/goal/get returned an empty goal thread id")
+		}
+		if response.Goal.ThreadID != threadID {
+			return fmt.Errorf("thread/goal/get returned goal for %s, want %s", response.Goal.ThreadID, threadID)
+		}
+		var statusErr error
+		active, statusErr = c.goalStatusReservesScheduler(response.Goal.Status)
+		if statusErr != nil {
+			return statusErr
+		}
+	}
+	c.mu.Lock()
+	if c.threadID != threadID {
+		c.mu.Unlock()
+		return errors.New("managed thread changed while reading persistent goal")
+	}
+	// The app-server reader can dispatch a goal notification after the
+	// thread/goal/get response is written but before this goroutine applies it.
+	// That later dispatch is authoritative over the earlier response.
+	if c.goalRevision == goalRevision {
+		c.codexGoalActive = active
+	}
+	c.signalLifecycleChangeLocked()
+	c.mu.Unlock()
+	c.wakeStateChange()
 	return nil
 }
 
@@ -1660,10 +1879,11 @@ func isBeforeFirstUserMessage(err error, threadID string) bool {
 
 func (c *controller) loop(ctx context.Context) error {
 	var watchdog *time.Timer
+	var watchdogSeq uint64
 	var pendingDelivery *wire.Deliver
 	for {
-		phase := c.currentPhase()
-		if phase == phaseIdle && pendingDelivery != nil {
+		phase, interactiveReverse, deferredLifecycle, codexGoalActive, settingsInFlight, activitySeq := c.watchdogState()
+		if phase == phaseIdle && deferredLifecycle == 0 && !codexGoalActive && !settingsInFlight && pendingDelivery != nil {
 			err := c.startDelivery(ctx, *pendingDelivery)
 			if errors.Is(err, errTurnAlreadyReserved) {
 				continue
@@ -1679,13 +1899,15 @@ func (c *controller) loop(ctx context.Context) error {
 			continue
 		}
 		var delivery <-chan wire.Deliver
-		if phase == phaseIdle && pendingDelivery == nil {
+		if phase == phaseIdle && deferredLifecycle == 0 && !codexGoalActive && !settingsInFlight && pendingDelivery == nil {
 			delivery = c.deliveries
 		}
 		var watchdogC <-chan time.Time
-		if phase == phaseActive {
+		watchdogEligible := phase == phaseActive || (phase == phaseIdle && codexGoalActive)
+		if watchdogEligible && interactiveReverse == 0 {
 			if watchdog == nil {
 				watchdog = time.NewTimer(c.cfg.ActivityTimeout)
+				watchdogSeq = activitySeq
 			}
 			watchdogC = watchdog.C
 		} else if watchdog != nil {
@@ -1759,13 +1981,17 @@ func (c *controller) loop(ctx context.Context) error {
 					}
 				}
 				watchdog.Reset(c.cfg.ActivityTimeout)
+				watchdogSeq = c.activitySeq.Load()
 			}
 		case <-c.stateChanged:
 			// Rebuild phase-dependent select cases after a proxy request changes
 			// turn ownership or returns the controller to idle.
 		case <-watchdogC:
-			c.setFailed()
-			return fmt.Errorf("codex: active turn had no app-server activity for %s", c.cfg.ActivityTimeout)
+			if !c.claimWatchdogExpiry(watchdogSeq) {
+				watchdog = nil
+				continue
+			}
+			return fmt.Errorf("codex: active turn or persistent goal had no app-server activity for %s", c.cfg.ActivityTimeout)
 		}
 	}
 }
@@ -1780,7 +2006,7 @@ func (c *controller) startDelivery(ctx context.Context, delivery wire.Deliver) e
 		sent = time.Now().UTC()
 	}
 	c.mu.Lock()
-	if c.phase != phaseIdle {
+	if c.phase != phaseIdle || c.deferredLifecycle != 0 || c.codexGoalActive || c.settingsInFlight {
 		c.mu.Unlock()
 		return errTurnAlreadyReserved
 	}
@@ -1951,6 +2177,9 @@ func (c *controller) applyNotification(notification appserver.Notification) (boo
 }
 
 func (c *controller) finishNotification(ctx context.Context, queued queuedNotification) error {
+	if queued.deferredLifecycle {
+		defer c.finishDeferredLifecycle(queued.notification)
+	}
 	managedCompletion := queued.managedCompletion
 	if !queued.applied {
 		var err error
@@ -2016,6 +2245,7 @@ func (c *controller) settleCompletedTurnLocked() {
 	c.turnTerminalSeen = false
 	c.turnTerminalProcessed = false
 	c.turnStartResponseSeen = false
+	c.signalLifecycleChangeLocked()
 }
 
 func (c *controller) handleNotification(ctx context.Context, notification appserver.Notification) error {
@@ -2062,14 +2292,38 @@ func (c *controller) reconcileTurn(threadID, turnID, status string) error {
 	if threadID != c.threadID {
 		return fmt.Errorf("codex: event thread %s does not match managed thread %s", threadID, c.threadID)
 	}
-	if c.phase != phaseStarting && c.phase != phaseActive {
-		return fmt.Errorf("codex: turn %s started while controller is %s", turnID, c.phase)
-	}
 	if turnID == "" {
 		return errors.New("codex: turn/started carried an empty turn id")
 	}
 	if status != appserver.TurnStatusInProgress {
 		return fmt.Errorf("codex: turn/started for %s has status %q, want %q", turnID, status, appserver.TurnStatusInProgress)
+	}
+	if c.phase == phaseBooting || c.phase == phaseIdle {
+		_, deferredGoalReservation := c.deferredGoalTurnIDs[turnID]
+		if !c.codexGoalActive && !deferredGoalReservation {
+			return fmt.Errorf("codex: turn %s started without a persistent-goal scheduler reservation", turnID)
+		}
+		if c.turnOwner != turnOwnerNone || c.turnID != "" || c.turnTerminalSeen {
+			return fmt.Errorf("codex: automatic turn %s found stale controller ownership while %s", turnID, c.phase)
+		}
+		c.turnOwner = turnOwnerCodex
+		c.turnID = turnID
+		c.current = wire.Deliver{}
+		c.outboundCount = 0
+		c.startResult = nil
+		c.startAmbiguous = false
+		c.turnTerminalSeen = false
+		c.turnTerminalProcessed = false
+		// Codex-owned turns are not paired with a controller-issued turn/start
+		// request. Their lifecycle is complete when the terminal notification is
+		// processed; no local start response can arrive later.
+		c.turnStartResponseSeen = true
+		c.phase = phaseActive
+		c.signalLifecycleChangeLocked()
+		return nil
+	}
+	if c.phase != phaseStarting && c.phase != phaseActive {
+		return fmt.Errorf("codex: turn %s started while controller is %s", turnID, c.phase)
 	}
 	if c.turnID != "" && c.turnID != turnID {
 		return fmt.Errorf("codex: event turn %s does not match active turn %s", turnID, c.turnID)
@@ -2141,19 +2395,27 @@ func (c *controller) enqueueDelivery(delivery wire.Deliver) {
 
 func (c *controller) enqueueNotification(notification appserver.Notification) {
 	c.touchActivity()
+	if err := c.observeGoalNotification(notification); err != nil {
+		c.signalFatal(err)
+		return
+	}
 	queued := queuedNotification{notification: notification}
 	switch notification.Method {
 	case appserver.NotificationThreadStarted,
 		appserver.NotificationTurnStarted,
 		appserver.NotificationTurnCompleted,
 		appserver.NotificationError:
-		managedCompletion, err := c.applyNotification(notification)
-		if err != nil {
-			c.signalFatal(err)
-			return
+		if c.deferLifecycleNotification(notification) {
+			queued.deferredLifecycle = true
+		} else {
+			managedCompletion, err := c.applyNotification(notification)
+			if err != nil {
+				c.signalFatal(err)
+				return
+			}
+			queued.applied = true
+			queued.managedCompletion = managedCompletion
 		}
-		queued.applied = true
-		queued.managedCompletion = managedCompletion
 	default:
 		if !c.queueProxyEvent(notification) {
 			if proxy := c.currentProxy(); proxy != nil {
@@ -2175,6 +2437,158 @@ func (c *controller) enqueueNotification(notification appserver.Notification) {
 	default:
 		c.signalFatal(errors.New("codex: app-server notification queue is full"))
 	}
+}
+
+// observeGoalNotification reserves the managed thread for Codex's persistent
+// goal scheduler. The ordered reader invokes it before turn lifecycle events,
+// matching app-server's goal-snapshot-before-continuation contract.
+func (c *controller) observeGoalNotification(notification appserver.Notification) error {
+	var threadID string
+	var active bool
+	switch notification.Method {
+	case appserver.NotificationThreadGoalUpdated:
+		var params appserver.ThreadGoalUpdatedNotification
+		if err := notification.DecodeParams(&params); err != nil {
+			return err
+		}
+		if params.ThreadID == "" {
+			return errors.New("codex: thread/goal/updated carried an empty thread id")
+		}
+		if params.ThreadID != c.managedThreadID() {
+			return nil
+		}
+		if params.Goal.ThreadID == "" {
+			return errors.New("codex: thread/goal/updated carried an empty goal thread id")
+		}
+		if params.Goal.ThreadID != params.ThreadID {
+			return fmt.Errorf("codex: thread/goal/updated disagrees on thread id %s/%s", params.ThreadID, params.Goal.ThreadID)
+		}
+		threadID = params.ThreadID
+		var statusErr error
+		active, statusErr = c.goalStatusReservesScheduler(params.Goal.Status)
+		if statusErr != nil {
+			return fmt.Errorf("codex: thread/goal/updated: %w", statusErr)
+		}
+	case appserver.NotificationThreadGoalCleared:
+		var params appserver.ThreadGoalClearedNotification
+		if err := notification.DecodeParams(&params); err != nil {
+			return err
+		}
+		if params.ThreadID == "" {
+			return errors.New("codex: thread/goal/cleared carried an empty thread id")
+		}
+		if params.ThreadID != c.managedThreadID() {
+			return nil
+		}
+		threadID = params.ThreadID
+	default:
+		return nil
+	}
+
+	c.mu.Lock()
+	if threadID != c.threadID {
+		c.mu.Unlock()
+		return nil
+	}
+	c.goalRevision++
+	c.codexGoalActive = active
+	c.signalLifecycleChangeLocked()
+	c.mu.Unlock()
+	c.wakeStateChange()
+	return nil
+}
+
+func (c *controller) goalStatusReservesScheduler(status string) (bool, error) {
+	switch status {
+	case appserver.ThreadGoalStatusActive:
+		return true, nil
+	case "":
+		return false, errors.New("persistent goal carried an empty status")
+	case appserver.ThreadGoalStatusPaused,
+		appserver.ThreadGoalStatusBlocked,
+		appserver.ThreadGoalStatusUsageLimited,
+		appserver.ThreadGoalStatusBudgetLimited,
+		appserver.ThreadGoalStatusComplete:
+		return false, nil
+	default:
+		// A future status can have continuation semantics that this client
+		// does not yet understand. Retain scheduler ownership until a known
+		// terminal status or clear notification arrives.
+		if c.logger != nil {
+			c.logger.Warn("unknown Codex goal status conservatively reserves scheduler ownership", "status", status)
+		}
+		return true, nil
+	}
+}
+
+// deferLifecycleNotification keeps the reader-side lifecycle state ordered
+// when Codex starts a persistent-goal continuation immediately behind a
+// terminal event. Completion processing runs on the controller loop; all
+// following lifecycle events remain queued until that loop catches up.
+func (c *controller) deferLifecycleNotification(notification appserver.Notification) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.deferredLifecycle > 0 {
+		c.deferredLifecycle++
+		c.recordDeferredTurnLocked(notification)
+		return true
+	}
+	if notification.Method != appserver.NotificationTurnStarted || !c.turnTerminalSeen ||
+		(c.phase != phaseAwaitingStartResponse && c.phase != phaseCompleting) {
+		return false
+	}
+	var params appserver.TurnStartedNotification
+	if err := notification.DecodeParams(&params); err != nil || params.ThreadID != c.threadID {
+		return false
+	}
+	c.deferredLifecycle = 1
+	c.recordDeferredTurnLocked(notification)
+	c.signalLifecycleChangeLocked()
+	return true
+}
+
+func (c *controller) recordDeferredTurnLocked(notification appserver.Notification) {
+	if notification.Method != appserver.NotificationTurnStarted {
+		return
+	}
+	var params appserver.TurnStartedNotification
+	if err := notification.DecodeParams(&params); err != nil || params.ThreadID != c.threadID || params.Turn.ID == "" {
+		return
+	}
+	if c.deferredTurnIDs == nil {
+		c.deferredTurnIDs = make(map[string]struct{})
+	}
+	c.deferredTurnIDs[params.Turn.ID] = struct{}{}
+	// A goal can publish terminal, continuation start, continuation terminal,
+	// and goal completion faster than the controller loop can process the first
+	// terminal. Preserve the reservation observed when this deferred start was
+	// admitted even if a later ordered goal update releases the global gap.
+	if c.codexGoalActive {
+		if c.deferredGoalTurnIDs == nil {
+			c.deferredGoalTurnIDs = make(map[string]struct{})
+		}
+		c.deferredGoalTurnIDs[params.Turn.ID] = struct{}{}
+	}
+	c.latestDeferredTurnID = params.Turn.ID
+}
+
+func (c *controller) finishDeferredLifecycle(notification appserver.Notification) {
+	c.mu.Lock()
+	if notification.Method == appserver.NotificationTurnStarted {
+		var params appserver.TurnStartedNotification
+		if notification.DecodeParams(&params) == nil {
+			delete(c.deferredTurnIDs, params.Turn.ID)
+			delete(c.deferredGoalTurnIDs, params.Turn.ID)
+			if c.latestDeferredTurnID == params.Turn.ID {
+				c.latestDeferredTurnID = ""
+			}
+		}
+	}
+	if c.deferredLifecycle > 0 {
+		c.deferredLifecycle--
+	}
+	c.signalLifecycleChangeLocked()
+	c.mu.Unlock()
 }
 
 func (c *controller) queueProxyEvent(notification appserver.Notification) bool {
@@ -2203,6 +2617,7 @@ func (c *controller) releaseProxyEventGate() {
 		}
 		if len(c.proxyEventQueue) == 0 {
 			c.proxyEventGate = false
+			c.signalLifecycleChangeLocked()
 			c.mu.Unlock()
 			return
 		}
@@ -2219,13 +2634,47 @@ func (c *controller) releaseProxyEventGate() {
 }
 
 func (c *controller) handleReverseRequest(request *appserver.ReverseRequest) {
+	interactive := request.Method != appserver.MethodDynamicToolCall && forwardToTUI(request.Method)
+	if interactive {
+		owned, err := c.ownsInteractiveReverseThread(request)
+		if err != nil {
+			c.logger.Warn("answer unroutable app-server reverse request with headless policy", "method", request.Method, "err", err)
+			c.handleUnownedInteractiveReverse(request)
+			return
+		}
+		if !owned {
+			c.logger.Debug("answer reverse request outside managed ancestry with headless policy", "method", request.Method)
+			c.handleUnownedInteractiveReverse(request)
+			return
+		}
+		c.beginInteractiveReverse(request)
+		defer c.endInteractiveReverse(request)
+	}
 	proxy := c.currentProxy()
-	if request.Method != appserver.MethodDynamicToolCall && proxy != nil && forwardToTUI(request.Method) {
+	if interactive && proxy != nil {
 		parent := c.ctx
 		if parent == nil {
 			parent = context.Background()
 		}
-		ctx, cancel := context.WithTimeout(parent, c.cfg.ActivityTimeout)
+		gateTimeout := c.cfg.ControlTimeout
+		if gateTimeout <= 0 {
+			gateTimeout = defaultControlTimeout
+		}
+		gateCtx, cancelGate := context.WithTimeout(parent, gateTimeout)
+		gateErr := c.waitForInteractiveRelay(gateCtx)
+		cancelGate()
+		if gateErr != nil {
+			if !errors.Is(gateErr, context.Canceled) {
+				c.signalFatal(fmt.Errorf("codex: wait to relay %s through TUI: %w", request.Method, gateErr))
+			}
+			c.reverse.Handle(request)
+			return
+		}
+		activityTimeout := c.cfg.ActivityTimeout
+		if activityTimeout <= 0 {
+			activityTimeout = defaultActivityTimeout
+		}
+		ctx, cancel := context.WithTimeout(parent, activityTimeout)
 		handled, err := proxy.ForwardReverse(ctx, request)
 		cancel()
 		if handled {
@@ -2239,6 +2688,50 @@ func (c *controller) handleReverseRequest(request *appserver.ReverseRequest) {
 		}
 	}
 	c.reverse.Handle(request)
+}
+
+// handleUnownedInteractiveReverse answers the protocol request without
+// treating unrelated thread traffic as activity on the managed scheduler.
+func (c *controller) handleUnownedInteractiveReverse(request *appserver.ReverseRequest) {
+	headless := c.reverse
+	headless.onActivity = nil
+	headless.onOutbound = nil
+	headless.Handle(request)
+}
+
+func (c *controller) ownsInteractiveReverseThread(request *appserver.ReverseRequest) (bool, error) {
+	var route struct {
+		ThreadID string `json:"threadId"`
+	}
+	if err := request.DecodeParams(&route); err != nil {
+		return false, err
+	}
+	if route.ThreadID == "" {
+		return false, errors.New("reverse request carried an empty threadId")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if route.ThreadID == c.threadID {
+		return true, nil
+	}
+	_, descendant := c.descendantThreads[route.ThreadID]
+	return descendant, nil
+}
+
+func (c *controller) waitForInteractiveRelay(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		if c.ready && !c.proxyEventGate {
+			c.mu.Unlock()
+			return nil
+		}
+		wait := c.lifecycleWaitLocked()
+		controllerDone := c.controllerDoneLocked()
+		c.mu.Unlock()
+		if err := waitForControllerLifecycle(ctx, controllerDone, wait); err != nil {
+			return err
+		}
+	}
 }
 
 func forwardToTUI(method string) bool {
@@ -2255,35 +2748,71 @@ func forwardToTUI(method string) bool {
 }
 
 func (c *controller) authorizeReverse(ctx context.Context, threadID, turnID string) error {
-	c.mu.Lock()
-	if !c.ready {
-		c.startupViolation = true
-		c.mu.Unlock()
-		return errors.New("adapter ownership is not established")
+	if threadID == "" || turnID == "" {
+		return errors.New("tool call is missing thread or turn identity")
 	}
-	if threadID != c.threadID {
-		if _, ok := c.descendantThreads[threadID]; ok {
+	for {
+		c.mu.Lock()
+		if !c.ready {
+			if !c.preReadyToolRouteLocked(threadID, turnID) {
+				c.startupViolation = true
+				c.signalLifecycleChangeLocked()
+				c.mu.Unlock()
+				return fmt.Errorf("adapter ownership is not established for tool call thread/turn %s/%s", threadID, turnID)
+			}
+			wait := c.lifecycleWaitLocked()
+			controllerDone := c.controllerDoneLocked()
+			c.mu.Unlock()
+			if err := waitForControllerLifecycle(ctx, controllerDone, wait); err != nil {
+				return fmt.Errorf("wait for adapter ownership: %w", err)
+			}
+			continue
+		}
+		if threadID != c.threadID {
+			if _, ok := c.descendantThreads[threadID]; ok {
+				c.mu.Unlock()
+				return nil
+			}
+			rootThreadID := c.threadID
+			app := c.app
+			c.mu.Unlock()
+			return c.authorizeDescendant(ctx, app, rootThreadID, threadID)
+		}
+		if _, future := c.deferredTurnIDs[turnID]; future {
+			wait := c.lifecycleWaitLocked()
+			controllerDone := c.controllerDoneLocked()
+			c.mu.Unlock()
+			if err := waitForControllerLifecycle(ctx, controllerDone, wait); err != nil {
+				return fmt.Errorf("wait for queued Codex turn %s lifecycle: %w", turnID, err)
+			}
+			continue
+		}
+		if c.phase == phaseStarting || c.phase == phaseActive {
+			if c.turnID != "" && c.turnID != turnID {
+				managedTurnID := c.turnID
+				c.mu.Unlock()
+				return fmt.Errorf("tool call turn %s does not match %s", turnID, managedTurnID)
+			}
+			c.turnID = turnID
 			c.mu.Unlock()
 			return nil
 		}
-		rootThreadID := c.threadID
-		app := c.app
-		c.mu.Unlock()
-		return c.authorizeDescendant(ctx, app, rootThreadID, threadID)
-	}
-	if c.phase != phaseStarting && c.phase != phaseActive {
 		phase := c.phase
 		c.mu.Unlock()
 		return fmt.Errorf("tool call arrived while controller is %s", phase)
 	}
-	if c.turnID != "" && c.turnID != turnID {
-		managedTurnID := c.turnID
-		c.mu.Unlock()
-		return fmt.Errorf("tool call turn %s does not match %s", turnID, managedTurnID)
+}
+
+func (c *controller) preReadyToolRouteLocked(threadID, turnID string) bool {
+	if threadID != c.threadID {
+		_, descendant := c.descendantThreads[threadID]
+		return descendant
 	}
-	c.turnID = turnID
-	c.mu.Unlock()
-	return nil
+	if _, deferred := c.deferredTurnIDs[turnID]; deferred {
+		return true
+	}
+	return c.turnOwner == turnOwnerCodex && c.turnID == turnID &&
+		(c.phase == phaseActive || c.phase == phaseCompleting)
 }
 
 type descendantCandidate struct {
@@ -2360,15 +2889,66 @@ func (c *controller) authorizeDescendant(ctx context.Context, app appServerClien
 	return fmt.Errorf("tool call thread %s has no parent or fork ancestry to %s", requestedThreadID, rootThreadID)
 }
 
-func (c *controller) observeReverseRequest(method string) {
-	if method != appserver.MethodDynamicToolCall {
+func (c *controller) observeReverseRequest(request *appserver.ReverseRequest) {
+	if request == nil {
 		return
 	}
+	if request.Method != appserver.MethodDynamicToolCall && forwardToTUI(request.Method) {
+		owned, err := c.ownsInteractiveReverseThread(request)
+		if err == nil && owned {
+			c.beginInteractiveReverse(request)
+		}
+		return
+	}
+	if request.Method != appserver.MethodDynamicToolCall {
+		return
+	}
+	var params appserver.DynamicToolCallParams
+	decodeErr := json.Unmarshal(request.Params, &params)
 	c.mu.Lock()
-	if !c.ready {
+	valid := decodeErr == nil && params.Namespace == nil && params.CallID != "" &&
+		params.ThreadID != "" && params.TurnID != "" &&
+		c.preReadyToolRouteLocked(params.ThreadID, params.TurnID)
+	if !c.ready && !valid {
 		c.startupViolation = true
+		c.signalLifecycleChangeLocked()
 	}
 	c.mu.Unlock()
+}
+
+func (c *controller) beginInteractiveReverse(request *appserver.ReverseRequest) {
+	c.mu.Lock()
+	if c.interactiveRequests == nil {
+		c.interactiveRequests = make(map[*appserver.ReverseRequest]struct{})
+	}
+	if _, exists := c.interactiveRequests[request]; exists {
+		c.mu.Unlock()
+		return
+	}
+	c.interactiveRequests[request] = struct{}{}
+	c.interactiveReverse++
+	c.mu.Unlock()
+	c.touchActivity()
+	c.wakeStateChange()
+}
+
+func (c *controller) endInteractiveReverse(request *appserver.ReverseRequest) {
+	// Record the completed wait before releasing the watchdog suspension. If
+	// its timer became readable at the same instant, the generation check
+	// rejects that stale expiry.
+	c.mu.Lock()
+	if _, exists := c.interactiveRequests[request]; !exists {
+		c.mu.Unlock()
+		return
+	}
+	c.touchActivity()
+	delete(c.interactiveRequests, request)
+	c.interactiveReverse--
+	c.mu.Unlock()
+	// A human-facing request can legitimately consume the complete inactivity
+	// budget. Restart the turn watchdog from the response or fallback, rather
+	// than from the request that began the wait.
+	c.wakeStateChange()
 }
 
 func (c *controller) hasStartupViolation() bool {
@@ -2386,6 +2966,7 @@ func (c *controller) noteOutbound() {
 }
 
 func (c *controller) touchActivity() {
+	c.activitySeq.Add(1)
 	select {
 	case c.activity <- struct{}{}:
 	default:
@@ -2396,6 +2977,38 @@ func (c *controller) wakeStateChange() {
 	select {
 	case c.stateChanged <- struct{}{}:
 	default:
+	}
+}
+
+func (c *controller) lifecycleWaitLocked() <-chan struct{} {
+	if c.lifecycleWait == nil {
+		c.lifecycleWait = make(chan struct{})
+	}
+	return c.lifecycleWait
+}
+
+func (c *controller) controllerDoneLocked() <-chan struct{} {
+	if c.ctx == nil {
+		return nil
+	}
+	return c.ctx.Done()
+}
+
+func (c *controller) signalLifecycleChangeLocked() {
+	if c.lifecycleWait != nil {
+		close(c.lifecycleWait)
+	}
+	c.lifecycleWait = make(chan struct{})
+}
+
+func waitForControllerLifecycle(ctx context.Context, controllerDone, changed <-chan struct{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-controllerDone:
+		return context.Canceled
+	case <-changed:
+		return nil
 	}
 }
 
@@ -2427,10 +3040,30 @@ func (c *controller) currentPhase() controllerPhase {
 	return c.phase
 }
 
+func (c *controller) watchdogState() (controllerPhase, int, int, bool, bool, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.phase, c.interactiveReverse, c.deferredLifecycle, c.codexGoalActive, c.settingsInFlight, c.activitySeq.Load()
+}
+
+func (c *controller) claimWatchdogExpiry(expectedActivity uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	watchdogEligible := c.phase == phaseActive || (c.phase == phaseIdle && c.codexGoalActive)
+	if !watchdogEligible || c.interactiveReverse != 0 || c.activitySeq.Load() != expectedActivity {
+		return false
+	}
+	c.phase = phaseFailed
+	c.ready = false
+	c.signalLifecycleChangeLocked()
+	return true
+}
+
 func (c *controller) setFailed() {
 	c.mu.Lock()
 	c.phase = phaseFailed
 	c.ready = false
+	c.signalLifecycleChangeLocked()
 	c.mu.Unlock()
 }
 
@@ -2483,14 +3116,7 @@ func (c *controller) shutdown(stop context.CancelFunc) {
 
 	c.mu.Lock()
 	c.ready = false
-	phase := c.phase
-	threadID := c.threadID
-	turnID := c.turnID
-	hasDelivery := c.current.ID != ""
-	startResult := c.startResult
-	startAmbiguous := c.startAmbiguous
-	turnTerminalSeen := c.turnTerminalSeen
-	owner := c.turnOwner
+	c.signalLifecycleChangeLocked()
 	c.mu.Unlock()
 	if c.cfg.OnStopping != nil {
 		if err := c.cfg.OnStopping(); err != nil {
@@ -2513,26 +3139,90 @@ func (c *controller) shutdown(stop context.CancelFunc) {
 	}
 	cancelBrokerWait()
 
+	// Lifecycle continues while broker close is in flight. Snapshot only after
+	// that wait, and prefer the newest deferred persistent-goal continuation to
+	// the terminal turn whose completion caused it to queue.
+	c.mu.Lock()
+	phase := c.phase
+	threadID := c.threadID
+	turnID := c.turnID
+	observedTurnID := c.turnID
+	hasDelivery := c.current.ID != ""
+	startResult := c.startResult
+	startAmbiguous := c.startAmbiguous
+	turnTerminalSeen := c.turnTerminalSeen
+	owner := c.turnOwner
+	if c.latestDeferredTurnID != "" {
+		phase = phaseActive
+		turnID = c.latestDeferredTurnID
+		hasDelivery = false
+		startResult = nil
+		startAmbiguous = false
+		turnTerminalSeen = false
+		owner = turnOwnerCodex
+	}
+	c.mu.Unlock()
+
 	if turnTerminalSeen || phase == phaseAwaitingStartResponse {
 		if startResult != nil {
 			// The terminal notification was already reconciled. Only the outstanding
 			// start response remains to be drained.
-			c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous, true)
+			turnID = c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous, true)
 		}
 	} else if phase == phaseStarting || phase == phaseActive || hasDelivery || owner != turnOwnerNone || turnID != "" || startAmbiguous {
 		if err := c.app.TurnInterrupt(ctx, appserver.TurnInterruptParams{ThreadID: threadID, TurnID: turnID}); err != nil {
 			c.logger.Warn("interrupt Codex turn during shutdown", "thread", threadID, "turn", turnID, "err", err)
 		}
 		if turnID != "" || startResult != nil || startAmbiguous {
-			c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous, false)
+			turnID = c.drainShutdownTurn(ctx, threadID, turnID, startResult, startAmbiguous, false)
 		}
 	}
+	cleanedTurns := make(map[string]struct{})
+	if observedTurnID != "" {
+		cleanedTurns[observedTurnID] = struct{}{}
+	}
+	if turnID != "" {
+		cleanedTurns[turnID] = struct{}{}
+	}
+	drainAdvancedTurns := func() {
+		for ctx.Err() == nil {
+			c.mu.Lock()
+			nextTurnID := c.latestDeferredTurnID
+			_, alreadyCleaned := cleanedTurns[nextTurnID]
+			if nextTurnID == "" || alreadyCleaned {
+				switch c.phase {
+				case phaseStarting, phaseActive, phaseAwaitingStartResponse, phaseCompleting:
+					if _, cleaned := cleanedTurns[c.turnID]; c.turnID != "" && !cleaned {
+						nextTurnID = c.turnID
+					}
+				}
+			}
+			c.mu.Unlock()
+			if _, cleaned := cleanedTurns[nextTurnID]; nextTurnID == "" || cleaned {
+				break
+			}
+			if err := c.app.TurnInterrupt(ctx, appserver.TurnInterruptParams{ThreadID: threadID, TurnID: nextTurnID}); err != nil {
+				c.logger.Warn("interrupt deferred Codex goal turn during shutdown", "thread", threadID, "turn", nextTurnID, "err", err)
+			}
+			cleanedID := c.drainShutdownTurn(ctx, threadID, nextTurnID, nil, false, false)
+			cleanedTurns[nextTurnID] = struct{}{}
+			if cleanedID != "" {
+				cleanedTurns[cleanedID] = struct{}{}
+			}
+		}
+	}
+	drainAdvancedTurns()
 	if err := c.app.WaitHandlers(ctx); err != nil {
 		c.logger.Warn("drain app-server reverse requests during shutdown", "err", err)
 	}
+	// A reverse handler can finish the last item of a persistent-goal turn and
+	// allow app-server to publish its continuation while WaitHandlers is in
+	// progress. Recheck current as well as deferred lifecycle state before the
+	// client connection closes.
+	drainAdvancedTurns()
 }
 
-func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID string, startResult <-chan turnStartResult, ambiguous, terminal bool) {
+func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID string, startResult <-chan turnStartResult, ambiguous, terminal bool) string {
 	for !terminal || startResult != nil {
 		select {
 		case started := <-startResult:
@@ -2540,7 +3230,7 @@ func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID str
 			if started.err != nil {
 				ambiguous = turnStartMayHaveSucceeded(started.err)
 				if turnID == "" && !ambiguous {
-					return
+					return turnID
 				}
 				c.logger.Warn("drain turn/start response during shutdown", "err", started.err)
 				continue
@@ -2551,7 +3241,7 @@ func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID str
 			}
 			if turnID != "" && turnID != started.response.Turn.ID {
 				c.logger.Warn("drain mismatched turn/start response", "expected", turnID, "actual", started.response.Turn.ID)
-				return
+				return turnID
 			}
 			turnID = started.response.Turn.ID
 			ambiguous = false
@@ -2584,12 +3274,13 @@ func (c *controller) drainShutdownTurn(ctx context.Context, threadID, turnID str
 				}
 			}
 		case <-c.app.Done():
-			return
+			return turnID
 		case <-ctx.Done():
 			c.logger.Warn("timed out draining Codex turn during shutdown", "thread", threadID, "turn", turnID)
-			return
+			return turnID
 		}
 	}
+	return turnID
 }
 
 // turnStartMayHaveSucceeded distinguishes a definitive JSON-RPC rejection from

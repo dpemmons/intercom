@@ -12,7 +12,7 @@ import (
 )
 
 // version is the binary version, overridable via -ldflags '-X main.version=...'.
-var version = "0.2.3-dev"
+var version = "0.2.4-dev"
 
 // commit is the git SHA the binary was built from, overridable likewise.
 var commit = "unknown"
@@ -54,6 +54,8 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(
 		newShimCmd(),
 		newCodexCmd(),
+		newCodexAppServerExecCmd(),
+		newCodexProcessSessionCleanupCmd(),
 		newCodexMCPBridgeCmd(),
 		newBrokerCmd(),
 		newNameCmd(),

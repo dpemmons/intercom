@@ -41,9 +41,10 @@ type Options struct {
 	MaxConcurrentHandlers int
 	OnNotification        func(Notification)
 	// OnReverseRequestReceived runs synchronously on the ordered reader before
-	// the request handler is scheduled. It must return promptly. Lifecycle
-	// owners can use it to close startup races without performing any I/O.
-	OnReverseRequestReceived func(method string)
+	// the request handler is scheduled. It must return promptly and must not
+	// answer the request. Lifecycle owners can use it to close startup races
+	// without performing any I/O.
+	OnReverseRequestReceived func(*ReverseRequest)
 	// OnReverseRequest runs on an independent goroutine and may perform I/O.
 	OnReverseRequest func(*ReverseRequest)
 }
@@ -284,6 +285,12 @@ func (c *Client) ThreadRead(ctx context.Context, params ThreadReadParams) (Threa
 	return response, err
 }
 
+func (c *Client) ThreadGoalGet(ctx context.Context, params ThreadGoalGetParams) (ThreadGoalGetResponse, error) {
+	var response ThreadGoalGetResponse
+	err := c.Call(ctx, MethodThreadGoalGet, params, &response)
+	return response, err
+}
+
 func (c *Client) MCPServerStatusList(ctx context.Context, params MCPServerStatusListParams) (MCPServerStatusListResponse, error) {
 	var response MCPServerStatusListResponse
 	err := c.Call(ctx, MethodMCPServerStatusList, params, &response)
@@ -457,7 +464,7 @@ func (c *Client) dispatch(data []byte) error {
 		}
 		request := &ReverseRequest{ID: id, Method: method, Params: params, client: c}
 		if c.opts.OnReverseRequestReceived != nil {
-			c.opts.OnReverseRequestReceived(method)
+			c.opts.OnReverseRequestReceived(request)
 		}
 		if err := c.beginHandler(); err != nil {
 			return err

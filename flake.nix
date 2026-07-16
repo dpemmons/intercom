@@ -10,7 +10,7 @@
       revision = self.rev or self.dirtyRev or "unknown";
       revisionLength = builtins.stringLength revision;
       shortRevision = builtins.substring 0 (if revisionLength < 8 then revisionLength else 8) revision;
-      packageVersion = "0.2.3-${shortRevision}";
+      packageVersion = "0.2.4-${shortRevision}";
     in {
       packages = forAll (pkgs: rec {
         intercom = pkgs.buildGoModule {
@@ -26,6 +26,7 @@
           # go.mod pins go 1.25.5; use the matching toolchain from nixpkgs.
           go = pkgs.go_1_25;
           nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeCheckInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.procps ];
           postInstall = ''
             install -Dm755 scripts/intercom-codex-project \
               "$out/bin/intercom-codex-project"
@@ -34,7 +35,9 @@
               --replace-fail 'intercom_bin=''${INTERCOM_BIN:-intercom}' \
                 'intercom_bin=''${INTERCOM_BIN:-'"$out"'/bin/intercom}'
             wrapProgram "$out/bin/intercom-codex-project" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath (
+                [ pkgs.coreutils ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.procps ]
+              )}
           '';
           meta = with pkgs.lib; {
             description = "Local messaging bridge for Claude Code and managed Codex sessions";

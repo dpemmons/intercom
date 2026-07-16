@@ -589,7 +589,7 @@ func TestBlockedReverseRequestDoesNotBlockReader(t *testing.T) {
 	ordered := make(chan bool, 1)
 	release := make(chan struct{})
 	client, err := DialUnix(context.Background(), server.endpoint, Options{
-		OnReverseRequestReceived: func(method string) { observed <- method },
+		OnReverseRequestReceived: func(request *ReverseRequest) { observed <- request.Method },
 		OnReverseRequest: func(request *ReverseRequest) {
 			select {
 			case method := <-observed:

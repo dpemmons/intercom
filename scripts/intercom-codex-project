@@ -188,9 +188,9 @@ if ((list_sessions)) && ((${#adapter_only_args[@]} != 0)); then
   exit 2
 fi
 
-# Timeout values are multiplied by ten for decisecond polling. Keep the
-# canonical value within signed 64-bit arithmetic even after that multiply.
-max_timeout_seconds=922337203685477580
+# Timeout values are passed to Go as time.Duration seconds and are multiplied
+# by ten for decisecond shell polling. The Go duration bound is the smaller one.
+max_timeout_seconds=9223372036
 
 parse_timeout() {
   local name=$1
@@ -238,22 +238,27 @@ esac
 app_server_socket_path=$runtime_dir/app-server.sock
 client_socket_path=$runtime_dir/client.sock
 mcp_bridge_socket_path=$runtime_dir/mcp-bridge.sock
+app_server_session_path=$runtime_dir/app-server.session
 app_server_endpoint=unix://$app_server_socket_path
 client_endpoint=unix://$client_socket_path
 
 server_pid=
+server_session_ready=0
 adapter_pid=
 cleaned=0
+cleanup_failed=0
+launching_child=0
+deferred_signal_status=
 
 is_running() {
-  local want=$1
-  local pid
-  while IFS= read -r pid; do
-    if [[ $pid == "$want" ]]; then
-      return 0
-    fi
-  done < <(jobs -pr)
-  return 1
+	local want=$1
+	local pid
+	while IFS= read -r pid; do
+		if [[ $pid == "$want" ]]; then
+			return 0
+		fi
+	done < <(jobs -pr)
+	return 1
 }
 
 wait_dead() {
@@ -270,21 +275,134 @@ wait_dead() {
   return 1
 }
 
+refresh_server_session_ready() {
+	if ((server_session_ready)); then
+		return 0
+	fi
+	if [[ ! -f $app_server_session_path ]]; then
+		return 1
+	fi
+	local published
+	published=$(<"$app_server_session_path")
+	if [[ $published != "$server_pid" ]]; then
+		printf 'intercom-codex-project: app-server published process session %q, want %s\n' \
+			"$published" "$server_pid" >&2
+		cleanup_failed=1
+		return 2
+	fi
+	server_session_ready=1
+	return 0
+}
+
+cleanup_server_session() {
+	local pid=$1
+	local cleanup_status=0
+	"$intercom_bin" codex-process-session-cleanup \
+		--sid "$pid" --leader "$pid" --timeout "${shutdown_timeout}s" || cleanup_status=$?
+	if ((cleanup_status != 0)); then
+		cleanup_failed=1
+	fi
+	if ((cleanup_status != 0)); then
+		# The session helper has already emitted the precise inspection, signal,
+		# or survivor error. Kill the still-owned direct child as a final fallback.
+		if is_running "$pid"; then
+			kill -KILL "$pid" 2>/dev/null || true
+			if ! wait_dead "$pid" "$shutdown_timeout"; then
+				printf 'intercom-codex-project: app-server direct child survived fallback SIGKILL\n' >&2
+				return
+			fi
+		fi
+		return
+	fi
+	# A successful session sweep must also have stopped a live direct child.
+	# This catches a corrupt readiness marker or a helper implementation that
+	# reports an empty session for the still-owned child.
+	if is_running "$pid"; then
+		printf 'intercom-codex-project: app-server process-session cleanup left its direct child running; killing it\n' >&2
+		cleanup_failed=1
+		kill -KILL "$pid" 2>/dev/null || true
+		if ! wait_dead "$pid" "$shutdown_timeout"; then
+			printf 'intercom-codex-project: app-server direct child survived fallback SIGKILL\n' >&2
+		fi
+	fi
+}
+
+stop_server_session() {
+	local pid=$1
+	cleanup_server_session "$pid"
+	wait "$pid" 2>/dev/null || true
+}
+
 stop_process() {
-  local pid=$1
-  local label=$2
-  if [[ -z $pid ]] || ! is_running "$pid"; then
-    if [[ -n $pid ]]; then
-      wait "$pid" 2>/dev/null || true
-    fi
-    return
-  fi
-  kill -TERM "$pid" 2>/dev/null || true
-  if ! wait_dead "$pid" "$shutdown_timeout"; then
-    printf 'intercom-codex-project: %s did not stop; killing it\n' "$label" >&2
-    kill -KILL "$pid" 2>/dev/null || true
-  fi
-  wait "$pid" 2>/dev/null || true
+	local pid=$1
+	local label=$2
+	if [[ -z $pid ]]; then
+		return
+	fi
+
+	if [[ $label == app-server ]]; then
+		local marker_status=0
+		refresh_server_session_ready || marker_status=$?
+		if ((marker_status == 0 || marker_status == 2)); then
+			stop_server_session "$pid"
+			return
+		fi
+
+		# A terminating signal can arrive before setsid and readiness publication.
+		# Signal the still-owned direct child, then watch for the atomic marker. The
+		# helper publishes it before exec or any app-server descendant can exist.
+		if is_running "$pid"; then
+			kill -TERM "$pid" 2>/dev/null || true
+			local ticks=$((shutdown_timeout * 10))
+			local i
+			for ((i = 0; i < ticks; i++)); do
+				marker_status=0
+				refresh_server_session_ready || marker_status=$?
+				if ((marker_status == 0 || marker_status == 2)); then
+					stop_server_session "$pid"
+					return
+				fi
+				if ! is_running "$pid"; then
+					break
+				fi
+				sleep 0.1
+			done
+		fi
+
+		marker_status=0
+		refresh_server_session_ready || marker_status=$?
+		if ((marker_status == 0 || marker_status == 2)); then
+			stop_server_session "$pid"
+			return
+		fi
+		if is_running "$pid"; then
+			printf 'intercom-codex-project: app-server did not stop before creating its process session; killing it\n' >&2
+			kill -KILL "$pid" 2>/dev/null || true
+			if ! wait_dead "$pid" "$shutdown_timeout"; then
+				printf 'intercom-codex-project: app-server direct child survived SIGKILL\n' >&2
+				cleanup_failed=1
+				return
+			fi
+		fi
+		wait "$pid" 2>/dev/null || true
+		return
+	fi
+
+	if ! is_running "$pid"; then
+		wait "$pid" 2>/dev/null || true
+		return
+	fi
+	kill -TERM "$pid" 2>/dev/null || true
+	if ! wait_dead "$pid" "$shutdown_timeout"; then
+		printf 'intercom-codex-project: %s did not stop; killing it\n' "$label" >&2
+		kill -KILL "$pid" 2>/dev/null || true
+		if ! wait_dead "$pid" "$shutdown_timeout"; then
+			printf 'intercom-codex-project: %s survived SIGKILL\n' "$label" >&2
+			cleanup_failed=1
+			return
+		fi
+	fi
+	wait "$pid" 2>/dev/null || true
 }
 
 cleanup() {
@@ -296,40 +414,95 @@ cleanup() {
   # app-server is stopped.
   stop_process "$adapter_pid" adapter
   stop_process "$server_pid" app-server
-  rm -rf "$runtime_dir"
+  if ! rm -rf "$runtime_dir"; then
+    printf 'intercom-codex-project: could not remove runtime directory %s\n' "$runtime_dir" >&2
+    cleanup_failed=1
+  fi
+}
+
+on_exit() {
+	local status=$1
+	trap '' INT TERM HUP
+	trap - EXIT
+	cleanup
+	if ((status == 0 && cleanup_failed)); then
+		status=1
+	fi
+	exit "$status"
 }
 
 on_signal() {
-  local status=$1
-  trap - INT TERM HUP EXIT
-  cleanup
-  exit "$status"
+	local status=$1
+	if ((launching_child)); then
+		if [[ -z $deferred_signal_status ]]; then
+			deferred_signal_status=$status
+		fi
+		return
+	fi
+	trap '' INT TERM HUP
+	trap - EXIT
+	cleanup
+	exit "$status"
+}
+
+dispatch_deferred_signal() {
+	if [[ -z $deferred_signal_status ]]; then
+		return
+	fi
+	local status=$deferred_signal_status
+	deferred_signal_status=
+	on_signal "$status"
 }
 
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 trap 'on_signal 129' HUP
-trap cleanup EXIT
+trap 'on_exit $?' EXIT
 
 # App-server diagnostics belong on the launcher's diagnostic stream. The
 # adapter/proxy retains stdout for its post-readiness attachment instructions.
-"$codex_bin" app-server --listen "$app_server_endpoint" 1>&2 &
+# The hidden helper calls setsid(2) and then replaces itself with Codex. The
+# direct child PID is therefore a session ID that survives process-group changes.
+# Disable inherited job control so Bash does not make the helper a process-group
+# leader before it calls setsid(2).
+set +m
+launching_child=1
+"$intercom_bin" codex-app-server-exec --ready-file "$app_server_session_path" -- \
+	"$codex_bin" app-server --listen "$app_server_endpoint" 1>&2 &
 server_pid=$!
+launching_child=0
+dispatch_deferred_signal
 
 # Waiting for the socket avoids a noisy initial failure while the adapter's
 # own bounded dial retry verifies the actual WebSocket handshake.
 startup_ticks=$((startup_timeout * 10))
 for ((i = 0; i < startup_ticks; i++)); do
-  if [[ -S $app_server_socket_path ]]; then
+	marker_status=0
+	refresh_server_session_ready || marker_status=$?
+	if ((marker_status == 2)); then
+		exit 1
+	fi
+	if ((server_session_ready)) && [[ -S $app_server_socket_path ]]; then
     break
   fi
   if ! is_running "$server_pid"; then
-    wait "$server_pid" || status=$?
+		# Sweep any descendants before collecting the cached child status.
+		cleanup_server_session "$server_pid"
+		status=0
+		wait "$server_pid" || status=$?
+		server_pid=
     printf 'intercom-codex-project: app-server exited before readiness\n' >&2
-    exit "${status:-1}"
+		if ((status == 0)); then
+			status=1
+		fi
+		exit "$status"
   fi
   sleep 0.1
 done
+if ((!server_session_ready)); then
+	printf 'intercom-codex-project: app-server did not establish its process session after %ss\n' "$startup_timeout" >&2
+	exit 1
+fi
 if [[ ! -S $app_server_socket_path ]]; then
   printf 'intercom-codex-project: app-server was not ready after %ss\n' "$startup_timeout" >&2
   exit 1
@@ -371,6 +544,7 @@ case $selection_mode in
     ;;
 esac
 
+launching_child=1
 "$intercom_bin" codex \
   --app-server "$app_server_endpoint" \
   --client-endpoint "$client_endpoint" \
@@ -378,22 +552,25 @@ esac
   "${selection_args[@]}" \
   "${forwarded_args[@]}" &
 adapter_pid=$!
+launching_child=0
+dispatch_deferred_signal
 
 while :; do
-  if ! is_running "$adapter_pid"; then
+	if ! is_running "$adapter_pid"; then
     status=0
     wait "$adapter_pid" || status=$?
     adapter_pid=
-    stop_process "$server_pid" app-server
-    server_pid=
     exit "$status"
   fi
-  if ! is_running "$server_pid"; then
-    status=0
-    wait "$server_pid" || status=$?
-    server_pid=
-    stop_process "$adapter_pid" adapter
-    adapter_pid=
+	if ! is_running "$server_pid"; then
+		# Preserve adapter-before-app-server cleanup ordering before sweeping any
+		# descendants left by the exited app-server leader.
+		stop_process "$adapter_pid" adapter
+		adapter_pid=
+		cleanup_server_session "$server_pid"
+		status=0
+		wait "$server_pid" || status=$?
+		server_pid=
     if ((status == 0)); then
       status=1
     fi

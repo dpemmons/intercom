@@ -397,6 +397,7 @@ func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) 
 
 	const (
 		seedPrompt       = "materialize this ordinary interactive session"
+		goalObjective    = "complete the active-goal adoption regression"
 		firstPrompt      = "invoke the managed list_peers tool after adoption"
 		secondPrompt     = "invoke the managed list_peers tool after cold resume"
 		firstCallID      = "adopted-mcp-list-peers"
@@ -404,6 +405,12 @@ func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) 
 		firstDeliveryID  = "adopted-delivery"
 		secondDeliveryID = "cold-resume-delivery"
 	)
+	goalRequestStarted := make(chan struct{})
+	allowGoalResponse := make(chan struct{})
+	var goalRequestOnce sync.Once
+	var allowGoalOnce sync.Once
+	releaseGoalResponse := func() { allowGoalOnce.Do(func() { close(allowGoalResponse) }) }
+	defer releaseGoalResponse()
 	responses := newPinnedResponsesRouter(t, func(request map[string]any) (string, error) {
 		switch {
 		case pinnedRequestContains(request, secondCallID):
@@ -422,6 +429,10 @@ func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) 
 				return "", err
 			}
 			return pinnedNamespacedFunctionCallSSE("response-adopt-tool", firstCallID, namespace, intercomtools.ListPeersName, `{}`), nil
+		case pinnedRequestContains(request, goalObjective):
+			goalRequestOnce.Do(func() { close(goalRequestStarted) })
+			<-allowGoalResponse
+			return pinnedAssistantSSE("response-goal-final", "message-goal-final", "goal adoption complete"), nil
 		case pinnedRequestContains(request, seedPrompt):
 			return pinnedAssistantSSE("response-seed", "message-seed", "ordinary session materialized"), nil
 		default:
@@ -442,6 +453,22 @@ func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) 
 	if baselineTurns == 0 {
 		t.Fatal("ordinary thread did not inherit the materialized seed turn")
 	}
+	process.stop(t, syscall.SIGTERM, true)
+
+	goalSetter := startPinnedAppServer(t, codexBin, codexHome, root, "g", appserver.Options{})
+	initializePinnedClient(t, goalSetter.client)
+	setPinnedThreadGoal(t, goalSetter.client, ordinaryThread.ID, goalObjective, "active")
+	select {
+	case <-goalRequestStarted:
+		goalSetter.stop(t, syscall.SIGKILL, false)
+		t.Fatal("setting a goal on an unloaded thread unexpectedly started a turn")
+	case <-time.After(100 * time.Millisecond):
+	}
+	goalSetter.stop(t, syscall.SIGTERM, true)
+
+	process = startPinnedAppServer(t, codexBin, codexHome, root, "a", appserver.Options{})
+	initializePinnedClient(t, process.client)
+	endpoint = "unix://" + filepath.Join(root, "app-server-a.sock")
 
 	recorder := newPinnedAdoptionBrokerRecorder([]string{"alice", "bob"})
 	statePath := filepath.Join(root, "state.json")
@@ -477,11 +504,23 @@ func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) 
 		t.Fatalf("adopted thread = %q, want %q", first.info.ThreadID, ordinaryThread.ID)
 	}
 	assertPinnedManagedMCPStatus(t, process.client, ordinaryThread.ID)
+	select {
+	case <-goalRequestStarted:
+	case err := <-first.done:
+		first.cancel()
+		t.Fatalf("controller stopped before active goal continuation: %v", err)
+	case <-time.After(10 * time.Second):
+		first.stop(t)
+		t.Fatal("active goal did not continue during adoption")
+	}
+	setPinnedThreadGoal(t, process.client, ordinaryThread.ID, "", "complete")
+	releaseGoalResponse()
+	waitPinnedCompletedTurnCount(t, process.client, ordinaryThread.ID, baselineTurns+1)
 	first.broker.deliver(wire.Deliver{
 		ID: firstDeliveryID, From: "alice", Message: firstPrompt, Timestamp: "2026-07-14T12:00:00Z",
 	})
 	recorder.waitForLists(t, 1, first.done)
-	waitPinnedCompletedTurnCount(t, process.client, ordinaryThread.ID, baselineTurns+1)
+	waitPinnedCompletedTurnCount(t, process.client, ordinaryThread.ID, baselineTurns+2)
 	first.stop(t)
 	process.stop(t, syscall.SIGTERM, true)
 
@@ -508,13 +547,13 @@ func TestCompatibleCodexAppServerAdoptOrdinarySessionMCPBridgeE2E(t *testing.T) 
 		ID: secondDeliveryID, From: "bob", Message: secondPrompt, Timestamp: "2026-07-14T12:01:00Z",
 	})
 	recorder.waitForLists(t, 2, second.done)
-	waitPinnedCompletedTurnCount(t, resumedProcess.client, ordinaryThread.ID, baselineTurns+2)
+	waitPinnedCompletedTurnCount(t, resumedProcess.client, ordinaryThread.ID, baselineTurns+3)
 	second.stop(t)
 	resumedProcess.stop(t, syscall.SIGTERM, true)
 
 	requests := responses.snapshotRequests(t)
-	if len(requests) != 5 {
-		t.Fatalf("Responses requests = %d, want 5", len(requests))
+	if len(requests) != 6 {
+		t.Fatalf("Responses requests = %d, want 6", len(requests))
 	}
 	if pinnedRequestAdvertisesTool(requests[0], intercomtools.ListPeersName) ||
 		pinnedRequestAdvertisesTool(requests[0], intercomtools.SendMessageName) {
@@ -663,6 +702,28 @@ func readPinnedInteractiveSession(t *testing.T, client *appserver.Client, cwd st
 	}
 	t.Fatalf("Codex TUI did not create a materialized interactive session: %#v", listed.Data)
 	return appserver.Thread{}
+}
+
+func setPinnedThreadGoal(t *testing.T, client *appserver.Client, threadID, objective, status string) {
+	t.Helper()
+	params := map[string]any{"threadId": threadID, "status": status}
+	if objective != "" {
+		params["objective"] = objective
+	}
+	var response struct {
+		Goal struct {
+			ThreadID string `json:"threadId"`
+			Status   string `json:"status"`
+		} `json:"goal"`
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := client.Call(ctx, "thread/goal/set", params, &response); err != nil {
+		t.Fatalf("set thread %s goal status %s: %v", threadID, status, err)
+	}
+	if response.Goal.ThreadID != threadID || response.Goal.Status != status {
+		t.Fatalf("thread/goal/set response = %#v, want thread %s status %s", response, threadID, status)
+	}
 }
 
 func pinnedThreadHasCompletedTurn(thread appserver.Thread) bool {

@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -296,6 +298,72 @@ func TestLauncherSignalStopsAdapterBeforeServer(t *testing.T) {
 	wantEventsInOrder(t, result.events, "adapter-term", "server-term")
 }
 
+func TestLauncherSignalBeforeSessionPublicationStopsDirectChild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "signal-before-session-publication")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvent(t, eventPath, "pre-session-pid=", 5*time.Second)
+	pid := recordedEventPID(t, readEvents(t, eventPath), "pre-session-pid=")
+	disarmCleanup := cleanupRecordedPIDs(t, []int{pid})
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 143 {
+		t.Fatalf("exit code = %d, want 143; stderr:\n%s", code, stderr.String())
+	}
+	waitForProcessExit(t, pid, 5*time.Second)
+	disarmCleanup()
+	if strings.Contains(readEvents(t, eventPath), "adapter-start") {
+		t.Fatal("adapter started after pre-session termination")
+	}
+	assertRuntimeClean(t, runtimeDir)
+}
+
+func TestLauncherRejectsWrongSessionMarkerWithoutHanging(t *testing.T) {
+	result := runLauncher(t, "wrong-session-marker")
+	pid := recordedEventPID(t, result.events, "pre-session-pid=")
+	disarmCleanup := cleanupRecordedPIDs(t, []int{pid})
+	if result.exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	for _, want := range []string{
+		"app-server published process session",
+		"app-server process-session cleanup left its direct child running; killing it",
+	} {
+		if !strings.Contains(result.stderr, want) {
+			t.Fatalf("missing %q; stderr:\n%s", want, result.stderr)
+		}
+	}
+	waitForProcessExit(t, pid, 5*time.Second)
+	disarmCleanup()
+	if strings.Contains(result.events, "adapter-start") {
+		t.Fatal("adapter started after invalid process-session marker")
+	}
+}
+
+func TestLauncherDisablesInheritedJobControlBeforeSetsid(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "adapter-first")
+	cmd.Args = append([]string{cmd.Args[0], "-m"}, cmd.Args[1:]...)
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 17 {
+		t.Fatalf("exit code = %d, want adapter code 17; stderr:\n%s", code, stderr.String())
+	}
+	wantEventsInOrder(t, readEvents(t, eventPath), "server-start", "adapter-start", "server-term")
+	assertRuntimeClean(t, runtimeDir)
+}
+
 func TestLauncherSignalExitCodes(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -327,6 +395,195 @@ func TestLauncherEscalatesAdapterFromTermToKill(t *testing.T) {
 		t.Fatalf("TERM-ignoring adapter reported a graceful stop:\n%s", result.events)
 	}
 	wantEventsInOrder(t, result.events, "adapter-ignore-term", "server-term")
+}
+
+func TestLauncherForcedServerKillStopsDescendantTree(t *testing.T) {
+	result := startAndSignalLauncher(t, "server-descendants-ignore-term", syscall.SIGTERM)
+	pids := recordedServerTreePIDs(t, result.events)
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+
+	if result.exitCode != 143 {
+		t.Fatalf("exit code = %d, want 143; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stderr, "app-server did not stop; killing it") {
+		t.Fatalf("missing forced-kill diagnostic; stderr:\n%s", result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "server-tree-pids=", "adapter-start", "adapter-term")
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+}
+
+func TestLauncherStopsDescendantsAfterServerWrapperExits(t *testing.T) {
+	result := startAndSignalLauncher(t, "server-wrapper-exits-descendants-ignore-term", syscall.SIGTERM)
+	pids := recordedServerTreePIDs(t, result.events)
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+
+	if result.exitCode != 143 {
+		t.Fatalf("exit code = %d, want 143; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	if strings.Contains(result.stderr, "app-server did not stop; killing it") {
+		t.Fatalf("wrapper that handled TERM was reported stuck; stderr:\n%s", result.stderr)
+	}
+	if !strings.Contains(result.stderr, "app-server descendants did not stop; killing them") {
+		t.Fatalf("missing descendant forced-kill diagnostic; stderr:\n%s", result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "server-tree-pids=", "adapter-start", "adapter-term", "server-wrapper-term")
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+}
+
+func TestLauncherStopsDescendantsAfterUnexpectedServerWrapperExit(t *testing.T) {
+	result := runLauncher(t, "server-wrapper-exits-unexpectedly")
+	pids := recordedServerTreePIDs(t, result.events)
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+
+	if result.exitCode != 31 {
+		t.Fatalf("exit code = %d, want wrapper code 31; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stderr, "app-server descendants did not stop; killing them") {
+		t.Fatalf("missing orphan-descendant forced-kill diagnostic; stderr:\n%s", result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "server-tree-pids=", "adapter-start", "server-wrapper-exit", "adapter-term")
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+}
+
+func TestLauncherStopsLateServerDescendant(t *testing.T) {
+	result := startAndSignalLauncher(t, "server-wrapper-exits-late-descendant", syscall.SIGTERM)
+	pids := append(recordedServerTreePIDs(t, result.events), recordedLateServerPID(t, result.events))
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+
+	if result.exitCode != 143 {
+		t.Fatalf("exit code = %d, want 143; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	if strings.Contains(result.stderr, "app-server did not stop; killing it") {
+		t.Fatalf("wrapper that handled TERM was reported stuck; stderr:\n%s", result.stderr)
+	}
+	if !strings.Contains(result.stderr, "app-server descendants did not stop; killing them") {
+		t.Fatalf("missing late-descendant forced-kill diagnostic; stderr:\n%s", result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "server-wrapper-term", "server-late-worker-pid=")
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+}
+
+func TestLauncherStopsSessionAfterLeaderExitsBeforeReadiness(t *testing.T) {
+	result := runLauncher(t, "server-exit-before-ready-descendant")
+	pids := recordedServerTreePIDs(t, result.events)
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+
+	if result.exitCode != 33 {
+		t.Fatalf("exit code = %d, want leader code 33; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	if strings.Contains(result.events, "adapter-start") {
+		t.Fatalf("adapter started after app-server leader exited before readiness:\n%s", result.events)
+	}
+	if !strings.Contains(result.stderr, "app-server descendants did not stop; killing them") {
+		t.Fatalf("missing descendant cleanup diagnostic; stderr:\n%s", result.stderr)
+	}
+	wantEventsInOrder(t, result.events, "server-tree-pids=", "server-wrapper-exit-before-ready")
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+}
+
+func TestLauncherSecondSignalDoesNotAbortSessionCleanup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "server-descendants-ignore-term-second-signal")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvent(t, eventPath, "adapter-start", 5*time.Second)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvent(t, eventPath, "cleanup-kill-phase", 5*time.Second)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.Wait()
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 143 {
+		t.Fatalf("exit code = %d, want 143; stderr:\n%s", code, stderr.String())
+	}
+	events := readEvents(t, eventPath)
+	pids := recordedServerTreePIDs(t, events)
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+	assertRuntimeClean(t, runtimeDir)
+}
+
+func TestLauncherReportsSessionCleanupFailureAndOverridesSuccess(t *testing.T) {
+	result := runLauncher(t, "server-cleanup-failure")
+	pids := recordedServerTreePIDs(t, result.events)
+	disarmCleanup := cleanupRecordedPIDs(t, pids)
+	if result.exitCode != 1 {
+		t.Fatalf("exit code = %d, want cleanup failure status 1; stderr:\n%s", result.exitCode, result.stderr)
+	}
+	if !strings.Contains(result.stderr, "simulated app-server process-session cleanup failure") {
+		t.Fatalf("missing cleanup failure diagnostic; stderr:\n%s", result.stderr)
+	}
+	for _, pid := range pids {
+		waitForProcessExit(t, pid, 5*time.Second)
+	}
+	disarmCleanup()
+}
+
+func TestLauncherReportsRuntimeDirectoryRemovalFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeBase := launcherCommand(t, ctx, "runtime-removal-failure")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cleanupArmed := true
+	t.Cleanup(func() {
+		if cleanupArmed {
+			cleanupRecordedTestSession(eventPath)
+		}
+	})
+	err := cmd.Wait()
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 1 {
+		t.Fatalf("exit code = %d, want cleanup failure status 1; stderr:\n%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "could not remove runtime directory") {
+		t.Fatalf("missing runtime removal diagnostic; stderr:\n%s", stderr.String())
+	}
+	assertTestSessionStopped(t, eventPath)
+	cleanupArmed = false
+	entries, readErr := os.ReadDir(runtimeBase)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("runtime base entries = %v, want failed service directory", entries)
+	}
+	failedRuntime := filepath.Join(runtimeBase, entries[0].Name())
+	if chmodErr := os.Chmod(failedRuntime, 0o700); chmodErr != nil {
+		t.Fatal(chmodErr)
+	}
+	if removeErr := os.RemoveAll(failedRuntime); removeErr != nil {
+		t.Fatal(removeErr)
+	}
+	assertRuntimeClean(t, runtimeBase)
 }
 
 func TestLauncherAcceptsLeadingZeroTimeouts(t *testing.T) {
@@ -373,7 +630,8 @@ func TestLauncherRejectsInvalidTimeout(t *testing.T) {
 	}{
 		{name: "non-number", value: "not-a-number"},
 		{name: "zero", value: "000"},
-		{name: "overflow", value: "922337203685477581"},
+		{name: "duration overflow", value: "9223372037"},
+		{name: "arithmetic overflow", value: "922337203685477581"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -393,6 +651,23 @@ func TestLauncherRejectsInvalidTimeout(t *testing.T) {
 			assertRuntimeClean(t, runtimeDir)
 		})
 	}
+}
+
+func TestLauncherAcceptsMaximumDurationTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, "server-exit-before-ready")
+	replaceEnv(cmd, "INTERCOM_CODEX_STARTUP_TIMEOUT_SECONDS", "9223372036")
+	replaceEnv(cmd, "INTERCOM_CODEX_SHUTDOWN_TIMEOUT_SECONDS", "9223372036")
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
+	}
+	if code := processExitCode(err); code != 19 {
+		t.Fatalf("exit code = %d, want app-server code 19; stderr:\n%s", code, stderr.String())
+	}
+	wantEventsInOrder(t, readEvents(t, eventPath), "server-exit-before-ready")
+	assertRuntimeClean(t, runtimeDir)
 }
 
 func TestLauncherRejectsEndpointOverridesBeforeStartingChildren(t *testing.T) {
@@ -709,7 +984,16 @@ func runLauncher(t *testing.T, mode string, args ...string) launcherResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd, stderr, eventPath, runtimeDir := launcherCommand(t, ctx, mode, args...)
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start launcher: %v", err)
+	}
+	cleanupArmed := true
+	t.Cleanup(func() {
+		if cleanupArmed {
+			cleanupRecordedTestSession(eventPath)
+		}
+	})
+	err := cmd.Wait()
 	if ctx.Err() != nil {
 		t.Fatalf("launcher timed out; stderr:\n%s", stderr.String())
 	}
@@ -720,6 +1004,8 @@ func runLauncher(t *testing.T, mode string, args ...string) launcherResult {
 		runtime:  runtimeDir,
 	}
 	assertRuntimeClean(t, result.runtime)
+	assertTestSessionStopped(t, eventPath)
+	cleanupArmed = false
 	return result
 }
 
@@ -731,6 +1017,12 @@ func startAndSignalLauncher(t *testing.T, mode string, signal syscall.Signal) la
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start launcher: %v", err)
 	}
+	cleanupArmed := true
+	t.Cleanup(func() {
+		if cleanupArmed {
+			cleanupRecordedTestSession(eventPath)
+		}
+	})
 	waitForEvent(t, eventPath, "adapter-start", 5*time.Second)
 	if err := cmd.Process.Signal(signal); err != nil {
 		t.Fatalf("signal launcher: %v", err)
@@ -746,6 +1038,8 @@ func startAndSignalLauncher(t *testing.T, mode string, signal syscall.Signal) la
 		runtime:  runtimeDir,
 	}
 	assertRuntimeClean(t, result.runtime)
+	assertTestSessionStopped(t, eventPath)
+	cleanupArmed = false
 	return result
 }
 
@@ -857,6 +1151,14 @@ func runLauncherHelper() int {
 	switch args[0] {
 	case "app-server":
 		return runServerHelper(args)
+	case "codex-app-server-exec":
+		return runSessionExecHelper(args)
+	case "codex-process-session-cleanup":
+		return runProcessSessionCleanupHelper(args)
+	case "launcher-native-server":
+		return runNativeServerHelper(args)
+	case "launcher-server-worker":
+		return runServerWorkerHelper()
 	case "codex":
 		if len(args) > 1 && args[1] == "sessions" {
 			return runSessionsHelper(args)
@@ -864,6 +1166,142 @@ func runLauncherHelper() int {
 		return runAdapterHelper(args)
 	default:
 		return 91
+	}
+}
+
+func runSessionExecHelper(args []string) int {
+	if len(args) < 6 || args[1] != "--ready-file" || args[2] == "" || args[3] != "--" {
+		return 103
+	}
+	mode := os.Getenv(helperMode)
+	if mode == "signal-before-session-publication" || mode == "wrong-session-marker" {
+		recordEvent(fmt.Sprintf("pre-session-pid=%d", os.Getpid()))
+		if mode == "wrong-session-marker" {
+			if err := os.WriteFile(args[2], []byte(fmt.Sprintf("%d\n", os.Getpid()+1)), 0o600); err != nil {
+				return 108
+			}
+		}
+		waitForSignal()
+		return 0
+	}
+	path, err := exec.LookPath(args[4])
+	if err != nil {
+		recordEvent("session-exec-lookup-error=" + err.Error())
+		return 104
+	}
+	if _, err := syscall.Setsid(); err != nil {
+		recordEvent("session-exec-setsid-error=" + err.Error())
+		return 105
+	}
+	recordEvent(fmt.Sprintf("server-session-pid=%d", os.Getpid()))
+	readyTemp := fmt.Sprintf("%s.%d.tmp", args[2], os.Getpid())
+	if err := os.WriteFile(readyTemp, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		recordEvent("session-exec-ready-error=" + err.Error())
+		return 108
+	}
+	if err := os.Rename(readyTemp, args[2]); err != nil {
+		recordEvent("session-exec-ready-error=" + err.Error())
+		return 108
+	}
+	if err := syscall.Exec(path, args[4:], os.Environ()); err != nil {
+		recordEvent("session-exec-error=" + err.Error())
+		return 106
+	}
+	return 0
+}
+
+func runProcessSessionCleanupHelper(args []string) int {
+	sidText, sidOK := flagValue(args, "--sid")
+	leaderText, leaderOK := flagValue(args, "--leader")
+	timeoutText, timeoutOK := flagValue(args, "--timeout")
+	sid, sidErr := strconv.Atoi(sidText)
+	leader, leaderErr := strconv.Atoi(leaderText)
+	timeout, timeoutErr := time.ParseDuration(timeoutText)
+	if !sidOK || !leaderOK || !timeoutOK || sidErr != nil || leaderErr != nil || sid <= 0 || leader != sid || timeoutErr != nil || timeout <= 0 {
+		return 109
+	}
+	mode := os.Getenv(helperMode)
+	finish := func() int {
+		if mode == "server-cleanup-failure" {
+			_, _ = fmt.Fprintln(os.Stderr, "intercom: simulated app-server process-session cleanup failure")
+			return 110
+		}
+		return 0
+	}
+	signal.Ignore(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	termDeadline := time.Now().Add(timeout)
+	var members []int
+	for {
+		members = helperSessionMembers(sid)
+		if len(members) == 0 {
+			return finish()
+		}
+		helperSignalSessionMembers(members, leader, syscall.SIGTERM)
+		if !time.Now().Before(termDeadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if slices.Contains(members, leader) {
+		_, _ = fmt.Fprintln(os.Stderr, "intercom-codex-project: app-server did not stop; killing it")
+	} else {
+		_, _ = fmt.Fprintln(os.Stderr, "intercom-codex-project: app-server descendants did not stop; killing them")
+	}
+	if mode == "server-descendants-ignore-term-second-signal" {
+		recordEvent("cleanup-kill-phase")
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	killDeadline := time.Now().Add(timeout)
+	for {
+		members = helperSessionMembers(sid)
+		if len(members) == 0 {
+			return finish()
+		}
+		helperSignalSessionMembers(members, leader, syscall.SIGKILL)
+		if !time.Now().Before(killDeadline) {
+			return 110
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func helperSessionMembers(sid int) []int {
+	output, err := exec.Command("ps", "-A", "-o", "pid=", "-o", "stat=").Output()
+	if err != nil {
+		return []int{sid}
+	}
+	members := make([]int, 0)
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || strings.HasPrefix(fields[1], "Z") {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		got, err := testGetSID(pid)
+		if err == nil && got == sid {
+			members = append(members, pid)
+		}
+	}
+	return members
+}
+
+func helperSignalSessionMembers(members []int, leader int, signal syscall.Signal) {
+	for _, pid := range members {
+		if pid != leader {
+			if sid, err := testGetSID(pid); err == nil && sid == leader {
+				_ = syscall.Kill(pid, signal)
+			}
+		}
+	}
+	if slices.Contains(members, leader) {
+		if sid, err := testGetSID(leader); err == nil && sid == leader {
+			_ = syscall.Kill(leader, signal)
+		}
 	}
 }
 
@@ -897,6 +1335,12 @@ func runSessionsHelper(args []string) int {
 
 func runServerHelper(args []string) int {
 	mode := os.Getenv(helperMode)
+	if mode == "server-descendants-ignore-term" || mode == "server-wrapper-exits-descendants-ignore-term" ||
+		mode == "server-wrapper-exits-unexpectedly" || mode == "server-wrapper-exits-late-descendant" ||
+		mode == "server-exit-before-ready-descendant" || mode == "server-descendants-ignore-term-second-signal" ||
+		mode == "server-cleanup-failure" {
+		return runServerWrapperHelper(args)
+	}
 	if mode == "server-exit-before-ready" {
 		recordEvent("server-exit-before-ready")
 		return 19
@@ -933,6 +1377,108 @@ func runServerHelper(args []string) int {
 	return 0
 }
 
+func runServerWrapperHelper(args []string) int {
+	endpoint, ok := flagValue(args, "--listen")
+	if !ok || !strings.HasPrefix(endpoint, "unix://") {
+		return 92
+	}
+	var signals chan os.Signal
+	mode := os.Getenv(helperMode)
+	if mode == "server-wrapper-exits-descendants-ignore-term" || mode == "server-wrapper-exits-late-descendant" {
+		signals = make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM)
+		defer signal.Stop(signals)
+	}
+	child := exec.Command(os.Args[0], "launcher-native-server", endpoint)
+	child.Env = os.Environ()
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		recordEvent("server-native-start-error=" + err.Error())
+		return 98
+	}
+	go func() { _ = child.Wait() }()
+	if mode == "server-exit-before-ready-descendant" {
+		if !helperWaitForEvent("server-tree-pids=", 5*time.Second) {
+			return 111
+		}
+		recordEvent("server-wrapper-exit-before-ready")
+		return 33
+	}
+	if mode == "server-wrapper-exits-unexpectedly" {
+		if !helperWaitForEvent("adapter-start", 5*time.Second) {
+			return 102
+		}
+		recordEvent("server-wrapper-exit")
+		return 31
+	}
+	if signals != nil {
+		<-signals
+		recordEvent("server-wrapper-term")
+		return 0
+	}
+	signal.Ignore(syscall.SIGTERM)
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func runNativeServerHelper(args []string) int {
+	if len(args) != 2 || !strings.HasPrefix(args[1], "unix://") {
+		return 99
+	}
+	worker := exec.Command(os.Args[0], "launcher-server-worker")
+	worker.Env = os.Environ()
+	worker.Stdout = os.Stdout
+	worker.Stderr = os.Stderr
+	worker.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := worker.Start(); err != nil {
+		recordEvent("server-worker-start-error=" + err.Error())
+		return 100
+	}
+	go func() { _ = worker.Wait() }()
+	var listener net.Listener
+	if os.Getenv(helperMode) != "server-exit-before-ready-descendant" {
+		var err error
+		listener, err = net.Listen("unix", strings.TrimPrefix(args[1], "unix://"))
+		if err != nil {
+			recordEvent("server-listen-error=" + err.Error())
+			return 101
+		}
+		defer listener.Close()
+	}
+	recordEvent(fmt.Sprintf("server-tree-pids=%d,%d,%d", os.Getppid(), os.Getpid(), worker.Process.Pid))
+	if os.Getenv(helperMode) == "server-wrapper-exits-late-descendant" {
+		go func() {
+			if !helperWaitForEvent("server-wrapper-term", 5*time.Second) {
+				return
+			}
+			late := exec.Command(os.Args[0], "launcher-server-worker")
+			late.Env = os.Environ()
+			late.Stdout = os.Stdout
+			late.Stderr = os.Stderr
+			late.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := late.Start(); err != nil {
+				recordEvent("server-late-worker-start-error=" + err.Error())
+				return
+			}
+			recordEvent(fmt.Sprintf("server-late-worker-pid=%d", late.Process.Pid))
+			_ = late.Wait()
+		}()
+	}
+	signal.Ignore(syscall.SIGTERM)
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func runServerWorkerHelper() int {
+	signal.Ignore(syscall.SIGTERM)
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
 func runAdapterHelper(args []string) int {
 	mode := os.Getenv(helperMode)
 	if mode == "adapter-ignore-term" {
@@ -940,9 +1486,24 @@ func runAdapterHelper(args []string) int {
 	}
 	recordEvent("adapter-start")
 	recordEvent("adapter-args=" + strings.Join(args, "\x1f"))
-	if mode == "adapter-first" || mode == "stream-routing" || mode == "picker-adopt" || mode == "picker-fork" {
+	if mode == "adapter-first" || mode == "stream-routing" || mode == "picker-adopt" || mode == "picker-fork" ||
+		mode == "server-cleanup-failure" || mode == "runtime-removal-failure" {
 		if mode == "stream-routing" {
 			_, _ = fmt.Fprintln(os.Stdout, "service-ready")
+		}
+		if mode == "server-cleanup-failure" {
+			return 0
+		}
+		if mode == "runtime-removal-failure" {
+			endpoint, ok := flagValue(args, "--app-server")
+			if !ok || !strings.HasPrefix(endpoint, "unix://") {
+				return 95
+			}
+			if err := os.Chmod(filepath.Dir(strings.TrimPrefix(endpoint, "unix://")), 0o500); err != nil {
+				recordEvent("runtime-chmod-error=" + err.Error())
+				return 96
+			}
+			return 0
 		}
 		return 17
 	}
@@ -1079,4 +1640,120 @@ func helperWaitForEvent(want string, timeout time.Duration) bool {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return false
+}
+
+func recordedServerTreePIDs(t *testing.T, events string) []int {
+	t.Helper()
+	for _, line := range strings.Split(events, "\n") {
+		if !strings.HasPrefix(line, "server-tree-pids=") {
+			continue
+		}
+		var wrapper, native, worker int
+		if _, err := fmt.Sscanf(strings.TrimPrefix(line, "server-tree-pids="), "%d,%d,%d", &wrapper, &native, &worker); err != nil {
+			t.Fatalf("parse server tree PIDs from %q: %v", line, err)
+		}
+		return []int{wrapper, native, worker}
+	}
+	t.Fatalf("server tree PIDs not found in events:\n%s", events)
+	return nil
+}
+
+func recordedLateServerPID(t *testing.T, events string) int {
+	t.Helper()
+	for _, line := range strings.Split(events, "\n") {
+		if !strings.HasPrefix(line, "server-late-worker-pid=") {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(strings.TrimPrefix(line, "server-late-worker-pid="), "%d", &pid); err != nil {
+			t.Fatalf("parse late server PID from %q: %v", line, err)
+		}
+		return pid
+	}
+	t.Fatalf("late server PID not found in events:\n%s", events)
+	return 0
+}
+
+func recordedEventPID(t *testing.T, events, prefix string) int {
+	t.Helper()
+	for _, line := range strings.Split(events, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimPrefix(line, prefix))
+		if err != nil || pid <= 0 {
+			t.Fatalf("parse PID from %q: %v", line, err)
+		}
+		return pid
+	}
+	t.Fatalf("event %q not found:\n%s", prefix, events)
+	return 0
+}
+
+func cleanupRecordedPIDs(t *testing.T, pids []int) func() {
+	t.Helper()
+	armed := true
+	t.Cleanup(func() {
+		if !armed {
+			return
+		}
+		for index := len(pids) - 1; index >= 0; index-- {
+			_ = syscall.Kill(pids[index], syscall.SIGKILL)
+		}
+	})
+	return func() { armed = false }
+}
+
+func assertTestSessionStopped(t *testing.T, eventPath string) {
+	t.Helper()
+	sid, ok := optionalRecordedEventPID(readEvents(t, eventPath), "server-session-pid=")
+	if !ok {
+		return
+	}
+	if members := helperSessionMembers(sid); len(members) != 0 {
+		cleanupRecordedTestSession(eventPath)
+		t.Fatalf("launcher left app-server session %d members running: %v", sid, members)
+	}
+}
+
+func cleanupRecordedTestSession(eventPath string) {
+	data, _ := os.ReadFile(eventPath)
+	events := string(data)
+	if pid, ok := optionalRecordedEventPID(events, "pre-session-pid="); ok {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	sid, ok := optionalRecordedEventPID(events, "server-session-pid=")
+	if ok {
+		for range 10 {
+			members := helperSessionMembers(sid)
+			if len(members) == 0 {
+				break
+			}
+			helperSignalSessionMembers(members, sid, syscall.SIGKILL)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func optionalRecordedEventPID(events, prefix string) (int, bool) {
+	for _, line := range strings.Split(events, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimPrefix(line, prefix))
+		return pid, err == nil && pid > 0
+	}
+	return 0, false
+}
+
+func waitForProcessExit(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d survived launcher shutdown", pid)
 }

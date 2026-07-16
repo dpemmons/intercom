@@ -185,16 +185,18 @@ This procedure starts an interactive managed Codex service and executes the conc
 
 - `codex-cli` 0.144.1 or later available as `codex`.
 - `intercom-codex-project` and `intercom` available on `PATH`.
+- Linux or Darwin with `setsid(2)`, `getsid(2)`, and `ps -A -o pid= -o stat=` available.
 - Codex authentication available to the child `codex app-server` process.
 - A project directory writable under the selected Codex sandbox policy.
 
 ### Concepts
 
-The launcher starts one child `codex app-server`, waits for its Unix socket, and starts one child `intercom codex` adapter/proxy. A mode-0700 runtime directory contains three unique endpoints:
+The launcher starts its hidden Intercom session-exec helper as a child. A terminal signal received during the asynchronous launch window is deferred until the launcher records the child PID, then dispatched immediately. The helper creates a process session, writes its own PID, forces the marker inode to mode 0600 independently of process umask, publishes it atomically, and replaces itself with `codex app-server`. Publication occurs after `setsid(2)` and before app-server execution or descendant creation, so the Codex child PID is also the dedicated session ID. The launcher validates that PID and waits for the Unix socket before it starts one `intercom codex` adapter/proxy child outside the Codex session. A mode-0700 runtime directory contains three unique endpoints and one readiness marker:
 
 - `app-server.sock` is the private upstream connection from the adapter to app-server;
 - `client.sock` is the private downstream connection from one stock Codex TUI to the adapter/proxy;
-- `mcp-bridge.sock` is the authenticated private tool connection used by adopted and forked sessions.
+- `mcp-bridge.sock` is the authenticated private tool connection used by adopted and forked sessions;
+- `app-server.session` is the mode-0600 decimal PID and session ID published without replacing an existing marker.
 
 The adapter creates or resumes one non-ephemeral thread with the following unattended policy:
 
@@ -206,9 +208,9 @@ The adapter creates or resumes one non-ephemeral thread with the following unatt
 - `send_message` and `list_peers` registered as dynamic tools for a new Intercom thread or as a required MCP server for an adopted or forked interactive thread;
 - one inbound Intercom message serialized into one Codex turn.
 
-The proxy forwards the documented closed request allowlist. TUI turns and Intercom delivery turns share one scheduler, so only one turn starts at a time. An Intercom delivery waits while a TUI turn is active. A `turn/start` request is rejected while another managed turn is active. Interactive approval and input requests use the attached TUI when it remains connected; the unattended fallback policy applies without a TUI. Client notifications other than `initialized` and request methods outside the allowlist are rejected.
+The proxy forwards the documented closed request allowlist. TUI turns, Intercom delivery turns, and Codex persistent-goal continuations share one scheduler. An Intercom delivery waits while another turn source owns it. A `turn/start` request is rejected while another managed turn or accepted settings update blocks local admission. Interactive approval and input requests use the attached TUI when it remains connected; the unattended fallback policy applies without a TUI. Client notifications other than `initialized` and request methods outside the allowlist are rejected.
 
-The attached TUI may select model, service tier, reasoning effort and summary, personality, collaboration mode, and multi-agent mode for its own turns. The proxy pins the managed directory, runtime workspace-root list, approval policy, approvals reviewer, and sandbox policy to the service configuration. Settings update is allowed only while the controller is idle and drops permissions and unknown fields. Both service configurations use approval policy `never` and approvals reviewer `user`. The default uses workspace-write sandboxing; yolo uses `danger-full-access`. Intercom reasserts the selected policy on thread resume, settings updates, TUI turns, and Intercom-delivered turns. Thread-level Intercom developer instructions remain separate from additive collaboration-mode instructions.
+The attached TUI may select model, service tier, reasoning effort and summary, personality, collaboration mode, and multi-agent mode for its own turns. The proxy pins the managed directory, runtime workspace-root list, approval policy, approvals reviewer, and sandbox policy to the service configuration. Settings update is allowed only while the controller is idle and drops permissions and unknown fields. Once accepted, it atomically blocks broker-delivery start, TUI `turn/start`, and another settings update through its upstream response or error. Independently arriving app-server goal and turn lifecycle remains authoritative. Both service configurations use approval policy `never` and approvals reviewer `user`. The default uses workspace-write sandboxing; yolo uses `danger-full-access`. Intercom reasserts the selected policy on thread resume, settings updates, TUI turns, and Intercom-delivered turns. Thread-level Intercom developer instructions remain separate from additive collaboration-mode instructions.
 
 Codex may create child threads while a managed root turn runs. Child lifecycle events do not complete or replace the root turn. A child whose parent or fork ancestry is verified through `thread/read` may use inherited Intercom tools. This behavior depends on the launcher's dedicated app-server; the lower-level adapter is not valid with a shared app-server.
 
@@ -246,6 +248,10 @@ The output contains all other peers in bytewise sorted order. Existing Claude pe
 | Condition | Result |
 |---|---|
 | App-server, managed-thread, tool, broker, proxy, descriptor, or readiness-output initialization fails. | The launcher does not print an attachment command, stops its service group, and exits nonzero. Standard error identifies the failed boundary. |
+| The helper cannot resolve Codex, create its process session, publish the marker, or execute app-server. | `intercom` reports `resolve Codex executable`, `create app-server process session`, `publish app-server process session`, or `exec Codex app-server`; the launcher reports that app-server exited before readiness and exits nonzero. |
+| The marker does not appear before the startup timeout. | The launcher reports `app-server did not establish its process session after Ns`, performs pre-marker direct-child cleanup, and exits with status 1. |
+| The marker value differs from the direct-child PID. | The launcher reports `app-server published process session VALUE, want PID`, marks cleanup failed, invokes session cleanup against the expected PID, and exits nonzero. |
+| The marker is valid but the socket does not appear before the startup timeout. | The launcher reports `app-server was not ready after Ns`, stops the process session, and exits with status 1. |
 | Another service owns the peer binding or live broker-and-peer descriptor. | Startup reports `peer is already managed` or `Codex instance is already live`; the existing service remains active. |
 | Another live broker peer owns `reviewer`. | Broker registration reports `name_taken`; the launcher exits without readiness output. |
 | The generated attachment command cannot find the descriptor under its printed environment. | `intercom codex attach` reports that no live instance exists or that the descriptor is stale. The launcher must still be running and the complete printed command must be used. |
@@ -356,7 +362,7 @@ The binding is stored in `$INTERCOM_DIR/codex/NAME.json`; the default base is `$
 
 The durable binding contains the managed thread identity and compatibility metadata. It survives launcher shutdown and does not contain the client socket, service PID, or TUI attachment state. The live descriptor selects one running service by broker identity and peer name. It contains the current client endpoint and is removed during clean service shutdown.
 
-Adoption preserves the selected thread ID and transfers operational ownership to Intercom. Fork creates and manages another thread while leaving the source usable. `--new` creates and binds an unrelated thread. Adoption or fork of a thread other than the saved binding requires `--replace-binding`.
+Adoption preserves the selected thread ID and transfers operational ownership to Intercom. Fork creates and manages another thread while leaving the source usable. `--new` creates and binds an unrelated thread. Adoption or fork of a thread other than the saved binding requires `--replace-binding`. A replacement locks the prior bound thread before validation and retains that lock through live-descriptor publication, readiness output, and final startup release. Success releases it after commit; failure releases it after leaving or restoring the prior binding. Fork from the prior thread uses the retained lock for its source and separately locks the returned fork.
 
 ### Procedure
 
@@ -401,6 +407,8 @@ The TUI displays the managed thread, and the launcher writes a `Codex TUI attach
 
 With no active turn and an empty composer, `Ctrl-C` exits the stock TUI and detaches it from the service. Pressing Tab while a turn is active queues a follow-up in the stock TUI. The TUI submits that message after the active turn completes. Steering and interruption are supported only for the active turn owned by the attached TUI. A TUI that exits after a rejected request can be reattached with the same name-based command.
 
+A supported human-interaction reverse request reaches the attached TUI only when its `threadId` names the managed root or a descendant already recorded by managed lifecycle or tool authorization. An owned request waits for service readiness and for earlier controller-gated lifecycle notifications before TUI delivery. A malformed or unrelated supported request receives the applicable fixed headless-policy response. It does not reach the managed TUI and does not record managed activity or suspend the managed watchdog. The active-turn or persistent-goal inactivity interval is suspended only for owned requests awaiting TUI input.
+
 ##### See also
 
 [Reference: `intercom codex attach`](REFERENCE.md#intercom-codex-attach), [proxy errors](REFERENCE.md#intercom-codex)
@@ -418,6 +426,8 @@ The prior launcher must be stopped. `$INTERCOM_DIR/codex/reviewer.json` must con
 ##### Concepts
 
 Resume requires the same peer name, canonical working directory, `CODEX_HOME`, state schema, and tool-contract version. App-server user-agent and Codex-version fields are diagnostic and are refreshed after successful validation. Restart creates new private sockets and a new live descriptor.
+
+After resume, the adapter calls `thread/goal/get` before broker readiness. A null goal does not reserve the scheduler. Status `active` or an unknown nonempty status reserves it; `paused`, `blocked`, `usageLimited`, `budgetLimited`, and `complete` release it. Error -32601 leaves initial state notification-driven. Another error or an invalid goal identity or empty status fails startup. Ordered goal update and clear notifications supersede an earlier read. A Codex-owned continuation may begin during resume; readiness does not admit a TUI turn or queued Intercom delivery until that continuation reaches terminal processing and its persistent-goal reservation releases.
 
 ##### Procedure
 
@@ -448,6 +458,7 @@ The attached TUI displays the prior conversation.
 | The selected peer, canonical directory, `CODEX_HOME`, state schema, or tool contract differs from the binding. | Startup reports the identity or contract mismatch and directs deliberate replacement through `--new`. |
 | The saved thread is active, failed, ephemeral, or violates the managed approval, reviewer, runtime-root, or sandbox invariants. | Startup reports the failed managed-thread invariant and leaves the binding unchanged. |
 | The saved thread is already locked by another Intercom adapter using the same `CODEX_HOME`. | Startup reports that the thread is already managed by Intercom. |
+| `thread/goal/get` returns an error other than -32601, or returns an invalid managed identity or empty status. | Startup reports the persistent-goal error and leaves the binding unchanged. Error -32601 continues with notification-driven goal state. |
 
 ##### Notes
 
@@ -519,6 +530,10 @@ The source TUI or IDE process must be stopped. The source session must satisfy t
 
 Adoption injects a required per-service MCP configuration for `send_message` and `list_peers`, validates both tools, and writes the binding only after managed-thread, tool, broker, and proxy validation succeeds. The MCP token and socket last for one service lifetime and are reinjected on cold resume; no permanent Codex configuration is written.
 
+The picker status describes the dedicated discovery app-server, not persistent-goal state or ownership by an ordinary Codex process. An eligible `idle` or `notLoaded` session may contain an active persistent goal. After resume, the adapter calls `thread/goal/get` before broker readiness. A null goal does not reserve the scheduler. Status `active` or an unknown nonempty status reserves it; `paused`, `blocked`, `usageLimited`, `budgetLimited`, and `complete` release it. Error -32601 leaves initial state notification-driven; another error or an invalid goal identity or empty status fails startup. Ordered goal update and clear notifications supersede an earlier read.
+
+Adoption may begin a Codex-owned continuation before broker readiness is printed. The continuation retains the controller until it completes; inbound Intercom messages remain queued. Its Intercom tool calls wait for broker registration during startup.
+
 ##### Procedure
 
 The ID-less form prints a numbered newest-first picker and reads one selection:
@@ -548,14 +563,17 @@ sed -n '/"threadId"/p; /"toolTransport"/p' "$state_dir/codex/reviewer.json"
 | Condition | Result |
 |---|---|
 | Interactive selection has no eligible record, lacks a terminal, is canceled, or selects another working directory. | Selection exits nonzero and no adapter starts. |
-| The source is archived, ephemeral, a child thread, active, failed, from another source kind, or has another canonical working directory. | Adoption reports an eligibility error and leaves the binding unchanged. |
+| The discovery app-server reports the source thread as archived, ephemeral, a child thread, active, failed, from another source kind, or in another canonical working directory. | Adoption reports an eligibility error and leaves the binding unchanged. An active persistent goal stored in an otherwise `idle` or `notLoaded` thread is resumed rather than rejected. |
 | Another Intercom adapter owns the source thread. | Adoption reports that the thread is already managed by Intercom. |
 | Another thread is already bound to the peer and `--replace-binding` is absent. | Adoption reports `use --replace-binding`; the existing binding remains unchanged. |
-| Managed MCP configuration or required-tool validation fails. | Adoption exits before binding commit; the prior binding remains unchanged. |
+| Managed MCP configuration or required-tool validation fails. | Adoption exits before the provisional binding write; the prior binding remains unchanged. |
+| `thread/goal/get` returns an error other than -32601, or returns an invalid managed identity or empty status. | Adoption fails before broker readiness and leaves the prior binding unchanged. Error -32601 continues with notification-driven goal state. |
 
 ##### Notes
 
 Ordinary Codex processes do not acquire the Intercom thread lock. The stopped source TUI or IDE must not resume the adopted session while Intercom manages it. Concurrent writes can violate lifecycle, tool-routing, and conversation-order invariants. Forking is required when ordinary access to the source must continue.
+
+Readiness can be printed while a resumed persistent-goal turn remains active. An attached TUI can inspect that turn but does not own it; a new TUI turn and queued Intercom deliveries wait until Codex publishes terminal completion.
 
 ##### See also
 
@@ -573,7 +591,7 @@ The source session must satisfy the eligibility rules in task 5.3 and have the e
 
 ##### Concepts
 
-App-server creates a new thread whose fork ancestry names the source. Intercom validates that ancestry, locks the returned thread ID, and leaves the source ID and conversation unchanged.
+App-server creates a new thread whose fork ancestry names the source. Intercom locks the source while it reads and forks it, validates the returned ancestry, locks the returned thread ID, and leaves the source ID and conversation unchanged. Replacement fork from the prior bound thread retains that existing lock through commit or rollback.
 
 ##### Procedure
 
@@ -601,11 +619,11 @@ The readiness block is printed. The binding's `threadId` differs from the select
 | The source fails the archive, source-kind, ephemeral, root-thread, status, or canonical-directory eligibility rules. | Fork reports an eligibility error and leaves the binding unchanged. |
 | App-server returns an empty or unchanged thread ID, or ancestry does not identify the source. | Fork reports an invariant error and leaves the binding unchanged. Codex storage may retain the created but unbound thread. |
 | Another thread is already bound to the peer and `--replace-binding` is absent. | Fork reports `use --replace-binding`; the existing binding remains unchanged. |
-| Managed MCP or required-tool validation fails. | Fork exits before binding commit; the prior binding remains unchanged. Codex storage may retain the created but unbound thread. |
+| Managed MCP or required-tool validation fails. | Fork exits before the provisional binding write; the prior binding remains unchanged. Codex storage may retain the created but unbound thread. |
 
 ##### Notes
 
-Fork is the selection for simultaneous or later ordinary use of the source session. Intercom manages only the returned fork ID. It does not lock or modify the source thread.
+Fork is the selection for simultaneous or later ordinary use of the source session. Intercom temporarily locks but does not modify the source thread. After ordinary fork startup, it manages only the returned fork ID. Replacement fork from the prior bound thread holds both the retained prior lock and returned fork lock until commit or rollback completes.
 
 ##### See also
 
@@ -623,7 +641,7 @@ The existing service must be stopped. The replacement source must satisfy the ad
 
 ##### Concepts
 
-`--replace-binding` is explicit authorization, not an independent selection mode. Adoption or fork validates the selected thread, required tools, broker registration, and proxy before committing the replacement. Live-descriptor publication and readiness output occur after commit.
+`--replace-binding` is explicit authorization, not an independent selection mode. The adapter acquires the prior binding's thread lock before app-server validation and retains it while it acquires and validates the selected or returned replacement thread. Adoption or fork validates the selected thread, required tools, broker registration, and proxy before provisionally writing the replacement. Live-descriptor publication, readiness output, and final startup release commit that replacement. The prior lock is released only after commit, or after rollback on failure. Fork from the prior bound thread reuses the retained lock as its source lock and also acquires the new fork lock.
 
 ##### Procedure
 
@@ -653,13 +671,15 @@ sed -n '/"threadId"/p; /"toolTransport"/p' "$state_dir/codex/reviewer.json"
 | Condition | Result |
 |---|---|
 | `--replace-binding` is supplied without `--adopt` or `--fork-from`. | The launcher exits with status 2 before child creation. |
+| Another Intercom adapter holds the prior binding's thread lock. | Startup reports `lock prior thread ID during replacement`; validation does not begin and the saved binding remains unchanged. |
 | Selection, source validation, managed-thread validation, required-tool validation, broker registration, or proxy creation fails. | The prior binding remains unchanged. |
-| Live-descriptor publication or readiness-output writing fails after replacement commit. | The launcher exits nonzero and the replacement binding remains stored, although no usable attachment command is printed. |
-| Fork creation succeeds but a pre-commit validation fails. | The prior binding remains unchanged; Codex storage may retain an unbound fork. |
+| Live-descriptor publication, readiness-output writing, or final startup release fails after the provisional write. | The launcher exits nonzero and restores the prior binding, or removes the replacement when no prior binding existed. No usable attachment command is printed. |
+| Rollback of a provisional replacement also fails. | The replacement rollback diagnostic is joined to the startup error; the durable binding requires inspection. |
+| Fork creation succeeds but a validation before the provisional binding write fails. | The prior binding remains unchanged; Codex storage may retain an unbound fork. |
 
 ##### Notes
 
-Selecting the thread ID already stored in the binding is an idempotent resume and does not require replacement authorization. Replacement changes only the Intercom binding. It does not delete the previous Codex rollout or conversation.
+Selecting the thread ID already stored in the binding is an idempotent resume and does not require replacement authorization or a second thread lock. Replacement changes only the Intercom binding. It does not delete the previous Codex rollout or conversation. Thread locks coordinate Intercom adapters only; an ordinary Codex process does not honor them.
 
 ##### See also
 
@@ -697,7 +717,7 @@ The readiness block is printed and the binding contains a thread ID different fr
 |---|---|
 | `--new` is combined with adoption, fork, or list mode. | The launcher exits with status 2 before child creation. |
 | New-thread creation or managed-thread validation fails. | The launcher exits before commit and retains the prior binding. |
-| Broker registration, proxy creation, descriptor publication, or readiness-output writing fails after commit. | The launcher exits nonzero and the new binding remains stored. |
+| For `--new`, broker registration, proxy creation, descriptor publication, or readiness-output writing fails after the new binding write. | The launcher exits nonzero and the new binding remains stored. Adoption and fork use the rollback rules in task 5.6. |
 
 ##### Notes
 
@@ -809,7 +829,13 @@ The launcher must be running in the foreground.
 
 Exiting the Codex TUI closes only its client connection. The service remains registered with the broker, retains queued deliveries and its live descriptor, and accepts a later `intercom codex attach --name NAME` command.
 
-Service termination is a separate launcher operation. The launcher sends `SIGTERM` to the adapter/proxy first. The adapter removes its live descriptor, marks the controller unavailable, stops broker reconnection, closes its broker connection, interrupts an active turn when necessary, and drains the turn and reverse-request handlers within one shutdown budget. The proxy then closes its listener and attached TUI. The launcher next sends `SIGTERM` to app-server. A child that exceeds the configured per-child shutdown timeout receives `SIGKILL`.
+Service termination is a separate launcher operation. The launcher sends `SIGTERM` to the adapter/proxy first. The adapter removes its live descriptor, marks the controller unavailable, stops broker reconnection, closes its broker connection, interrupts an active turn when necessary, and drains the turn and reverse-request handlers within one shutdown budget. The proxy then closes its listener and attached TUI. An adapter that survives the launcher timeout receives `SIGKILL` and a second timeout wait.
+
+The launcher starts Codex in a dedicated process session and keeps the adapter outside that session. After adapter shutdown, the hidden session-cleanup helper obtains candidate PIDs and states from `ps`, excludes zombies, and verifies session membership with `getsid(2)`. It repeats the membership check immediately before each signal, sends the signal to descendants before the leader, and repeats enumeration until the session is empty or the phase deadline expires. A PID receives at most one successful signal in each phase; a failed verification or signal is retried on a later pass. The `SIGTERM` and `SIGKILL` phases have separate full timeout intervals measured with a monotonic clock. Enumeration and signaling time count against the applicable interval, and each phase enumeration receives the remaining interval as its context deadline.
+
+Transient process enumeration, membership, and signaling errors are retried until the applicable deadline. The post-`SIGTERM` leader classification and final `SIGKILL` inspection are each bounded by the smaller of one second and the configured timeout. Final inspection failure, a persistent signal failure, or surviving verified PIDs makes cleanup fail. A cleanup-helper failure also causes a final `SIGKILL` attempt against the still-owned direct child. A descendant that changes process group remains covered. A descendant that calls `setsid(2)` leaves the cleanup session. The final `getsid(2)` verification and `kill(2)` call are not atomic; PID reuse between those operations remains a small best-effort race.
+
+A termination signal received before the session marker exists sends `SIGTERM` only to the direct child while the launcher watches for marker publication. Publication switches to session cleanup. A child that remains alive without a marker for one timeout receives direct-child `SIGKILL`. The helper publishes the marker before it executes app-server, so an app-server descendant cannot exist before this transition.
 
 Clean service shutdown closes an attached TUI connection and removes every private socket entry and its runtime directory. The durable binding and Codex conversation remain available for a later service restart.
 
@@ -849,16 +875,28 @@ ls "$state_dir/codex/live"
 | Only the TUI exits or disconnects. | The service does not stop; the peer remains registered and attachable. |
 | Adapter shutdown cleanup fails. | The launcher propagates the nonzero adapter status after attempting to stop app-server. |
 | App-server exits unexpectedly while the adapter runs. | The launcher stops the adapter and propagates the nonzero app-server status; unexpected app-server status 0 maps to 1. |
-| A child remains alive after the per-child shutdown timeout. | The launcher writes a warning, sends `SIGKILL`, and retains the initiating exit status. |
+| The adapter remains alive after its shutdown timeout. | The launcher writes `adapter did not stop; killing it`, sends `SIGKILL`, and retains the initiating exit status. |
+| The adapter remains alive after its post-`SIGKILL` timeout. | The launcher writes `adapter survived SIGKILL`, marks cleanup failed, and retains an existing nonzero or signal status; an otherwise successful exit becomes status 1. |
+| The Codex session leader remains after the app-server `SIGTERM` deadline. | The cleanup helper writes `intercom-codex-project: app-server did not stop; killing it` and begins an independent full-timeout `SIGKILL` phase. |
+| The Codex session leader exits, but another verified member remains after the `SIGTERM` deadline. | The cleanup helper writes `intercom-codex-project: app-server descendants did not stop; killing them` and begins an independent full-timeout `SIGKILL` phase. |
+| Process enumeration, `getsid(2)`, or signaling continues to fail through cleanup. | The helper reports the precise `enumerate processes`, `inspect process PID session`, `reverify process PID before SIGNAL`, or `signal process PID with SIGNAL` failure and returns nonzero. The launcher marks cleanup failed and attempts direct-child `SIGKILL`. |
+| Final session inspection fails after the `SIGKILL` deadline. | `intercom` reports `inspect app-server process session SID after SIGKILL`; the launcher marks cleanup failed and attempts direct-child `SIGKILL`. |
+| A persistent `SIGKILL` signaling failure remains after final inspection. | `intercom` reports `stop app-server process session SID with SIGKILL`; the launcher marks cleanup failed and attempts direct-child `SIGKILL`. |
+| Verified members survive the `SIGKILL` deadline. | `intercom` reports `app-server process session SID still has processes after SIGKILL: PID, ...`; the launcher marks cleanup failed and attempts direct-child `SIGKILL`. |
+| The session-cleanup helper reports success while the direct child remains live. | The launcher writes `app-server process-session cleanup left its direct child running; killing it`, marks cleanup failed, and sends fallback `SIGKILL`. |
+| The direct child survives fallback `SIGKILL` after session-helper failure. | The launcher writes `app-server direct child survived fallback SIGKILL`; cleanup remains failed. |
+| A pre-marker child survives `SIGTERM` for one timeout. | The launcher writes `app-server did not stop before creating its process session; killing it` and sends direct-child `SIGKILL`. |
+| A pre-marker child survives the post-`SIGKILL` timeout. | The launcher writes `app-server direct child survived SIGKILL`; cleanup remains failed. |
+| Private runtime-directory removal fails. | The launcher writes `could not remove runtime directory PATH`; cleanup remains failed. |
 | Descriptor removal fails during shutdown. | The adapter retries removal after controller return and exits nonzero if the second attempt fails. |
 
 ### Notes
 
-The launcher maps `SIGHUP`, `SIGINT`, and `SIGTERM` to status 129, 130, and 143. Normal adapter status is propagated. A nonzero app-server status is propagated; an unexpected zero app-server status maps to 1.
+The launcher maps the first `SIGHUP`, `SIGINT`, or `SIGTERM` to status 129, 130, or 143 and ignores repeated terminal signals during cleanup. Normal adapter status is propagated. A nonzero app-server status is propagated; an unexpected zero app-server status maps to 1. Cleanup failure changes status 0 to 1 but does not replace an existing nonzero child status or the status selected by the first terminal signal.
 
 Stopping during a starting or active turn interrupts that delivery. Intercom does not retry it. Deliveries waiting in the in-memory queue are lost when the adapter exits. A turn whose result matters must reach terminal completion before the service group stops.
 
-A hard kill, shell failure, or host failure can prevent descriptor and runtime-directory cleanup. The attach command reports a stale descriptor when its recorded process no longer exists. A later launcher publication for the same broker and peer replaces that stale descriptor without changing the durable binding.
+A hard kill, shell failure, or host failure can prevent descriptor and runtime-directory cleanup. A Codex descendant that calls `setsid(2)` leaves the launcher-owned process session and is not terminated by session cleanup. Session membership is reverified immediately before signaling, but `getsid(2)` and `kill(2)` are separate calls; the remaining PID-reuse window cannot be closed by the launcher. Reuse of the original leader PID as an unrelated new session ID after the original session becomes empty is also a very-low-probability best-effort boundary. The attach command reports a stale descriptor when its recorded process no longer exists. A later launcher publication for the same broker and peer replaces that stale descriptor without changing the durable binding.
 
 ### See also
 
@@ -1072,7 +1110,7 @@ The following table maps diagnostics to exact operating conditions.
 | `the attached TUI does not own the managed thread's active turn` | Enter attempted `turn/steer` while an Intercom-delivered turn owned the controller. | The proxy returns JSON-RPC error -32600. `codex-cli` 0.144.4 exits with status 1. The service and active turn remain alive; the same attachment command reconnects after the turn. Tab queues a follow-up without sending this request. |
 | `use --new to replace the binding` | The saved peer, canonical directory, `CODEX_HOME`, state schema, or tool contract differs from the selected runtime. | The matching exact binding values must be restored, or `--new` must select a deliberate replacement. App-server user-agent and Codex-version changes do not produce this diagnostic. |
 | `managed thread is ... want idle` | The dedicated thread is active or in an error state during startup. | The service group must stop until Codex settles before restart. |
-| `active turn had no app-server activity` | An active managed turn emits no app-server activity for 15 minutes. | App-server diagnostics determine whether the service group requires restart. |
+| `codex: active turn or persistent goal had no app-server activity for 15m0s` | An active managed turn or an idle controller reserved by an active or unknown persistent goal emits no app-server activity for 15 minutes while no owned interactive reverse request awaits TUI input. | App-server diagnostics determine whether the service group requires restart. |
 
 ### Notes
 

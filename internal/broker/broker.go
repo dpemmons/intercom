@@ -464,6 +464,10 @@ func (b *Broker) handleConn(raw net.Conn) {
 			_ = wConn.WriteWithTimeout(wire.Goodbye{Reason: "shutdown"}, time.Second)
 			return
 		}
+		// A rejected registration was previously silent, which made the
+		// "dark shim holds a name the real receiver can't get" failure mode
+		// invisible in the broker log. Log it so collisions are diagnosable.
+		logger.Warn("register rejected", "peer", hello.Name, "code", wire.CodeNameTaken, "reason", err.Error())
 		_ = wConn.Write(wire.Error{Code: wire.CodeNameTaken, Message: err.Error()})
 		return
 	}
@@ -547,6 +551,8 @@ func (b *Broker) deregister(p *peer) {
 			b.peersEmptySince = time.Now()
 		}
 		b.peersMu.Unlock()
+		// Logged outside the critical section the refactor deliberately narrowed.
+		b.opts.Logger.Info("peer deregistered", "peer", p.name)
 		b.notifyPeerChanged()
 		return
 	}

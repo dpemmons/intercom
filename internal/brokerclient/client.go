@@ -36,6 +36,14 @@ type ClientOptions struct {
 	Logger     *slog.Logger
 	OnDeliver  func(wire.Deliver)  // called from the read goroutine for each inbound deliver
 	OnGoodbye  func(reason string) // called when the broker explicitly sends goodbye
+	// NameAttempts is the maximum number of hello candidates to try when the
+	// requested name is already taken: Name, then Name-2, Name-3, … up to this
+	// many. Zero or one means the exact name only (a name_taken rejection is
+	// terminal). Only the Claude shim opts in to auto-suffixing; the Codex
+	// adapter leaves this unset so a collision fails loudly, because its attach
+	// and publication contracts assert the registered name equals the
+	// configured name.
+	NameAttempts int
 }
 
 // Client owns at most one connection to the broker at a time. It auto-spawns
@@ -56,6 +64,10 @@ type Client struct {
 	conn    net.Conn
 	wire    *wire.Conn
 	pending map[string]chan wire.Frame
+	// name is the peer name actually registered with the broker. It equals
+	// opts.Name unless that name was taken and Connect auto-suffixed it. Read
+	// via Name(); empty until the first successful handshake.
+	name string
 
 	// generation increments after every successful hello/welcome handshake.
 	// Lifecycle transitions publish while mu is held so events cannot be
@@ -145,6 +157,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.mu.Lock()
 	state := c.state
+	prior := c.name // effective name from a previous connection, if any
 	c.mu.Unlock()
 	switch state {
 	case ConnectionStateConnected:
@@ -156,16 +169,112 @@ func (c *Client) Connect(ctx context.Context) error {
 		return errors.New("broker client: version is required")
 	}
 
+	base := c.opts.Name
+	// Try the base name, then numbered suffixes, when NameAttempts opts in. On
+	// a reconnect the previously-held effective name is tried first so a
+	// suffixed session keeps its identity across a broker restart.
+	candidates := c.nameCandidates(base, prior)
+
+	var nameTaken *HelloError
+	for _, candidate := range candidates {
+		conn, w, err := c.helloOnce(ctx, candidate)
+		if err != nil {
+			var he *HelloError
+			if errors.As(err, &he) && he.Code == wire.CodeNameTaken {
+				// Retry under the next candidate; if this was the last one the
+				// loop ends and the remembered rejection is returned below.
+				nameTaken = he
+				continue
+			}
+			return err
+		}
+
+		// Success. Re-check ctx before publishing: cancellation after the
+		// handshake handoff does not own the established connection.
+		if err := ctx.Err(); err != nil {
+			_ = conn.Close()
+			return err
+		}
+
+		c.mu.Lock()
+		c.conn = conn
+		c.wire = w
+		c.name = candidate
+		c.state = ConnectionStateConnected
+		c.generation++
+		generation := c.generation
+		c.publishConnectionEvent(ConnectionEvent{
+			State:      ConnectionStateConnected,
+			Generation: generation,
+		})
+		c.mu.Unlock()
+
+		go c.readLoop(conn, w)
+		switch {
+		case prior != "" && candidate != prior:
+			c.opts.Logger.Warn("peer name changed on reconnect; peers using the old name can't reach you",
+				"previous", prior, "registered", candidate)
+		case candidate != base:
+			c.opts.Logger.Warn("requested peer name taken; registered under a suffixed name",
+				"requested", base, "registered", candidate)
+		}
+		c.opts.Logger.Info("connected to broker", "socket", c.opts.SocketPath, "name", candidate)
+		return nil
+	}
+
+	if nameTaken != nil {
+		return nameTaken
+	}
+	return fmt.Errorf("broker client: could not derive a valid peer name from %q", base)
+}
+
+// nameCandidates returns the ordered list of names Connect will try. With
+// NameAttempts <= 1 it is just the base name (a name_taken rejection is then
+// terminal). Otherwise it is base, base-2, … base-N, with the previously-held
+// name (prior) moved to the front on a reconnect. Candidates that fail
+// validation (e.g. a suffix past MaxNameLen) are skipped.
+func (c *Client) nameCandidates(base, prior string) []string {
+	attempts := c.opts.NameAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	prepended := prior != "" && prior != base && wire.ValidName(prior)
+	out := make([]string, 0, attempts+1)
+	if prepended {
+		out = append(out, prior)
+	}
+	for i := 0; i < attempts; i++ {
+		n := base
+		if i > 0 {
+			n = fmt.Sprintf("%s-%d", base, i+1)
+		}
+		if prepended && n == prior {
+			continue // already at the front
+		}
+		if !wire.ValidName(n) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// helloOnce performs one dial + hello/welcome handshake for candidate. On
+// success it returns the live (conn, w) with the cancellation guard already
+// disarmed, ready for the caller to publish. On any failure it closes the
+// connection and returns an error; a name_taken rejection comes back as a
+// *HelloError so the caller can decide whether to retry under another name.
+func (c *Client) helloOnce(ctx context.Context, candidate string) (net.Conn, *wire.Conn, error) {
 	conn, err := c.dialOrSpawn(ctx)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	w := wire.NewConn(conn)
 
 	// A handshake connection is not yet owned by the steady-state read loop.
 	// Close it on context cancellation to interrupt a blocked hello write or
 	// welcome read. stopHandshake joins an already-running callback, preventing
-	// the callback from escaping Connect or racing the handoff below.
+	// the callback from escaping this call or racing the handoff.
 	cancelDone := make(chan struct{})
 	stopCancel := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
@@ -181,19 +290,27 @@ func (c *Client) Connect(ctx context.Context) error {
 			<-cancelDone
 		}
 	}
-	defer stopHandshake()
+	// Disarm the guard on every path; close the conn unless we hand it back on
+	// success. Disarming before return means a successful conn is visible to
+	// the caller only after cancellation can no longer own it.
+	ok := false
+	defer func() {
+		stopHandshake()
+		if !ok {
+			_ = conn.Close()
+		}
+	}()
+
 	if err := ctx.Err(); err != nil {
-		_ = conn.Close()
-		return err
+		return nil, nil, err
 	}
 
 	// Hello with a write deadline.
-	if err := w.WriteWithTimeout(wire.Hello{Name: c.opts.Name, Version: c.opts.Version}, 5*time.Second); err != nil {
-		_ = conn.Close()
+	if err := w.WriteWithTimeout(wire.Hello{Name: candidate, Version: c.opts.Version}, 5*time.Second); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return nil, nil, ctxErr
 		}
-		return fmt.Errorf("broker client: write hello: %w", err)
+		return nil, nil, fmt.Errorf("broker client: write hello: %w", err)
 	}
 
 	// Welcome / error with a read deadline.
@@ -201,51 +318,43 @@ func (c *Client) Connect(ctx context.Context) error {
 	first, err := w.Read()
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		_ = conn.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+			return nil, nil, ctxErr
 		}
-		return fmt.Errorf("broker client: await welcome: %w", err)
+		return nil, nil, fmt.Errorf("broker client: await welcome: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		_ = conn.Close()
-		return err
+		return nil, nil, err
 	}
 	switch f := first.(type) {
 	case wire.Welcome:
-		// proceed
+		ok = true
+		return conn, w, nil
 	case wire.Error:
-		_ = conn.Close()
-		return &HelloError{Code: f.Code, Message: f.Message}
+		return nil, nil, &HelloError{Code: f.Code, Message: f.Message}
 	default:
-		_ = conn.Close()
-		return fmt.Errorf("broker client: unexpected first frame: %v", f.Kind())
+		return nil, nil, fmt.Errorf("broker client: unexpected first frame: %v", f.Kind())
 	}
+}
 
-	// Disarm and, if necessary, join the cancellation callback before making
-	// conn visible to other goroutines. Cancellation after this handoff does not
-	// own the established connection.
-	stopHandshake()
-	if err := ctx.Err(); err != nil {
-		_ = conn.Close()
-		return err
-	}
-
+// Name returns the peer name currently registered with the broker. Before the
+// first successful connect it is the requested name; after an auto-suffix it is
+// the effective (possibly suffixed) name.
+func (c *Client) Name() string {
 	c.mu.Lock()
-	c.conn = conn
-	c.wire = w
-	c.state = ConnectionStateConnected
-	c.generation++
-	generation := c.generation
-	c.publishConnectionEvent(ConnectionEvent{
-		State:      ConnectionStateConnected,
-		Generation: generation,
-	})
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	if c.name != "" {
+		return c.name
+	}
+	return c.opts.Name
+}
 
-	go c.readLoop(conn, w)
-	c.opts.Logger.Info("connected to broker", "socket", c.opts.SocketPath)
-	return nil
+// Connected reports whether the client currently holds a live broker
+// connection.
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state == ConnectionStateConnected
 }
 
 // HelloError is returned when the broker rejects our hello.

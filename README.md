@@ -79,13 +79,13 @@ claude mcp add --transport stdio --scope user intercom -- intercom shim
 claude mcp get intercom
 ```
 
-Each Claude Code peer starts with Channels enabled:
+A Claude peer participates in the broker only after an explicit opt-in: `INTERCOM_ENABLE=1`, or a nonblank `INTERCOM_NAME`. Each Claude Code peer starts with Channels enabled; the following command sets `INTERCOM_NAME`, which both selects the peer name and supplies the opt-in:
 
 ```sh
 INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:intercom
 ```
 
-`INTERCOM_NAME` is optional when the working-directory basename is the required peer name. Peer-name syntax is specified in [Command and tool reference: Peer names](docs/REFERENCE.md#peer-names).
+When the working-directory basename is already the required peer name, `INTERCOM_ENABLE=1` supplies the opt-in in place of `INTERCOM_NAME`. A launch with neither variable set serves the Intercom tools without registering a peer name, and `send_message` and `list_peers` return an error result. Peer-name syntax is specified in [Command and tool reference: Peer names](docs/REFERENCE.md#peer-names).
 
 ### Connect Codex
 
@@ -142,6 +142,7 @@ Claude receives a delivery as a channel event. Codex receives a delivery as a se
 | [`intercom-codex-project`](docs/REFERENCE.md#intercom-codex-project) | Supervises one dedicated Codex app-server and attachable adapter/proxy service group. |
 | [`send_message`](docs/REFERENCE.md#send_message) | Sends one message to one connected peer. |
 | [`list_peers`](docs/REFERENCE.md#list_peers) | Lists other peers connected to the same broker. |
+| [`channel_status`](docs/REFERENCE.md#channel_status) | Reports a Claude peer's opt-in state, effective name, and broker connectivity. |
 
 ## DOCUMENTATION
 

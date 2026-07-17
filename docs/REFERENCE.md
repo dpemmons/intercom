@@ -26,6 +26,7 @@ intercom-codex-project [--cwd DIRECTORY] --list-sessions [--all-sessions]
 
 send_message(to=NAME, message=TEXT)
 list_peers()
+channel_status()
 ```
 
 ## CONTENTS
@@ -46,6 +47,7 @@ list_peers()
 - [Agent tools](#agent-tools)
   - [`send_message`](#send_message)
   - [`list_peers`](#list_peers)
+  - [`channel_status`](#channel_status)
 - [Peer names](#peer-names)
 - [Environment](#environment)
 - [Files](#files)
@@ -137,9 +139,13 @@ No positional arguments are accepted.
 
 #### Semantics
 
-`intercom shim` serves newline-delimited JSON-RPC 2.0 MCP on standard input and standard output. It exposes `send_message` and `list_peers`, advertises the `claude/channel` experimental capability, and emits inbound broker deliveries as `notifications/claude/channel` notifications.
+`intercom shim` serves newline-delimited JSON-RPC 2.0 MCP on standard input and standard output. It exposes `send_message`, `list_peers`, and `channel_status`, advertises the `claude/channel` experimental capability, and emits inbound broker deliveries as `notifications/claude/channel` notifications.
 
-The peer name is `INTERCOM_NAME` after surrounding Unicode whitespace recognized by Go's `strings.TrimSpace` is removed, or the current working-directory basename when the variable is empty. The shim attempts broker registration after the MCP initialized notification. That eager attempt is asynchronous and nonfatal; a tool call attempts connection again when registration failed.
+The peer name is `INTERCOM_NAME` after surrounding Unicode whitespace recognized by Go's `strings.TrimSpace` is removed, or the current working-directory basename when the variable is empty.
+
+Broker participation requires an explicit opt-in: `INTERCOM_ENABLE=1`, a nonblank `INTERCOM_NAME`, or an explicitly configured name. The MCP transport gives no signal about whether the launching Claude Code process supplied `--dangerously-load-development-channels`, so unconditional registration would hold a peer name for a session that silently drops every delivery — a dark receiver. A session that has not opted in never contacts the broker and never registers a name; its `send_message` and `list_peers` calls return an error result stating that intercom is not enabled for the session, without any broker contact. `channel_status` remains available regardless of opt-in state and reports the disabled condition.
+
+An opted-in session connects once the MCP initialized notification arrives and holds that connection for the life of the session, reconnecting with increasing backoff after a broker restart or other disconnect so a receive-only session does not go dark. When the requested name is already taken, registration retries as `NAME-2`, `NAME-3`, and so on for up to 20 candidates; a reconnect after a broker restart tries the previously registered name first, so a suffixed session keeps its identity across the restart. A non-`name_taken` rejection, such as an invalid name, stops the background connection attempt instead of retrying.
 
 End of standard input, `SIGHUP`, `SIGINT`, and `SIGTERM` produce clean shutdown. Logs are written to standard error. No log text is written to the MCP standard-output stream.
 
@@ -156,7 +162,9 @@ End of standard input, `SIGHUP`, `SIGINT`, and `SIGTERM` produce clean shutdown.
 | Standard-input scanning fails, including an MCP line reaching the 8 MiB scanner limit. | The command reports `mcp: read` and exits with status 1. |
 | A channel notification cannot be encoded or written. | The failure is logged and that notification is lost. The shim continues reading MCP input. |
 | An MCP response cannot be written. | The response is lost. The response path does not make the write failure a direct process error. |
-| Broker registration is rejected or temporarily unavailable. | Eager registration logs a warning. A tool call returns an error result. The MCP process remains running. |
+| The session did not opt in (no `INTERCOM_ENABLE=1`, `INTERCOM_NAME`, or explicit name). | `send_message` and `list_peers` return an error result reporting that intercom is not enabled; no broker connection is attempted. |
+| The requested name is already registered by another live peer. | The background connection retries under a numbered suffix (`NAME-2`, `NAME-3`, ... up to 20 candidates) instead of failing. |
+| Broker registration fails for another reason, or the broker is temporarily unavailable. | A dial failure retries with increasing backoff. A non-name-collision rejection logs an error and stops the background reconnect. The MCP process remains running in either case. |
 
 Malformed JSON input and unrelated JSON-RPC notifications are discarded. Unsupported JSON-RPC requests receive method-not-found responses and do not terminate the shim.
 
@@ -1061,7 +1069,7 @@ Message sent to "reviewer".
 
 #### See also
 
-[`list_peers`](#list_peers), [send protocol](BROKER_PROTOCOL.md#send)
+[`list_peers`](#list_peers), [`channel_status`](#channel_status), [send protocol](BROKER_PROTOCOL.md#send)
 
 ### list_peers
 
@@ -1103,7 +1111,46 @@ Connected peers: implementer, reviewer
 
 #### See also
 
-[`send_message`](#send_message), [list protocol](BROKER_PROTOCOL.md#list_peers)
+[`send_message`](#send_message), [`channel_status`](#channel_status), [list protocol](BROKER_PROTOCOL.md#list_peers)
+
+### channel_status
+
+#### Signature
+
+```text
+channel_status() -> tool result
+```
+
+#### Arguments
+
+The JSON argument must be exactly an object with no members. `{}` is valid. `null`, arrays, scalars, and objects with members are invalid. The tool schema declares no properties.
+
+#### Semantics
+
+`channel_status` is available on the Claude shim only, in both the opted-in and non-opted-in condition. It reports, in one text result: whether the session is enabled; when enabled, the effective peer name currently registered with the broker, including a note when that name differs from the requested name because of an auto-suffix; whether the broker connection is currently live or reconnecting in the background; and the sorted list of other connected peers, or that none are connected.
+
+Every result carries a fixed caveat: intercom can confirm broker registration but cannot confirm that the session's Claude Code process actually loaded the channel, because that state is not observable over MCP. Confirming receipt requires an external check, such as a peer sending a test message or inspecting Claude Code startup output for the channels line.
+
+A disabled session's result states that intercom is disabled, that `send_message` and `list_peers` are inert, and that the session holds no peer name; it does not contact the broker.
+
+#### Errors
+
+`channel_status` has no error condition; it always returns a status result and never sets `isError`.
+
+#### Minimal example
+
+```text
+channel_status()
+intercom status:
+  enabled: yes
+  peer name: implementer
+  broker: connected
+  other peers: reviewer
+```
+
+#### See also
+
+[`send_message`](#send_message), [`list_peers`](#list_peers), [`intercom shim`](#intercom-shim)
 
 ## PEER NAMES
 
@@ -1113,11 +1160,14 @@ Nonblank explicit `--name` and `INTERCOM_NAME` values have surrounding Unicode w
 
 The operational command `intercom peers` claims `intercom-peers` for the lifetime of its query. That name remains legal for an agent but collides with the operational command while live.
 
+An opted-in Claude shim auto-suffixes on a name collision instead of failing: when the requested name is taken, it retries as `NAME-2`, `NAME-3`, and so on, skipping any candidate that would exceed `MaxNameLen` (64 bytes), for up to 20 attempts. A reconnect after a broker restart prefers the previously registered effective name over the originally requested name, so a suffixed session keeps a stable identity across the restart; the `channel_status` tool reports the currently effective name. This is shim-only behavior. The Codex adapter does not opt in to auto-suffixing and fails loudly on a name collision, reporting `codex: register with broker`.
+
 ## ENVIRONMENT
 
 | Variable | Type and units | Used by | Default | Semantics and errors |
 |---|---|---|---|---|
-| `INTERCOM_NAME` | peer name | `shim`, `codex` service, `name` | selected-directory basename | Supplies the peer name after whitespace trimming. `--name` takes precedence for the service. Blank means unset. Invalid content is fatal. `codex attach` ignores this variable and requires `--name`. |
+| `INTERCOM_NAME` | peer name | `shim`, `codex` service, `name` | selected-directory basename | Supplies the peer name after whitespace trimming. `--name` takes precedence for the service. Blank means unset. Invalid content is fatal. `codex attach` ignores this variable and requires `--name`. A nonblank value also opts the shim in to broker participation. |
+| `INTERCOM_ENABLE` | Boolean flag | `shim` | unset (disabled) | Opts a Claude shim in to broker participation when set to exactly `1`. Ignored by the Codex adapter and diagnostic commands, which always participate. An unset shim with no `INTERCOM_NAME` and no explicit configured name serves MCP without registering with the broker; `send_message` and `list_peers` then return an error result instead of contacting the broker. |
 | `INTERCOM_DIR` | directory path | broker, shim, Codex adapter and readiness output, Codex attach, `peers` | `$HOME/.claude-intercom` | Supplies the runtime, binding, and live-instance directory. A missing base directory is created with mode 0700. Existing base-directory permissions are not repaired; the live-instance subdirectory is forced to mode 0700. Readiness prints the symlink-resolved absolute directory. |
 | `INTERCOM_SOCKET` | Unix socket path | broker, shim, Codex adapter and readiness output, Codex attach, `peers` | `$INTERCOM_DIR/broker.sock` | Overrides the broker socket and selects the broker identity used to publish or find a live Codex descriptor. Descriptor operations resolve a relative value against each command's current directory, so service and attach invocations must produce the same canonical path. Readiness prints that canonical identity. Its broker lock path is the string plus `.lock`. Its parent is not created as a consequence of this override. |
 | `INTERCOM_BROKER_LOG` | file path | broker | `$INTERCOM_DIR/broker.log` | Selects the append-only structured log. `--foreground` writes to standard error instead. |

@@ -12,7 +12,7 @@ import (
 )
 
 // version is the binary version, overridable via -ldflags '-X main.version=...'.
-var version = "0.2.4-dev"
+var version = "0.3.0-dev"
 
 // commit is the git SHA the binary was built from, overridable likewise.
 var commit = "unknown"

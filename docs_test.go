@@ -130,7 +130,7 @@ func TestReferenceEntrySkeletons(t *testing.T) {
 			"#### Errors", "#### Exit status", "#### Example", "#### See also",
 		})
 	}
-	for _, heading := range []string{"send_message", "list_peers"} {
+	for _, heading := range []string{"send_message", "list_peers", "channel_status"} {
 		block := headingBlock(t, content, "### "+heading, "### ")
 		assertOrderedHeadings(t, heading, block, []string{
 			"#### Signature", "#### Arguments", "#### Semantics", "#### Errors",

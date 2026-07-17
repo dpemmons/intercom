@@ -118,7 +118,7 @@ Organization-managed Team and Enterprise accounts require the Channels setting t
 
 ### Concepts
 
-Claude Code starts `intercom shim` as a stdio MCP server. The shim registers with the broker after the MCP initialization handshake. The shim derives its peer name from `INTERCOM_NAME` when that variable contains a nonblank value; otherwise it uses the working-directory basename.
+Claude Code starts `intercom shim` as a stdio MCP server. The shim participates in the broker only for an opted-in session: an explicitly configured name, a nonblank `INTERCOM_NAME`, or `INTERCOM_ENABLE=1`. A session that has not opted in serves MCP tools without registering a peer name, and `send_message` and `list_peers` return an error result instead of contacting the broker. An opted-in shim connects after the MCP initialization handshake and derives its peer name from `INTERCOM_NAME` when that variable contains a nonblank value; otherwise it uses the working-directory basename.
 
 The bare MCP server name is `intercom`. Claude Code requires explicit development-channel authorization for a custom channel server.
 
@@ -136,13 +136,19 @@ The registration is inspected before the first launch:
 claude mcp get intercom
 ```
 
-The peer starts from the project directory:
+The peer participates in the broker only after an explicit opt-in. Setting `INTERCOM_NAME` opts the session in and selects the peer name in one step; the peer starts from the project directory:
 
 ```sh
 INTERCOM_NAME=implementer claude --dangerously-load-development-channels server:intercom
 ```
 
-The `INTERCOM_NAME` assignment may be omitted when the project-directory basename is the required peer name.
+When the project-directory basename is already the required peer name, `INTERCOM_ENABLE=1` supplies the opt-in on its own:
+
+```sh
+INTERCOM_ENABLE=1 claude --dangerously-load-development-channels server:intercom
+```
+
+A launch with neither variable set serves the Intercom tools without registering a peer name; `send_message` and `list_peers` then return an error result.
 
 ### Verification
 
@@ -153,27 +159,39 @@ $ INTERCOM_NAME=implementer intercom name
 implementer
 ```
 
+Calling `channel_status` from the running session confirms the opt-in state, the effective registered name after any auto-suffix, and broker connectivity:
+
+```text
+channel_status()
+intercom status:
+  enabled: yes
+  peer name: implementer
+  broker: connected
+  other peers: none
+```
+
 ### Errors
 
 | Condition | Result |
 |---|---|
 | `claude mcp add` rejects the registration. | No user-scoped `intercom` MCP server is created. The command diagnostic identifies the invalid Claude configuration or unavailable executable. |
 | The selected peer name is empty, exceeds 64 bytes, or contains a character outside ASCII letters, digits, `_`, and `-`. | `intercom shim` reports `invalid peer name` and exits. |
-| Another live peer owns the selected name. | Broker registration reports `name_taken`; the colliding shim retries registration on a later tool call. |
+| Another live peer owns the selected name. | The shim retries registration under a numbered suffix (`NAME-2`, `NAME-3`, ... up to 20 candidates) instead of failing; `channel_status` reports the effective registered name. |
+| The session did not opt in (no `INTERCOM_ENABLE=1`, `INTERCOM_NAME`, or explicit name). | `send_message` and `list_peers` return an error result reporting that intercom is not enabled; the shim never registers with the broker. |
 | The Channels launch option is absent or organization policy disables Channels. | Intercom tools may remain available, but inbound channel notifications are not delivered to Claude Code. |
 | Claude authentication is unavailable. | Claude Code reports its authentication error before the peer becomes usable. |
 
 ### Notes
 
-Two live peers cannot share a name. A Claude shim remains available as an MCP process after an eager broker registration failure and retries registration on a later tool call. The colliding peer does not appear in `list_peers` until the name becomes available.
+Two live peers cannot share a base name; an opted-in shim resolves the collision itself by registering under a numbered suffix rather than failing, and a reconnect after a broker restart prefers the previously registered effective name. A non-opted-in shim never appears in `list_peers` and holds no peer name to receive against; a session that appears unreachable is often one that skipped the opt-in, and `channel_status` distinguishes the two conditions.
 
-The Channels option is required on every Claude Code launch that uses the Intercom channel. MCP registration alone exposes the tools but does not authorize inbound channel notifications.
+The Channels option is required on every Claude Code launch that uses the Intercom channel. MCP registration alone exposes the tools but does not authorize inbound channel notifications and does not by itself opt the session in to broker participation.
 
 `Ctrl-C` in the Claude Code terminal stops Claude Code and its Intercom shim. The peer then disappears from broker discovery.
 
 ### See also
 
-[Reference: `intercom shim`](REFERENCE.md#intercom-shim), [Claude Code Channels](https://code.claude.com/docs/en/channels), [Claude Code MCP](https://code.claude.com/docs/en/mcp)
+[Reference: `intercom shim`](REFERENCE.md#intercom-shim), [Reference: `channel_status`](REFERENCE.md#channel_status), [Peer names](REFERENCE.md#peer-names), [Claude Code Channels](https://code.claude.com/docs/en/channels), [Claude Code MCP](https://code.claude.com/docs/en/mcp)
 
 ## 3. Add a managed Codex peer
 

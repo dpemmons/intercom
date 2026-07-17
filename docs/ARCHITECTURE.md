@@ -109,11 +109,11 @@ The `intercom` executable dispatches the broker, Claude shim, Codex adapter, and
 The broker owns the Unix listener and the in-memory map from peer name to live connection. It performs the following operations:
 
 - accepts one `hello` registration per connection;
-- rejects an invalid or already-connected peer name;
+- rejects an invalid or already-connected peer name and logs a `register rejected` line naming the peer and the rejection code;
 - returns the sorted set of other connected peer names;
 - writes each `deliver` frame directly to the selected destination connection;
 - acknowledges or rejects each `send` request on the sender connection;
-- removes an unresponsive destination after a delivery write failure;
+- removes an unresponsive destination after a delivery write failure and logs a `peer deregistered` line for any peer removal, whether by clean disconnect or a failed delivery write;
 - sends a best-effort `goodbye` during broker shutdown;
 - attempts to remove the socket entry when shutdown completes and logs an unlink failure.
 
@@ -129,11 +129,13 @@ A connection loss fails every request pending on that connection. A later operat
 
 ### Claude Code shim
 
-The Claude Code shim is an MCP server over standard input and standard output. Standard error carries logs. The shim advertises the `claude/channel` experimental capability and two tools: `send_message` and `list_peers`.
+The Claude Code shim is an MCP server over standard input and standard output. Standard error carries logs. The shim advertises the `claude/channel` experimental capability and three tools: `send_message`, `list_peers`, and `channel_status`.
 
-After the MCP client sends `notifications/initialized`, the shim attempts broker registration. Failure of this eager registration is logged and does not terminate the MCP server. A later tool call attempts registration again.
+The shim participates in the broker only when the session opts in: an explicitly configured name, a nonblank `INTERCOM_NAME`, or `INTERCOM_ENABLE=1`. MCP gives the shim no way to observe whether the launching Claude Code process actually loaded the channel, so unconditional registration previously produced dark receivers — sessions that held a peer name while silently dropping every delivery. A session that has not opted in never dials the broker and never registers a name; `send_message` and `list_peers` return an inert error result stating that intercom is not enabled, and `channel_status` reports the disabled condition without contacting the broker.
 
-An inbound broker delivery becomes a `notifications/claude/channel` notification. The notification contains the message body in `content`, the registered sender name in `meta.from`, and the broker timestamp in `meta.timestamp`.
+An opted-in session connects once the MCP client sends `notifications/initialized` and hands the connection to a background reconnect supervisor goroutine that holds it for the life of the process. The supervisor reconnects with increasing backoff after any disconnect — a broker restart, an idle-exit shutdown, or a transient dial failure — so a receive-only session keeps receiving deliveries without an outbound tool call to trigger reconnection. A registration rejected for a reason other than a name collision, such as an invalid name, stops the supervisor instead of retrying indefinitely. On a name collision the client retries under a numbered suffix (see [Peer names](REFERENCE.md#peer-names)). The broker logs a `register rejected` line for the collision behind each retry and a `peer deregistered` line whenever any peer, suffixed or not, is removed; both lines were previously silent, which made a stuck name collision hard to diagnose from the broker log alone.
+
+An inbound broker delivery becomes a `notifications/claude/channel` notification. The notification contains the message body in `content`, the registered sender name in `meta.from`, and the broker timestamp in `meta.timestamp`. Delivery notifications queue to a dedicated goroutine so a slow or stalled standard-output write cannot block the broker read loop.
 
 The shim processes `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, and `ping`. Unrelated client notifications are ignored. Unsupported requests receive a method-not-found response.
 
@@ -265,10 +267,12 @@ The broker records the client version in its log. The broker does not negotiate 
 
 ### Claude Code startup and delivery
 
+This flow assumes an opted-in session (an explicitly configured name, a nonblank `INTERCOM_NAME`, or `INTERCOM_ENABLE=1`). A non-opted-in session completes steps 1 through 3 but never performs step 4 and returns an inert error result for a `send_message` or `list_peers` call.
+
 1. Claude Code starts `intercom shim` and opens the MCP stdio transport.
 2. The client sends `initialize`; the shim returns server identity, tool capability, channel capability, and agent instructions.
 3. The client sends `notifications/initialized`.
-4. The shim attempts broker registration.
+4. The background reconnect supervisor connects to the broker, retrying under a numbered suffix on a name collision.
 5. A sender calls `send_message`.
 6. The source adapter validates tool arguments and writes `send` to the broker.
 7. The broker writes `deliver` to the Claude shim.
@@ -454,7 +458,7 @@ Shutdown closes unregistered accepted connections, writes a best-effort `goodbye
 
 ### Claude shim lifecycle
 
-The shim lifetime follows MCP standard input, process cancellation, or fatal I/O. End-of-file is a clean shutdown. Shutdown closes the broker connection and waits for active MCP tool handlers. A broker disconnection does not terminate the shim; a later tool call may reconnect. The shim does not run a continuous broker reconnect loop.
+The shim lifetime follows MCP standard input, process cancellation, or fatal I/O. End-of-file is a clean shutdown. Shutdown cancels the background reconnect supervisor before closing the broker connection, so a shutdown in progress is observed as cancellation rather than a disconnect the supervisor would otherwise reconnect through, and waits for active MCP tool handlers. A non-opted-in session never starts the supervisor and never holds a broker connection. An opted-in session's supervisor runs a continuous reconnect loop with increasing backoff for the process lifetime; a broker disconnection therefore does not terminate the shim and reconnects without waiting for a tool call.
 
 ### Codex adapter lifecycle
 
@@ -486,13 +490,13 @@ The launcher and cleanup helper ignore repeated terminal signals after cleanup b
 | Broker socket fails for a non-startable reason | The connect operation fails | The peer remains unregistered |
 | Broker lock is already held | The extra broker exits successfully | The lock owner remains authoritative |
 | Peer name is invalid | Registration fails with `bad_name` | The peer remains unregistered |
-| Peer name is already connected | Registration fails with `name_taken` | Claude logs eager failure and remains on MCP; Codex startup fails |
+| Peer name is already connected | Registration fails with `name_taken`; the broker logs `register rejected` | An opted-in Claude shim retries under a numbered suffix (up to 20 candidates) and remains on MCP; Codex startup fails |
 | Destination is absent | `send_ack` carries `no_such_peer` | No delivery occurs |
 | Destination equals sender | `send_ack` carries `no_self_send` | No delivery occurs |
 | Delivery exceeds the frame limit | `send_ack` carries `oversize` | The destination connection remains usable when rejection occurs before writing |
 | Destination write fails or exceeds its deadline | The broker removes the destination and returns `deliver_failed` | Delivery outcome may be partial at the failed stream; no retry occurs |
 | Source connection drops while awaiting a reply | The pending operation returns a disconnect error | The operation is not replayed because its outcome may be ambiguous |
-| Broker process exits | Claude reconnects on a later tool call; Codex reconnects in the background | Disconnected peers cannot receive messages |
+| Broker process exits | An opted-in Claude shim and the Codex adapter both reconnect in the background with increasing backoff | Disconnected peers cannot receive messages until reconnection completes; a non-opted-in Claude shim never held a connection |
 | Claude channel notification write fails | The shim logs the write failure | A broker acknowledgement may already have been returned |
 | A delivery arrives while the Codex inbound FIFO already contains 64 queued messages | The adapter enters a fatal shutdown path | The attempted 65th queued delivery is not admitted; queued messages have no durable recovery path |
 | A selected lifecycle notification arrives while its FIFO already contains 256 notifications | The adapter enters a fatal shutdown path | The attempted 257th notification is not admitted; controller state is no longer trusted |

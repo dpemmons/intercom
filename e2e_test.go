@@ -340,6 +340,202 @@ func TestEndToEndListPeers(t *testing.T) {
 	}
 }
 
+type toolResp struct {
+	Result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	} `json:"result"`
+}
+
+func (s *shimSession) callTool(id int, name, args string) toolResp {
+	s.t.Helper()
+	s.send(`{"jsonrpc":"2.0","id":` + itoa(id) + `,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`)
+	raw := s.recvUntil(func(b []byte) bool { return strings.Contains(string(b), `"id":`+itoa(id)) })
+	var r toolResp
+	if err := json.Unmarshal(raw, &r); err != nil {
+		s.t.Fatalf("decode tool response: %v", err)
+	}
+	return r
+}
+
+// runBrokerOn starts an in-process broker on a specific socket and returns a
+// cancel func plus a channel closed once it has fully exited (socket unlinked,
+// lock released), so a test can restart a broker on the same socket.
+func runBrokerOn(t *testing.T, sock, lock string) (context.CancelFunc, chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(done)
+		if err := broker.Run(ctx, broker.Options{
+			SocketPath: sock,
+			LockPath:   lock,
+			IdleAfter:  10 * time.Minute,
+			Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}); err != nil {
+			errCh <- err
+		}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(sock); err == nil {
+			return cancel, done
+		}
+		select {
+		case err := <-errCh:
+			cancel()
+			t.Fatalf("broker Run failed: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	t.Fatal("broker did not start on socket")
+	return nil, nil
+}
+
+// TestEndToEndDisabledSessionInert verifies the opt-in gate: a session started
+// with no explicit name and no opt-in env is inert — its broker-backed tools
+// refuse to touch the broker, so it never claims a peer name.
+func TestEndToEndDisabledSessionInert(t *testing.T) {
+	t.Setenv("INTERCOM_ENABLE", "")
+	t.Setenv("INTERCOM_NAME", "")
+	// A disabled session derives its (unused) name from the cwd basename; if the
+	// checkout has a non-name-safe basename there is nothing to assert.
+	if _, err := shim.ResolveName(); err != nil {
+		t.Skipf("cwd basename is not a valid peer name here: %v", err)
+	}
+	sock, _ := startBroker(t)
+
+	dark := startShim(t, t.Context(), "", sock) // no explicit name => disabled
+	dark.initialize(1)
+
+	if r := dark.callTool(10, "send_message", `{"to":"bob","message":"hi"}`); !r.Result.IsError ||
+		!strings.Contains(r.Result.Content[0].Text, "not enabled") {
+		t.Errorf("send_message should be inert; got isError=%v text=%q", r.Result.IsError, r.Result.Content[0].Text)
+	}
+	if r := dark.callTool(11, "list_peers", `{}`); !r.Result.IsError ||
+		!strings.Contains(r.Result.Content[0].Text, "not enabled") {
+		t.Errorf("list_peers should be inert; got isError=%v text=%q", r.Result.IsError, r.Result.Content[0].Text)
+	}
+	if r := dark.callTool(12, "channel_status", `{}`); !strings.Contains(r.Result.Content[0].Text, "DISABLED") {
+		t.Errorf("channel_status text = %q", r.Result.Content[0].Text)
+	}
+
+	// The disabled session must not have registered: an enabled observer sees no peers.
+	obs := startShim(t, t.Context(), "obs", sock)
+	obs.initialize(1)
+	if r := obs.callTool(13, "list_peers", `{}`); !strings.Contains(r.Result.Content[0].Text, "No other peers") {
+		t.Errorf("dark session leaked into registry; obs sees: %q", r.Result.Content[0].Text)
+	}
+}
+
+// TestEndToEndAutoSuffix verifies that a second session requesting a name
+// already held registers under a numbered suffix instead of failing.
+func TestEndToEndAutoSuffix(t *testing.T) {
+	sock, _ := startBroker(t)
+
+	dup1 := startShim(t, t.Context(), "dup", sock)
+	dup1.initialize(1)
+	dup1.callTool(1, "list_peers", `{}`) // force connect + register "dup"
+
+	dup2 := startShim(t, t.Context(), "dup", sock)
+	dup2.initialize(1)
+	dup2.callTool(2, "list_peers", `{}`) // connect, find "dup" taken, register "dup-2"
+
+	if r := dup2.callTool(3, "channel_status", `{}`); !strings.Contains(r.Result.Content[0].Text, "dup-2") {
+		t.Errorf("dup2 should report effective name dup-2; got %q", r.Result.Content[0].Text)
+	}
+
+	obs := startShim(t, t.Context(), "obs", sock)
+	obs.initialize(1)
+	// Sorted peer list reads "…: dup, dup-2"; "dup," proves "dup" is its own entry.
+	text := obs.callTool(4, "list_peers", `{}`).Result.Content[0].Text
+	if !strings.Contains(text, "dup-2") || !strings.Contains(text, "dup,") {
+		t.Errorf("expected both dup and dup-2 registered; got %q", text)
+	}
+}
+
+// TestEndToEndBurstDelivery sends several messages back-to-back to one receiver
+// and asserts all arrive, in order, through the buffered deliverLoop.
+func TestEndToEndBurstDelivery(t *testing.T) {
+	sock, _ := startBroker(t)
+	alice := startShim(t, t.Context(), "alice", sock)
+	bob := startShim(t, t.Context(), "bob", sock)
+	alice.initialize(1)
+	bob.initialize(1)
+	bob.callTool(90, "list_peers", `{}`) // ensure bob is registered
+
+	const n = 12
+	for i := 0; i < n; i++ {
+		if r := alice.callTool(100+i, "send_message", `{"to":"bob","message":"m`+itoa(i)+`"}`); r.Result.IsError {
+			t.Fatalf("send %d error: %q", i, r.Result.Content[0].Text)
+		}
+	}
+	for i := 0; i < n; i++ {
+		want := `"m` + itoa(i) + `"` // trailing quote makes "m1" distinct from "m10"
+		bob.recvUntil(func(b []byte) bool {
+			return strings.Contains(string(b), `"notifications/claude/channel"`) && strings.Contains(string(b), want)
+		})
+	}
+}
+
+// TestEndToEndReceiverSurvivesBrokerRestart is the regression test for the core
+// bug: a receive-only session must not go dark when the broker restarts. The
+// supervisor reconnects it in the background, so a later send still lands.
+func TestEndToEndReceiverSurvivesBrokerRestart(t *testing.T) {
+	// Keep the socket path short: macOS caps sun_path at 104 bytes.
+	dir, err := os.MkdirTemp("", "icrr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "s")
+	lock := sock + ".lock"
+
+	cancel1, done1 := runBrokerOn(t, sock, lock)
+
+	bob := startShim(t, t.Context(), "bob", sock)
+	bob.initialize(1)
+	alice := startShim(t, t.Context(), "alice", sock)
+	alice.initialize(1)
+
+	bob.callTool(90, "list_peers", `{}`)
+	alice.callTool(91, "list_peers", `{}`)
+
+	// Baseline delivery works before the restart.
+	alice.callTool(1, "send_message", `{"to":"bob","message":"one"}`)
+	bob.recvUntil(func(b []byte) bool {
+		return strings.Contains(string(b), `"notifications/claude/channel"`) && strings.Contains(string(b), `"one"`)
+	})
+
+	// Kill the broker and wait for it to fully release the socket + lock.
+	cancel1()
+	<-done1
+
+	// Fresh broker on the same socket; bob's supervisor reconnects on its own.
+	cancel2, done2 := runBrokerOn(t, sock, lock)
+	t.Cleanup(func() { cancel2(); <-done2 })
+
+	// Retry the send until bob's supervisor has re-registered him.
+	deadline := time.Now().Add(10 * time.Second)
+	for id := 100; ; id++ {
+		if time.Now().After(deadline) {
+			t.Fatal("receiver never came back after broker restart")
+		}
+		if !alice.callTool(id, "send_message", `{"to":"bob","message":"two"}`).Result.IsError {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	bob.recvUntil(func(b []byte) bool {
+		return strings.Contains(string(b), `"notifications/claude/channel"`) && strings.Contains(string(b), `"two"`)
+	})
+}
+
 func TestEndToEndSelfSendRejected(t *testing.T) {
 	sock, _ := startBroker(t)
 	alice := startShim(t, t.Context(), "alice", sock)

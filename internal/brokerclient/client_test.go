@@ -388,6 +388,158 @@ func TestClientHelloRejected(t *testing.T) {
 	}
 }
 
+// newSuffixClient builds a client that opts in to auto-suffixing.
+func newSuffixClient(t *testing.T, fb *fakeBroker, attempts int) *Client {
+	t.Helper()
+	return NewClient(ClientOptions{
+		Name:         "alice",
+		Version:      "test-version",
+		SocketPath:   fb.socketPath,
+		BrokerBin:    "/nonexistent",
+		NameAttempts: attempts,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+// awaitConnState drains connection events until the wanted state is observed.
+func awaitConnState(t *testing.T, c *Client, want ConnectionState) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-c.ConnectionEvents():
+			if ev.State == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for connection state %v", want)
+		}
+	}
+}
+
+// TestClientAutoSuffixOnNameTaken: with NameAttempts set, a taken name is
+// retried under numbered suffixes until one is accepted.
+func TestClientAutoSuffixOnNameTaken(t *testing.T) {
+	fb := newFakeBroker(t)
+	c := newSuffixClient(t, fb, 20)
+	t.Cleanup(func() { _ = c.Close() })
+
+	go func() {
+		if h := fb.awaitHello(); h.Name != "alice" {
+			t.Errorf("hello 1 = %q, want alice", h.Name)
+		}
+		fb.write(wire.Error{Code: wire.CodeNameTaken, Message: "taken"})
+		if h := fb.awaitHello(); h.Name != "alice-2" {
+			t.Errorf("hello 2 = %q, want alice-2", h.Name)
+		}
+		fb.write(wire.Error{Code: wire.CodeNameTaken, Message: "taken"})
+		if h := fb.awaitHello(); h.Name != "alice-3" {
+			t.Errorf("hello 3 = %q, want alice-3", h.Name)
+		}
+		fb.sendWelcome()
+	}()
+
+	if err := c.Connect(t.Context()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if got := c.Name(); got != "alice-3" {
+		t.Errorf("effective name = %q, want alice-3", got)
+	}
+	if !c.Connected() {
+		t.Error("Connected() = false after successful Connect")
+	}
+}
+
+// TestClientReconnectPrefersPriorName: MF-1. After landing on a suffix, a
+// reconnect offers that suffixed name first so identity stays stable.
+func TestClientReconnectPrefersPriorName(t *testing.T) {
+	fb := newFakeBroker(t)
+	c := newSuffixClient(t, fb, 20)
+	t.Cleanup(func() { _ = c.Close() })
+
+	go func() {
+		fb.awaitHello() // alice
+		fb.write(wire.Error{Code: wire.CodeNameTaken, Message: "taken"})
+		fb.awaitHello() // alice-2
+		fb.sendWelcome()
+	}()
+	if err := c.Connect(t.Context()); err != nil {
+		t.Fatalf("first Connect: %v", err)
+	}
+	if c.Name() != "alice-2" {
+		t.Fatalf("effective name = %q, want alice-2", c.Name())
+	}
+
+	// Drop and reconnect: the first hello must be alice-2, not alice.
+	fb.closeClient()
+	awaitConnState(t, c, ConnectionStateDisconnected)
+
+	go func() {
+		if h := fb.awaitHello(); h.Name != "alice-2" {
+			t.Errorf("reconnect hello = %q, want alice-2", h.Name)
+		}
+		fb.sendWelcome()
+	}()
+	if err := c.Connect(t.Context()); err != nil {
+		t.Fatalf("reconnect Connect: %v", err)
+	}
+	if c.Name() != "alice-2" {
+		t.Errorf("after reconnect name = %q, want alice-2", c.Name())
+	}
+}
+
+// TestClientAllNamesTaken: when every candidate is taken, the terminal error is
+// the last name_taken HelloError.
+func TestClientAllNamesTaken(t *testing.T) {
+	fb := newFakeBroker(t)
+	c := newSuffixClient(t, fb, 3)
+	t.Cleanup(func() { _ = c.Close() })
+
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			select {
+			case <-fb.helloCh:
+				fb.write(wire.Error{Code: wire.CodeNameTaken, Message: "taken"})
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	err := c.Connect(t.Context())
+	var herr *HelloError
+	if !errors.As(err, &herr) {
+		t.Fatalf("got %v, want HelloError", err)
+	}
+	if herr.Code != wire.CodeNameTaken {
+		t.Errorf("code = %s", herr.Code)
+	}
+}
+
+// TestClientAutoSuffixStopsOnNonNameTaken: a non-name_taken rejection is
+// terminal even with NameAttempts set (no blind retry loop).
+func TestClientAutoSuffixStopsOnNonNameTaken(t *testing.T) {
+	fb := newFakeBroker(t)
+	c := newSuffixClient(t, fb, 20)
+	t.Cleanup(func() { _ = c.Close() })
+
+	go func() {
+		fb.awaitHello()
+		fb.write(wire.Error{Code: wire.CodeBadName, Message: "bad"})
+	}()
+
+	err := c.Connect(t.Context())
+	var herr *HelloError
+	if !errors.As(err, &herr) {
+		t.Fatalf("got %v, want HelloError", err)
+	}
+	if herr.Code != wire.CodeBadName {
+		t.Errorf("code = %s, want bad_name", herr.Code)
+	}
+}
+
 func TestConnectCancellationInterruptsHelloWrite(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	t.Cleanup(func() { _ = serverSide.Close() })
